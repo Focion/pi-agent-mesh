@@ -1,0 +1,46 @@
+{
+  "name": "@pi/agent-mesh",
+  "version": "0.1.0",
+  "description": "Multi-agent messaging and shared-state layer on top of the pi SDK",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js",
+      "require": "./dist/core/index.cjs"
+    },
+    "./migrations/*": "./migrations/*"
+  },
+  "files": ["dist", "migrations"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check:imports": "node scripts/check-imports.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.4"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.0.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
