@@ -7,6 +7,9 @@ export default defineConfig({
     hookTimeout: 60_000,
     // better-sqlite3 is native; run each test file in its own process for isolation
     pool: "forks",
-    fileParallelism: true
-  }
+    fileParallelism: true,
+    // pi SDK dlopes a clipboard native module that hangs in this environment;
+    // TERMUX_VERSION=1 makes pi skip it (checked before any pi import)
+    env: { TERMUX_VERSION: "1" },
+  },
 });
