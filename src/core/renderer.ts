@@ -17,7 +17,7 @@ import type {
   InboxState,
   InboxView,
   RecentPreview,
-  Renderer
+  Renderer,
 } from "./types.js";
 import { truncate } from "./util.js";
 
@@ -30,7 +30,9 @@ export const CATCHUP_CLOSE = "<<<END CATCHUP>>>";
 
 /** 定界符转义（防线 1）：正文里的 <<< / >>> 不得逃出包裹体 */
 export function escapeDelims(s: string): string {
-  return s.replaceAll("<<<", "\\x3c\\x3c\\x3c").replaceAll(">>>", "\\x3e\\x3e\\x3e");
+  return s
+    .replaceAll("<<<", "\\x3c\\x3c\\x3c")
+    .replaceAll(">>>", "\\x3e\\x3e\\x3e");
 }
 
 function attrs(parts: Array<[string, string | number | undefined]>): string {
@@ -48,7 +50,7 @@ export function renderAttachmentRefs(env: Envelope): string {
     atts
       .map(
         (a) =>
-          `[attachment ${a.spaceId}/${a.key}${a.version === undefined ? "" : ` v${a.version}`} — read it with mesh_shared_get]`
+          `[attachment ${a.spaceId}/${a.key}${a.version === undefined ? "" : ` v${a.version}`} — read it with mesh_shared_get]`,
       )
       .join("\n")
   );
@@ -60,17 +62,25 @@ export function verifyWrapped(text: string): { ok: boolean; fixed: string } {
   const closes = text.split(MSG_CLOSE).length - 1;
   if (opens === 1 && closes === 1 && text.trimEnd().endsWith(MSG_CLOSE)) {
     // 检查包裹体内是否残留未转义定界符（开标记之后、END 之前）
-    const bodyStart = text.indexOf(">>>\n") >= 0 ? text.indexOf(">>>\n") + 4 : 0;
+    const bodyStart =
+      text.indexOf(">>>\n") >= 0 ? text.indexOf(">>>\n") + 4 : 0;
     const bodyEnd = text.lastIndexOf(MSG_CLOSE);
     const body = text.slice(bodyStart, bodyEnd);
-    if (!body.includes("<<<") && !body.includes(">>>")) return { ok: true, fixed: text };
+    if (!body.includes("<<<") && !body.includes(">>>"))
+      return { ok: true, fixed: text };
   }
   // 强制加壳（生产降级路径）：整体转义后重新包裹
-  return { ok: false, fixed: `${MSG_OPEN} kind="escaped">>>\n${escapeDelims(text)}\n${MSG_CLOSE}` };
+  return {
+    ok: false,
+    fixed: `${MSG_OPEN} kind="escaped">>>\n${escapeDelims(text)}\n${MSG_CLOSE}`,
+  };
 }
 
 export class DefaultRenderer implements Renderer {
-  renderMessage(env: Envelope, ctx: { recipient: { endpointClass: string }; senderName: string }): string {
+  renderMessage(
+    env: Envelope,
+    ctx: { recipient: { endpointClass: string }; senderName: string },
+  ): string {
     // sink / external：结构化 JSON，不套文本壳（§5.7）
     if (ctx.recipient.endpointClass !== "stream") {
       return JSON.stringify(
@@ -86,13 +96,13 @@ export class DefaultRenderer implements Renderer {
             mentions: env.mentions,
             replyTo: env.replyTo,
             correlationId: env.correlationId,
-            routedAt: env.routedAt
+            routedAt: env.routedAt,
           },
           payload: env.payload,
-          ext: env.ext
+          ext: env.ext,
         },
         null,
-        2
+        2,
       );
     }
     const header = attrs([
@@ -105,7 +115,7 @@ export class DefaultRenderer implements Renderer {
       ["mentions", env.mentions?.length ? env.mentions.join(",") : undefined],
       ["ts", env.logicalTs ?? env.routedAt],
       ["reply_to", env.replyTo],
-      ["correlation", env.correlationId]
+      ["correlation", env.correlationId],
     ]);
     const body = escapeDelims(env.payload.text ?? "");
     return `${MSG_OPEN} ${header}>>>\n${body}${renderAttachmentRefs(env)}\n${MSG_CLOSE}`;
@@ -117,7 +127,7 @@ export class DefaultRenderer implements Renderer {
       ["seq", env.seq],
       ["conv", env.conversationId],
       ["from", env.from],
-      ["kind", "system"]
+      ["kind", "system"],
     ]);
     return `${MSG_OPEN} ${header}>>>\n${escapeDelims(env.payload.text ?? "")}\n${MSG_CLOSE}`;
   }
@@ -130,12 +140,16 @@ export class DefaultRenderer implements Renderer {
       const head = attrs([
         ["conv", conv.conversationId],
         ["unread", conv.unread],
-        ["overflow", conv.overflow ?? 0]
+        ["overflow", conv.overflow ?? 0],
       ]);
       const lines: string[] = [];
       if (conv.summary) lines.push(`[summary] ${conv.summary}`);
-      lines.push(`[digest] ${conv.unread} unread message(s) in this conversation.`);
-      const recents = recent.filter((e) => e.conversationId === conv.conversationId).slice(-3);
+      lines.push(
+        `[digest] ${conv.unread} unread message(s) in this conversation.`,
+      );
+      const recents = recent
+        .filter((e) => e.conversationId === conv.conversationId)
+        .slice(-3);
       if (recents.length > 0) {
         lines.push("[recent]");
         for (const e of recents) {
@@ -143,32 +157,45 @@ export class DefaultRenderer implements Renderer {
             ["id", e.id],
             ["seq", e.seq],
             ["from", e.from],
-            ["kind", e.kind]
+            ["kind", e.kind],
           ]);
-          lines.push(`  ${MSG_OPEN} ${h}>>> ${escapeDelims(truncate(e.payload.text ?? "", 40))} ${MSG_CLOSE}`);
+          lines.push(
+            `  ${MSG_OPEN} ${h}>>> ${escapeDelims(truncate(e.payload.text ?? "", 40))} ${MSG_CLOSE}`,
+          );
         }
       }
-      blocks.push(`${INBOX_OPEN} ${head}>>>\n${lines.join("\n")}\n${INBOX_CLOSE}`);
+      blocks.push(
+        `${INBOX_OPEN} ${head}>>>\n${lines.join("\n")}\n${INBOX_CLOSE}`,
+      );
     }
     if (blocks.length === 0) return "";
     return blocks.join("\n\n");
   }
 
   /** CATCHUP 固化体（§7.6 升回预算内时，一条 CustomMessageEntry 永久写进历史） */
-  renderCatchup(convId: string, missed: number, spanFrom: number, spanTo: number, digest: string): string {
+  renderCatchup(
+    convId: string,
+    missed: number,
+    spanFrom: number,
+    spanTo: number,
+    digest: string,
+  ): string {
     const head = attrs([
       ["conv", convId],
       ["missed", missed],
-      ["span", `seq ${spanFrom}\u2013${spanTo}`]
+      ["span", `seq ${spanFrom}\u2013${spanTo}`],
     ]);
     return `${CATCHUP_OPEN} ${head}>>>\nYou are catching up: ${missed} message(s) you missed while away.\n${escapeDelims(digest)}\n${CATCHUP_CLOSE}`;
   }
 }
 
 /** 机械摘要（§7.5：无 LLM——条数 + 参与者 + 每条截断 40 字） */
-export function mechanicalDigest(items: Array<{ from: string; name: string; seq: number; text: string }>): string {
+export function mechanicalDigest(
+  items: Array<{ from: string; name: string; seq: number; text: string }>,
+): string {
   const bySpeaker = new Map<string, number>();
-  for (const it of items) bySpeaker.set(it.name, (bySpeaker.get(it.name) ?? 0) + 1);
+  for (const it of items)
+    bySpeaker.set(it.name, (bySpeaker.get(it.name) ?? 0) + 1);
   const top = [...bySpeaker.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5)
@@ -182,14 +209,18 @@ export function mechanicalDigest(items: Array<{ from: string; name: string; seq:
 }
 
 /** InboxState.recent 预览（§10.4：≤3 条、40 字、mentionsMe 布尔化） */
-export function toRecentPreview(env: Envelope, me: string, nameOf: (id: string) => string): RecentPreview {
+export function toRecentPreview(
+  env: Envelope,
+  me: string,
+  nameOf: (id: string) => string,
+): RecentPreview {
   return {
     seq: env.seq,
     from: env.from,
     name: nameOf(env.from),
     preview: truncate(env.payload.text ?? "", 40),
     mentionsMe: env.mentions?.includes(me) ?? false,
-    expectsMyAck: env.expect !== "none" && (env.to?.includes(me) ?? true)
+    expectsMyAck: env.expect !== "none" && (env.to?.includes(me) ?? true),
   };
 }
 

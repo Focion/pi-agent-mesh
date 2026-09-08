@@ -10,7 +10,7 @@ import type {
   EndpointId,
   PendingDelivery,
   Transport,
-  Unsubscribe
+  Unsubscribe,
 } from "./types.js";
 
 export class InProcessTransport implements Transport {

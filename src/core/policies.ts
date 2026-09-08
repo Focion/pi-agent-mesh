@@ -32,7 +32,7 @@ import type {
   PolicySlot,
   PresenceState,
   RetentionPolicy,
-  VerbatimBudget
+  VerbatimBudget,
 } from "./types.js";
 import { DefaultRenderer } from "./renderer.js";
 import { sha256Hex } from "./util.js";
@@ -43,7 +43,11 @@ export interface PolicyTimeoutDeps {
   slot: PolicySlot;
   timeoutMs: number;
   degradedTo: DegradeTarget;
-  onDegraded: (reason: "timeout" | "threw", slot: PolicySlot, degradedTo: DegradeTarget) => void;
+  onDegraded: (
+    reason: "timeout" | "threw",
+    slot: PolicySlot,
+    degradedTo: DegradeTarget,
+  ) => void;
 }
 
 /**
@@ -53,7 +57,7 @@ export interface PolicyTimeoutDeps {
 export async function withPolicyTimeout<T>(
   deps: PolicyTimeoutDeps,
   fn: () => T | Promise<T>,
-  fallback: T
+  fallback: T,
 ): Promise<T> {
   const timer = new Promise<"timeout">((resolve) => {
     const t = setTimeout(() => resolve("timeout"), deps.timeoutMs);
@@ -78,7 +82,7 @@ export async function withPolicyTimeout<T>(
 export function withPolicyGuard<T>(
   deps: PolicyTimeoutDeps,
   fn: () => T,
-  fallback: T
+  fallback: T,
 ): T {
   try {
     return fn();
@@ -91,7 +95,10 @@ export function withPolicyGuard<T>(
 // ─── ① DeliveryPolicy：§7.2 档位映射矩阵 ─────────────────────────────────
 
 /** 规模列：direct=0, 小群(3–8)=1, 中群(9–30)=2, 大群(30+)=3 */
-export function memberTier(memberCount: number, tiers: [number, number, number]): 0 | 1 | 2 | 3 {
+export function memberTier(
+  memberCount: number,
+  tiers: [number, number, number],
+): 0 | 1 | 2 | 3 {
   if (memberCount <= 2) return 0;
   if (memberCount <= tiers[0]) return 1; // 3–8
   if (memberCount <= tiers[1]) return 2; // 9–30
@@ -130,7 +137,8 @@ export class DefaultDeliveryPolicy implements DeliveryPolicy {
     const mentionsMe = env.mentions?.includes(me) ?? false;
 
     // 行 1：带我在等的 correlationId 的应答 → steer（所有列）
-    if (env.correlationId && this.deps.isAwaiting(me, env.correlationId)) return "steer";
+    if (env.correlationId && this.deps.isAwaiting(me, env.correlationId))
+      return "steer";
     // 行 2：expect=reply 且指向我
     if (env.expect === "reply" && (targetsMe || mentionsMe)) {
       return tier === 3 ? "followUp" : "steer";
@@ -185,7 +193,8 @@ export class DefaultActivationPolicy implements ActivationPolicy {
     const targetsMe = !env.to || env.to.length === 0 || env.to.includes(me);
     const mentionsMe = env.mentions?.includes(me) ?? false;
     return (
-      (env.correlationId !== undefined && ctx.awaitingCorrelations.includes(env.correlationId)) || // ① 我在等的应答回来
+      (env.correlationId !== undefined &&
+        ctx.awaitingCorrelations.includes(env.correlationId)) || // ① 我在等的应答回来
       (env.expect !== "none" && (targetsMe || mentionsMe)) || // ②③ 有期望且指向我（§12.3②：expect ≠ none 唤醒）
       env.priority === "urgent" // ④ 紧急
     );
@@ -259,7 +268,12 @@ export class DefaultRetentionPolicy implements RetentionPolicy {
    */
   verbatimBudget(_ctx: {
     accountId: AccountId;
-    conversations: Array<{ id: ConversationId; gap: number; lastActiveSeq: number; unreadBytes: number }>;
+    conversations: Array<{
+      id: ConversationId;
+      gap: number;
+      lastActiveSeq: number;
+      unreadBytes: number;
+    }>;
   }): VerbatimBudget {
     void _ctx;
     return { bytes: Number.MAX_SAFE_INTEGER, ttlSeq: this.gapK };
@@ -322,7 +336,9 @@ export class WakeRateLimiter {
   /** 是否已超限（超限则强制降为 silent，计 wake_throttled） */
   exceeds(accountId: AccountId, now = Date.now()): boolean {
     const win = this.windows.get(accountId) ?? [];
-    const fresh = win.filter((t) => now - t < this.limits.wakeRateLimit.windowMs);
+    const fresh = win.filter(
+      (t) => now - t < this.limits.wakeRateLimit.windowMs,
+    );
     this.windows.set(accountId, fresh);
     return fresh.length >= this.limits.wakeRateLimit.count;
   }
@@ -341,20 +357,29 @@ export class WakeRateLimiter {
 
 // ─── 装配：默认 Policies（sessionFactory 必填由调用方提供）──────────────
 
-export interface DefaultPolicyDeps extends DeliveryMatrixDeps, EndpointLookupDeps {
+export interface DefaultPolicyDeps
+  extends DeliveryMatrixDeps,
+    EndpointLookupDeps {
   limits: Limits;
 }
 
-export function createDefaultPolicies(deps: DefaultPolicyDeps): Omit<Policies, "sessionFactory"> {
+export function createDefaultPolicies(
+  deps: DefaultPolicyDeps,
+): Omit<Policies, "sessionFactory"> {
   return {
-    delivery: new DefaultDeliveryPolicy({ isAwaiting: deps.isAwaiting, limits: deps.limits }),
+    delivery: new DefaultDeliveryPolicy({
+      isAwaiting: deps.isAwaiting,
+      limits: deps.limits,
+    }),
     activation: new DefaultActivationPolicy(),
     floor: new FreeForAllFloorPolicy(),
     renderer: new DefaultRenderer(),
     clock: new WallClockLogicalClock(),
     accessControl: new AllowAllAccessControl(),
     retention: new DefaultRetentionPolicy(deps.limits.verbatimGapK),
-    endpointSelector: new TopologyEndpointSelector({ endpointsOf: deps.endpointsOf })
+    endpointSelector: new TopologyEndpointSelector({
+      endpointsOf: deps.endpointsOf,
+    }),
   };
 }
 
@@ -364,6 +389,11 @@ export function directConversationWakes(kind: string): boolean {
 }
 
 /** A2：presence ∈ {dnd, offline} 时不唤醒；urgent 是默认开启的例外（§7.3） */
-export function presenceBlocksWake(presence: PresenceState, priority: string | undefined): boolean {
-  return (presence === "dnd" || presence === "offline") && priority !== "urgent";
+export function presenceBlocksWake(
+  presence: PresenceState,
+  priority: string | undefined,
+): boolean {
+  return (
+    (presence === "dnd" || presence === "offline") && priority !== "urgent"
+  );
 }
