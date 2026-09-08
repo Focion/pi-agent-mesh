@@ -23,7 +23,7 @@
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
     "check:imports": "node scripts/check-imports.mjs"
   },
   "dependencies": {
