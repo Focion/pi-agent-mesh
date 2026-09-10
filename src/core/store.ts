@@ -7,7 +7,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import Database from "better-sqlite3";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Store } from "./contracts.js";
@@ -43,12 +43,18 @@ export const REGISTERED_COUNTERS = new Set([
 ]);
 
 function migrationsDir(): string {
-  return join(
-    dirname(fileURLToPath(import.meta.url)),
-    "..",
-    "..",
-    "migrations",
-  );
+  // migrations/ 是与 dist/ 并列的包根资产（package.json `files` 声明、`exports`
+  // 暴露）。从本模块位置向上走，找到含 package.json 的目录即包根，再拼 migrations/。
+  // 这样源码直跑（vitest，src/core）与打包产物（dist/index.js、dist/core/index.js）
+  // 都能解析到同一个目录——后者由 tsup flatten，用 `../../migrations` 相对路径会偏一级。
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (;;) {
+    if (existsSync(join(dir, "package.json"))) return join(dir, "migrations");
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error("mesh: could not locate package root for migrations/");
 }
 
 export interface OpenStoreOptions {
