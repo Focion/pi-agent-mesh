@@ -45,7 +45,7 @@ import {
 
 // ─── 行类型（mesh_messages / mesh_deliveries 的本地投影）───────────────────
 
-interface MessageRow {
+export interface MessageRow {
   id: string;
   conversation_id: string;
   seq: number;
@@ -106,7 +106,7 @@ const DELIVERY_STATES: readonly DeliveryState[] = [
 /** C5 口径：哪些状态算「还在收件箱里」 */
 const PENDING_STATES = "('routed','queued','parked','delivered')";
 
-function rowToEnvelope(r: MessageRow): Envelope {
+export function rowToEnvelope(r: MessageRow): Envelope {
   const payload = jsonParse<
     Partial<EnvelopePayload> & { claim?: { by: string; at: string } }
   >(r.payload, {});

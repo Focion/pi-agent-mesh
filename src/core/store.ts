@@ -91,14 +91,26 @@ export class SqliteStore implements Store {
     const files = readdirSync(dir)
       .filter((f) => /^\d{3}_.*\.sql$/.test(f))
       .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    const applied = new Set(
+    // 新库上 mesh_meta 尚不存在（由 000_init.sql 创建）：先查表是否存在，
+    // 而不是一上来就 SELECT——否则首次迁移必然抛「no such table: mesh_meta」。
+    const hasMeta =
       (
         this.db
-          .prepare<[], { k: string }>(
-            "SELECT k FROM mesh_meta WHERE k LIKE 'migration:%'",
+          .prepare(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='mesh_meta'",
           )
-          .all() as Array<{ k: string }>
-      ).map((r) => r.k.replace("migration:", "")),
+          .get() as { n: number }
+      ).n > 0;
+    const applied = new Set(
+      hasMeta
+        ? (
+            this.db
+              .prepare<[], { k: string }>(
+                "SELECT k FROM mesh_meta WHERE k LIKE 'migration:%'",
+              )
+              .all() as Array<{ k: string }>
+          ).map((r) => r.k.replace("migration:", ""))
+        : [],
     );
     for (const f of files) {
       if (applied.has(f)) continue;

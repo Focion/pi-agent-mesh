@@ -163,6 +163,8 @@ export interface Mailbox {
   sweep(nowMs?: number): Promise<void>;
   /** warm 成功后：该端点 parked → queued 并重投 */
   retryEndpoint(endpointId: EndpointId): Promise<void>;
+  /** 账号级重投（sink handler 注册晚于投递到达等场景）：该账号 parked → queued 并重投 */
+  retryAccount(accountId: AccountId): Promise<void>;
   /** I22：clearQueue 前把 delivered 未 consumed 回退为 queued */
   beforeClearQueue(endpointId: EndpointId): Promise<void>;
   /** sink/external 的消费确认（无 turn_end，§12.2 ④） */

@@ -288,10 +288,10 @@ export class MeshMailbox implements Mailbox {
     // 定档与选端结果落库（queued = 定档完成，§7.9）
     this.d.store.db
       .prepare(
-        "UPDATE mesh_deliveries SET state = 'queued', grade = ?, endpoint_id = ?, path = ?, woke = ?, state_changed_at = ? " +
+        "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, grade = ?, endpoint_id = ?, path = ?, woke = ?, state_changed_at = ? " +
           "WHERE id = ?",
       )
-      .run(grade, endpointId, path, woke ? 1 : 0, isoNow(), row.id);
+      .run(isoNow(), grade, endpointId, path, woke ? 1 : 0, isoNow(), row.id);
     const live: DeliveryRow = { ...row, state: "queued", grade, endpoint_id: endpointId, path };
 
     if (path === "P3") {
@@ -387,9 +387,9 @@ export class MeshMailbox implements Mailbox {
     }
     this.d.store.db
       .prepare(
-        "UPDATE mesh_deliveries SET state = 'queued', path = 'P1', grade = ?, state_changed_at = ? WHERE id = ?",
+        "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, path = 'P1', grade = ?, state_changed_at = ? WHERE id = ?",
       )
-      .run("followUp", isoNow(), row.id);
+      .run(isoNow(), "followUp", isoNow(), row.id);
     const rendered = d.policies.renderer.renderMessage(envelope, {
       recipient: account,
       senderName: this.nameOf(envelope.from),
@@ -925,24 +925,40 @@ export class MeshMailbox implements Mailbox {
             .all(endpointId)
     ) as DeliveryRow[];
     for (const row of rows) {
-      d.store.db
-        .prepare(
-          "UPDATE mesh_deliveries SET state = 'queued', parked_reason = NULL, parked_at = NULL, state_changed_at = ? WHERE id = ?",
-        )
-        .run(isoNow(), row.id);
-      const env = this.envelopeOf(row.message_id);
-      if (env) await this.deliverOne(env, { ...row, state: "queued" });
+      await this.requeueParked(row);
     }
+  }
+
+  /** 账号级重投（§6.3③：sink handler 注册晚于投递到达 → NO_SINK_HANDLER 解除） */
+  async retryAccount(accountId: AccountId): Promise<void> {
+    const rows = this.d.store.db
+      .prepare<[string], DeliveryRow>(
+        "SELECT * FROM mesh_deliveries WHERE state = 'parked' AND account_id = ?",
+      )
+      .all(accountId) as DeliveryRow[];
+    for (const row of rows) {
+      await this.requeueParked(row);
+    }
+  }
+
+  private async requeueParked(row: DeliveryRow): Promise<void> {
+    this.d.store.db
+      .prepare(
+        "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, parked_reason = NULL, parked_at = NULL, state_changed_at = ? WHERE id = ?",
+      )
+      .run(isoNow(), isoNow(), row.id);
+    const env = this.envelopeOf(row.message_id);
+    if (env) await this.deliverOne(env, { ...row, state: "queued" });
   }
 
   /** I22：clearQueue 前把 delivered 未 consumed 回退为 queued（清空后重投） */
   async beforeClearQueue(endpointId: EndpointId): Promise<void> {
     this.d.store.db
       .prepare(
-        "UPDATE mesh_deliveries SET state = 'queued', consumed_at = NULL, entry_id = NULL, state_changed_at = ? " +
+        "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, consumed_at = NULL, entry_id = NULL, state_changed_at = ? " +
           "WHERE endpoint_id = ? AND state = 'delivered'",
       )
-      .run(isoNow(), endpointId);
+      .run(isoNow(), isoNow(), endpointId);
   }
 
   /** sink/external 的消费确认（无 turn_end，§12.2 ④） */
