@@ -90,8 +90,8 @@ sameHost（§19.3）的实现（`SameHostTransport` + `EndpointLock` shared 共�
 
 | # | 项 | 说明 | 处置 |
 | --- | --- | --- | --- |
-| L1 | `isEndpointLocal` 无锁文件即「本进程」（`index.ts:471`） | 对 external 端点若 owner 进程崩溃（锁残留但按 M3 不自动清），会误判 local 并就地 auto-warm。§19 设计里这属于「运维未确认前不接管」的纪律缺口 | 文档写明运维边界：owner 崩溃需 `forceRelease` 后才可被接管 |
-| L2 | stale 端点锁不自动回收 | `crashed` 进程留的 endpoint `.lock` 会让该端点永远收不到 outbox 投递 | 这是 M3 的**正确**行为（`:6572`），非 bug；补运维文档/Demo 提示即可 |
+| L1 | `isEndpointLocal` 无锁文件即「本进程」（`index.ts:471`） | 对 external 端点若 owner 进程崩溃（锁残留但按 M3 不自动清），会误判 local 并就地 auto-warm。§19 设计里这属于「运维未确认前不接管」的纪律缺口 | ✅ 已修（2026-10-01）：`isEndpointLocal` 改读 `mesh_endpoints.lock_path` + `endpointClass`——`external` 恒 outbox、绝不本地 auto-warm；`stream` 按 lock.writerId 判本/他进程。见 `notes/plan/2026-10-01-deferred-fixes-plan.md` A2-3 |
+| L2 | stale 端点锁不自动回收 | `crashed` 进程留的 endpoint `.lock` 会让该端点永远收不到 outbox 投递 | ✅ 已修（2026-10-01）补上显式接管面：`MeshHost.reclaimEndpoint(endpointId)`（`ownerIsLive` 判活，`dead` 才 `forceRelease`）+ `createMesh({recoverDeadEndpoints})` 启动判活开关——M3「绝不猜」边界保留（判活不上来 ⇒ `unknown` ⇒ 保持 unavailable + 告警）。见 plan A2-4 |
 | L3 | `warm` 重复调用覆盖 `transportSubs` | `index.ts:1137` 二次 warm 会 `subscribe` 覆盖旧句柄（`transport.subscribe` 内部 `set` 已替换 handler，无泄漏），旧 unsub 被孤儿化 | 幂等 warm 下无实际泄漏，可忽略 |
 | L4 | `runPollCycle` 的 `await handler(pd)` 与 `setInterval` 可并发重入 | 同进程第二圈轮询会看到行已 `claimed` 而跳过，CAS 兜底 | 安全，无需改 |
 

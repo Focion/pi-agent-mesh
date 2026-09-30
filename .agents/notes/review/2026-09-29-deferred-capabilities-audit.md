@@ -48,7 +48,7 @@ related:
 | # | 缺陷 | 位置 | 重要程度 | 作用 / 影响 |
 | --- | --- | --- | --- | --- |
 | 8 | 崩溃恢复收件箱重算不完整 | `src/core/store.ts` `recomputeInboxCaches` | 🟡 中（正确性） ✅ 已修复（2026-09-29） | 现已补 `verbatim_bytes`（`from_account` 原文预算，字节口径，topic 不计）与 `overflow_count`（`dropped/folded`）；`overflow_summary` 恢复置 NULL（不伪造）。`cursor_seq / folded_to_seq` 按 §8.4 是**权威状态**、**不重算**——原 TODO 把两者列为待重算是与规范漂移，已改正 |
-| 9 | `endpointSelector` 的 `perConversation` 不哈希 | `src/core/policies.ts:324` | 🟢 低 | `perConversation` 拓扑未按 `hash(accountId,key)` 选端点，恒取第一条。当前同账号通常只有一条端点，无感；多端点 perConversation 时才错 |
+| 9 | `endpointSelector` 的 `perConversation` 不哈希 | `src/core/policies.ts:324` | 🟢 低 ✅ 已修复（2026-10-01） | `select` 的 ctx 补全 `conversationId` + 完整 `StreamTopology`；`perConversation` 分支按 `anchor = scope==="purpose" ? requestType : conversationId`、`idx = sha256Hex(accountId+":"+anchor) % N` 稳选槽位；无 perConversation 端点回退 `eps[0]`。`EndpointLookupDeps.endpointsOf` 已携带 `topology`。见 `tests/core/selector.test.ts`（5 用例） |
 
 ---
 
@@ -100,3 +100,19 @@ related:
 | demo 能力页 | 五页齐全（Topic / 请求-应答 / Queue / 共享空间 / Replay），但 `runScenario` 仍只支持 `"P0"|"P1"`，未加新能力的「一键场景」——demo 打磨项，非能力缺口 |
 
 **当前唯一 `MeshUnsupportedError` 运行时桩：`observer.forkAt`（#1，🟢 低，取证型）。** 其余均为声明类型对规范的显式简化（§16.4 逐订阅者预算、PutResult/GetResult 联合、保留窗口裁剪）与几处内部细节（#9 选择器哈希、demo 一键场景），无「现在就该做」的项。
+
+## 七、2026-10-01 复核结论（A/C 落地，D 维持延后）
+
+按 `notes/plan/2026-10-01-deferred-fixes-plan.md` 落地结果，逐项对账：
+
+| 核对项 | 结果 |
+| --- | --- |
+| **A. sameHost 端点归属 + 死写者恢复**（30 日 review L1/L2 + 新发现 C10） | ✅ 已修：`lock_path` 首次真正落库（warm/evict 经 `registry.setEndpointLock`，C10 不再恒触发）；`isEndpointLocal` 改读 DB `lock_path` + `endpointClass`（`external` 恒 outbox）；`EndpointLock.ownerIsLive` 三态判活（`kill -0` + 启动时刻 pid 复用护栏）；`MeshHost.reclaimEndpoint` + `createMesh({recoverDeadEndpoints})` 显式接管开关。测试：`tests/pi/stream-port.test.ts`（ownerIsLive 5 用例 + lock_path 落库 1 用例）、`tests/e2e/samehost.test.ts`（reclaimEndpoint 3 子用例） |
+| **#9 perConversation 选择器哈希** | ✅ 已修：`select` 补 `conversationId` + 完整 `StreamTopology`，按 `sha256Hex(accountId:key) % N` 稳选槽位（读法 2）。`tests/core/selector.test.ts` 5 用例 |
+| **#4 topic 逐订阅者 RetentionPolicy 预算** | 保持 fanout 简化，不改（🟢 低）。风险点仅订阅者极多时的写放大，已记入技术债 |
+| **#6 `PutResult`/`GetResult` 联合类型** | 保持 reject/null，不改（🟢 低）。`shared.getRaw()` 按既定决定**不做**，等真实需求 |
+| **#7 保留窗口 `purged` 分支** | 单列后续「裁剪」小项：按保留窗口删 `mesh_shared_versions` 旧行 + `purged` 标记，一次小 PR，不并入本计划 |
+| **#1 forkAt** | 维持延后（🟢 低，取证型），触发条件不变。仍为唯一 `MeshUnsupportedError` 运行时桩 |
+| **F. demo runScenario 一键场景** | **作废**：demo 已重构为「群聊-only」形态（`demo/public/app.js` 1018→211 行，五能力页未保留）。能力面的 RPC/控制器委托仍在（`rpc.ts` 的 `subscribe/unsubscribe/request/ack/claim/requeue/shared*/replay` 均透传 host），未来若要能力页可直接在其上搭 UI，无需新插桩 |
+
+**本轮净结果**：L1/L2 + C10（3 处正确性相关）与 #9（确定性路由）关闭；#1 与 #11（跨机）维持延后；#4/#6/#7 维持「声明类型显式简化」定界，其中 #7 单独挂技术债。

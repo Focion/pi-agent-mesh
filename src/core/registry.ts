@@ -422,6 +422,13 @@ export class MeshRegistry implements Registry {
       .run(lease, until, id);
   }
 
+  /** §8.3/§19.4：warm 抢到锁后落库归属（lock_path），evict 清空。C10 锁一致的持久真相。 */
+  setEndpointLock(id: EndpointId, lockPath: string | null): void {
+    this.db
+      .prepare("UPDATE mesh_endpoints SET lock_path = ? WHERE id = ?")
+      .run(lockPath, id);
+  }
+
   /** pooled 拓扑注册 size 条端点 */
   registerPooledEndpoints(
     accountId: AccountId,

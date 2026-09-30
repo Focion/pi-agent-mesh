@@ -32,6 +32,7 @@ import type {
   PolicySlot,
   PresenceState,
   RetentionPolicy,
+  StreamTopology,
   VerbatimBudget,
 } from "./types.js";
 import { DefaultRenderer } from "./renderer.js";
@@ -287,7 +288,7 @@ export class DefaultRetentionPolicy implements RetentionPolicy {
 // ─── ⑧ EndpointSelector：按拓扑解析（§8.1）──────────────────────────────
 
 export interface EndpointLookupDeps {
-  endpointsOf(accountId: string): Array<{ id: EndpointId; inFlight: number }>;
+  endpointsOf(accountId: string): Array<{ id: EndpointId; inFlight: number; topology: StreamTopology }>;
 }
 
 export class TopologyEndpointSelector implements EndpointSelector {
@@ -298,9 +299,10 @@ export class TopologyEndpointSelector implements EndpointSelector {
   }
 
   select(ctx: {
-    accountId: string;
+    accountId: AccountId;
+    conversationId: ConversationId;
     envelope: Envelope;
-    topology: { kind: string; affinity?: string };
+    topology: StreamTopology;
   }): EndpointId | EndpointId[] | null {
     const eps = this.deps.endpointsOf(ctx.accountId);
     if (eps.length === 0) return null;
@@ -317,13 +319,24 @@ export class TopologyEndpointSelector implements EndpointSelector {
         const anchor =
           ctx.topology.affinity === "sender"
             ? ctx.envelope.from
-            : ctx.envelope.conversationId;
+            : ctx.conversationId;
         const idx = sha256Hex(anchor).codePointAt(0)! % eps.length;
         return eps[idx]!.id;
       }
-      case "perConversation":
+      case "perConversation": {
+        // §8.1：endpointId = hash(accountId, key)。key = 会话（scope="conversation"）或
+        // 用途（scope="purpose" ← requestType）。注册端点带 scope_key（ux_endpoint_percv
+        // 唯一）→ 先精确命中；无命中则在 perConversation 端点里按 hash 稳定选一条兜底。
+        const scope = ctx.topology.scope ?? "conversation";
+        const key = scope === "purpose" ? (ctx.envelope.requestType ?? ctx.envelope.kind) : ctx.conversationId;
+        const percv = eps.filter((e) => e.topology.kind === "perConversation");
+        if (percv.length === 0) return eps[0]!.id; // 账号未按 perConversation 注册 ⇒ 回退首条
+        const exact = percv.find((e) => e.topology.kind === "perConversation" && e.topology.key === key);
+        if (exact) return exact.id;
+        const idx = sha256Hex(`${ctx.accountId}:${key}`).codePointAt(0)! % percv.length;
+        return percv[idx]!.id;
+      }
       default:
-        // hash(accountId, key)（§8.1）；P1 阶段同账号通常只有一条，直接命中
         return eps[0]!.id;
     }
   }

@@ -60,6 +60,7 @@ function makeHarness(
         registry.endpointsOf(acct).map((e) => ({
           id: e.id,
           inFlight: 0,
+          topology: e.topology,
         })),
       limits,
     }),

@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { createMesh } from "../../src/index.js";
 import type { MeshHost, SessionFactory } from "../../src/index.js";
+import { EndpointLock } from "../../src/index.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -201,6 +202,40 @@ describe("sameHost two-process delivery (§19.3)", () => {
     expect(await ctxB.host.observer.checkInvariants().then((r) => r.violations)).toEqual([]);
 
     await ctxA.host.close();
+    await ctxB.host.close();
+  });
+});
+
+describe("reclaimEndpoint：死写者锁恢复（M-R10 / §27.4）", () => {
+  it("死 pid 残留锁 ⇒ reclaimed；活锁 ⇒ held；取不到启动时刻 ⇒ unknown", async () => {
+    const dbPath = join(tmpdir(), `mesh-reclaim-${Date.now()}.db`);
+    const ctxB = await makeHost(dbPath, "B", "ep-b", { pollIntervalMs: 100 });
+
+    const locksDir = join(ctxB.dir, "mesh", "locks");
+    await mkdir(locksDir, { recursive: true });
+    const lockPath = join(locksDir, `${ctxB.epId}.lock`);
+
+    // ① 死 pid 残留锁（owner 崩溃）：可回收
+    await writeFile(
+      lockPath,
+      JSON.stringify({ writerId: "crashed", pid: 99_999_999, lease: "exclusive", acquiredAt: "", leaseUntil: null, procStartedAt: "" }),
+    );
+    expect(await ctxB.host.reclaimEndpoint(ctxB.epId)).toEqual({ outcome: "reclaimed" });
+    expect(await EndpointLock.readInfo(lockPath)).toBeUndefined();
+    await ctxB.host.warm(ctxB.epId); // 回收后本进程可 warm
+
+    // ② 活锁（本进程持有时）：拒绝接管，绝不猜
+    const held = await EndpointLock.acquire(lockPath, { writerId: "live-owner", lease: "shared" });
+    expect(await ctxB.host.reclaimEndpoint(ctxB.epId)).toEqual({ outcome: "held" });
+    await held.release();
+
+    // ③ 取不到启动时刻（pid 存活、procStartedAt 空）：保守拒绝 unknown
+    await writeFile(
+      lockPath,
+      JSON.stringify({ writerId: "ambiguous", pid: process.pid, lease: "shared", acquiredAt: "", leaseUntil: null, procStartedAt: "" }),
+    );
+    expect(await ctxB.host.reclaimEndpoint(ctxB.epId)).toEqual({ outcome: "unknown" });
+
     await ctxB.host.close();
   });
 });

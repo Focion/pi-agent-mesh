@@ -4,7 +4,8 @@
 // 全部走 faux provider，无 LLM 成本。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -131,6 +132,7 @@ beforeEach(async () => {
         e.leaseUntil = until;
       }
     },
+    setEndpointLock: () => {},
     stateDir: dir,
     idleEvictMs: 0, // 测试不做空闲驱逐
     onDegraded: (info) => degraded.push(info),
@@ -179,6 +181,7 @@ describe("PiStreamPort: warm 与 .lock 单写者（M3 / §8.4①）", () => {
       },
       setEndpointSession: () => {},
       setEndpointLease: () => {},
+      setEndpointLock: () => {},
       stateDir: dir,
       idleEvictMs: 0,
     });
@@ -206,6 +209,7 @@ describe("PiStreamPort: warm 与 .lock 单写者（M3 / §8.4①）", () => {
           e.leaseUntil = until;
         }
       },
+      setEndpointLock: () => {},
       stateDir: dir,
       idleEvictMs: 0,
       exclusiveLeaseTtlMs: 120,
@@ -357,5 +361,79 @@ describe("EndpointLock 单元行为", () => {
     expect(lock.held()).toBe(false);
     expect(() => lock.assertHeld("ep_x")).toThrow(/invariant_violated/);
     await lock.release();
+  });
+});
+
+describe("EndpointLock.ownerIsLive：死写者判定（M-R10 / §27.4）", () => {
+  beforeEach(() => mkdirSync(join(dir, "locks"), { recursive: true }));
+
+  it("pid 不存在的死锁 ⇒ dead（kill -0 失败，允许接管）", async () => {
+    const p = join(dir, "locks", "ovl1.lock");
+    await writeFile(
+      p,
+      JSON.stringify({ writerId: "w-dead", pid: 99_999_999, lease: "shared", acquiredAt: "", leaseUntil: null, procStartedAt: "" }),
+    );
+    expect(await EndpointLock.ownerIsLive(p)).toBe("dead");
+  });
+
+  it("本进程持有的锁 ⇒ alive（pid 存活且启动时刻吻合）", async () => {
+    const p = join(dir, "locks", "ovl2.lock");
+    const lock = await EndpointLock.acquire(p, { writerId: "w-live", lease: "shared" });
+    expect(await EndpointLock.ownerIsLive(p)).toBe("alive");
+    await lock.release();
+  });
+
+  it("pid 存活但启动时刻不吻合 ⇒ dead（pid 已被复用）", async () => {
+    const p = join(dir, "locks", "ovl3.lock");
+    const lock = await EndpointLock.acquire(p, { writerId: "w-stale", lease: "shared" });
+    // 覆写启动时刻，模拟 pid 被复用的残留锁
+    await writeFile(
+      p,
+      JSON.stringify({ writerId: "w-stale", pid: process.pid, lease: "shared", acquiredAt: "", leaseUntil: null, procStartedAt: "Thu Jan  1 00:00:00 1970" }),
+    );
+    expect(await EndpointLock.ownerIsLive(p)).toBe("dead");
+    await lock.release();
+  });
+
+  it("pid 存活但取不到启动时刻 ⇒ unknown（保守拒绝，绝不猜）", async () => {
+    const p = join(dir, "locks", "ovl4.lock");
+    await writeFile(
+      p,
+      JSON.stringify({ writerId: "w-old", pid: process.pid, lease: "shared", acquiredAt: "", leaseUntil: null, procStartedAt: "" }),
+    );
+    expect(await EndpointLock.ownerIsLive(p)).toBe("unknown");
+  });
+
+  it("锁文件不存在 ⇒ dead（无持有者）", async () => {
+    expect(await EndpointLock.ownerIsLive(join(dir, "locks", "ovl5.lock"))).toBe("dead");
+  });
+});
+
+describe("PiStreamPort: lock_path 归属落库（§19.4 / C10）", () => {
+  it("warm 抢到锁后落 lock_path，evict 清空", async () => {
+    const lockPaths = new Map<string, string | null>();
+    // 用真实注册表语义的 setEndpointLock：记录到 Map，供断言
+    const factory = await createTestFactory(faux, dir);
+    const tracking = new PiStreamPort({
+      sessionFactory: factory,
+      getEndpoint: (id) => endpoints.get(id),
+      getAccount: (id) => accounts.get(id),
+      buildTools: () => [],
+      setEndpointState: (id, state) => {
+        const e = endpoints.get(id);
+        if (e) e.state = state;
+      },
+      setEndpointSession: () => {},
+      setEndpointLease: () => {},
+      setEndpointLock: (id, p) => lockPaths.set(id, p),
+      stateDir: dir,
+      idleEvictMs: 0,
+    });
+    const ep = addEndpoint();
+    await tracking.warm(ep.id, "shared");
+    expect(lockPaths.get(ep.id)).toBe(join(dir, "locks", `${ep.id}.lock`));
+    await tracking.evict(ep.id);
+    expect(lockPaths.get(ep.id)).toBeNull();
+    await tracking.dispose();
   });
 });

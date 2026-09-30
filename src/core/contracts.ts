@@ -86,6 +86,8 @@ export interface Registry {
   updateEndpointState(id: EndpointId, state: EndpointState): void;
   setEndpointSession(id: EndpointId, piSessionId: string): void;
   setEndpointLease(id: EndpointId, lease: MeshLease, until: string | null): void;
+  /** §8.3/§19.4：warm 落库 lock_path 归属，evict 清空（null）。 */
+  setEndpointLock(id: EndpointId, lockPath: string | null): void;
 
   // ── 会话 ──
   /** 幂等：同一对账号恒得同一 id（§9.1 派生式 id） */

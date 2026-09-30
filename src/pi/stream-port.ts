@@ -56,6 +56,8 @@ export interface PiStreamPortDeps {
   setEndpointState(id: EndpointId, state: EndpointState): void;
   setEndpointSession(id: EndpointId, piSessionId: string): void;
   setEndpointLease(id: EndpointId, lease: MeshLease, until: string | null): void;
+  /** §8.3/§19.4：warm 抢到锁后落库 lock_path 归属（C10 锁一致），evict 清空（null） */
+  setEndpointLock(id: EndpointId, lockPath: string | null): void;
   /** §8.3 clearQueue 协议：仍有 delivered 未 consumed 时不驱逐 */
   hasUnconsumed?(endpointId: EndpointId): boolean;
   /** 锁文件目录（<stateDir>/locks/<endpointId>.lock） */
@@ -210,6 +212,8 @@ export class PiStreamPort implements StreamPort {
       }
       throw err;
     }
+    // §19.4：lock_path 落库＝「这条流归本进程」，是 isEndpointLocal 与 C10 的持久真相。
+    d.setEndpointLock(endpointId, lock.lockPath);
 
     // ② SessionFactory 建/恢复（失败 ⇒ NO_SESSION，§7.10 唯一要告警的）
     const tools = d.buildTools(endpointId);
@@ -232,6 +236,7 @@ export class PiStreamPort implements StreamPort {
       }
     } catch (err) {
       await lock.release();
+      d.setEndpointLock(endpointId, null);
       d.setEndpointState(endpointId, "unavailable");
       if (err instanceof PiPortError) throw err;
       throw new PiPortError(
@@ -322,6 +327,7 @@ export class PiStreamPort implements StreamPort {
       // dispose 失败同样不阻断（§8.3 驱逐是内存管理，不是数据操作）
     }
     await rec.lock.release();
+    d.setEndpointLock(endpointId, null);
     // 挂在 waiter 上的 deliver 以 undefined 收场（调用方走 handoff 超时重投）
     for (const w of rec.waiters.splice(0)) w.resolve(undefined);
     this.streams.delete(endpointId);

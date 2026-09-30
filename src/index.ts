@@ -60,6 +60,7 @@ import type {
   RegisterEndpointInput,
   SendInput,
   SinkHandler,
+  StreamTopology,
   ToolDefinition,
   Unsubscribe,
 } from "./core/types.js";
@@ -317,22 +318,44 @@ export async function createMesh(options: MeshOptions): Promise<MeshHost> {
   // §19.3：sameHost（多进程同机）下 N 个进程合法共享同一 dbPath；单进程则严格排他。
   const useSameHost =
     options.transport === "sameHost" || options.transport instanceof SameHostTransport;
+  // §27.4 / M-R10：接管前必须验证持锁者 pid 真的不存在（kill -0 + 启动时刻），才回收陈旧锁。
+  const recoverDead = options.recoverDeadEndpoints === true;
 
   // ② 抢占实例锁（M3：单实例排他；sameHost 下多进程附着）
   try {
     if (options.dbPath !== ":memory:") {
+      const endpointIds = (store.db
+        .prepare<[], { id: string }>("SELECT id FROM mesh_endpoints")
+        .all() as Array<{ id: string }>).map((r) => r.id);
+
+      // recoverDeadEndpoints：先回收死写者遗留的实例锁（单进程崩溃后 .instance.lock 残留会挡住重启）。
+      if (recoverDead && !useSameHost) {
+        const instPath = options.dbPath + ".instance.lock";
+        if ((await EndpointLock.ownerIsLive(instPath)) === "dead") {
+          await EndpointLock.forceRelease(instPath);
+        }
+      }
       instanceLock = await EndpointLock.acquire(options.dbPath + ".instance.lock", {
         writerId,
         lease: "shared",
         mode: useSameHost ? "multi" : "single",
       });
+
+      // recoverDeadEndpoints：回收死写者遗留的端点锁，暖化不被陈旧锁卡死（M-R10 唯一合法自动回收）。
+      if (recoverDead) {
+        for (const id of endpointIds) {
+          const lockPath = join(stateDir, "locks", `${id}.lock`);
+          if ((await EndpointLock.ownerIsLive(lockPath)) === "dead") {
+            await EndpointLock.forceRelease(lockPath);
+            store.db.prepare("UPDATE mesh_endpoints SET lock_path = NULL WHERE id = ?").run(id);
+          }
+        }
+      }
+
       // 端点锁探测（单进程形态，§8.4①的权威顺序靠它）：任何已注册端点的锁被他人
       // 持有 ⇒ 拒绝启动。sameHost 下跳过——端点归属唯一进程（§19.4），他进程持有的
       // 端点锁是常态，单写者由 warm 时的 acquire 兜底，启动期不得据此拒绝。
       if (!useSameHost) {
-        const endpointIds = (store.db
-          .prepare<[], { id: string }>("SELECT id FROM mesh_endpoints")
-          .all() as Array<{ id: string }>).map((r) => r.id);
         for (const id of endpointIds) {
           const probe = await EndpointLock.acquire(join(stateDir, "locks", `${id}.lock`), { writerId });
           await probe.release();
@@ -406,8 +429,8 @@ export async function createMesh(options: MeshOptions): Promise<MeshHost> {
     ) > 0;
   };
 
-  const endpointsOf = (acct: AccountId): Array<{ id: EndpointId; inFlight: number }> =>
-    registry.endpointsOf(acct).map((e) => ({ id: e.id, inFlight: mailbox ? mailbox.inFlightCount(e.id) : 0 }));
+  const endpointsOf = (acct: AccountId): Array<{ id: EndpointId; inFlight: number; topology: StreamTopology }> =>
+    registry.endpointsOf(acct).map((e) => ({ id: e.id, inFlight: mailbox ? mailbox.inFlightCount(e.id) : 0, topology: e.topology }));
 
   const defaults = createDefaultPolicies({ isAwaiting, endpointsOf, limits });
   const policies: Policies = { ...defaults, ...options.policies };
@@ -444,6 +467,7 @@ export async function createMesh(options: MeshOptions): Promise<MeshHost> {
     setEndpointState,
     setEndpointSession: (id, sid) => registry.setEndpointSession(id, sid),
     setEndpointLease: (id, lease, until) => registry.setEndpointLease(id, lease, until),
+    setEndpointLock: (id, p) => registry.setEndpointLock(id, p),
     hasUnconsumed,
     stateDir,
     exclusiveLeaseTtlMs: limits.exclusiveLeaseTtlMs,
@@ -473,10 +497,23 @@ export async function createMesh(options: MeshOptions): Promise<MeshHost> {
     // 单进程 InProcessTransport 恒为 true（无锁探测必要）
     if (!(transport instanceof SameHostTransport)) return true;
     try {
-      const lockPath = join(stateDir, "locks", `${endpointId}.lock`);
+      // 归属真相（§19.4）：warm 时落库的 lock_path；他进程托管的 external 账号恒不走本进程直派。
+      const row = store.db
+        .prepare<[string], { lock_path: string | null; account_id: string }>(
+          "SELECT lock_path, account_id FROM mesh_endpoints WHERE id = ?",
+        )
+        .get(endpointId);
+      if (row) {
+        const acct = registry.getAccount(row.account_id);
+        if (acct && acct.endpointClass !== "stream") return false;
+      }
+      const lockPath = row?.lock_path ?? join(stateDir, "locks", `${endpointId}.lock`);
       const info = await EndpointLock.readInfo(lockPath);
-      // 无锁文件 ⇒ 端点未 warm 或 FakeStreamPort ⇒ 保守视为本进程
-      if (!info) return true;
+      if (!info) {
+        // 无锁文件且 lock_path 空＝从未归属 ⇒ 本进程可 warm（O_EXCL 兜底单写者）。
+        // lock_path 已落库但文件消失（owner 崩溃残留）⇒ 保守判他进程，交 outbox，等运维 reclaim。
+        return !row?.lock_path;
+      }
       return info.writerId === writerId;
     } catch {
       return true; // 读不到锁信息时保守视为本进程
@@ -1153,6 +1190,19 @@ export async function createMesh(options: MeshOptions): Promise<MeshHost> {
       transportSubs.get(endpointId)?.();
       transportSubs.delete(endpointId);
       await port.evict(endpointId);
+    },
+    async reclaimEndpoint(endpointId) {
+      // §27.4 / M-R10：只有 ownerIsLive === "dead" 才回收；alive/unknown 一律拒绝（绝不猜）。
+      const lockPath = join(stateDir, "locks", `${endpointId}.lock`);
+      const verdict = await EndpointLock.ownerIsLive(lockPath);
+      if (verdict !== "dead") {
+        const ep = registry.getEndpoint(endpointId);
+        if (ep) registry.updateEndpointState(endpointId, "unavailable");
+        return { outcome: verdict === "alive" ? "held" : "unknown" };
+      }
+      await EndpointLock.forceRelease(lockPath);
+      registry.setEndpointLock(endpointId, null);
+      return { outcome: "reclaimed" };
     },
     toolSet(endpointId: string, only?: MeshToolName[]): ToolDefinition[] {
       const ep = registry.getEndpoint(endpointId);

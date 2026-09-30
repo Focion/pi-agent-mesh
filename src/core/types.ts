@@ -868,6 +868,13 @@ export interface MeshHost {
   warm(endpointId: string, lease?: MeshLease): Promise<void>;
   evict(endpointId: string): Promise<void>;
   toolSet(endpointId: string, only?: MeshToolName[]): ToolDefinition[];
+  /**
+   * §27.4 / M-R10：路由「死写者」的陈旧端点锁。只有 `ownerIsLive === "dead"`（持锁
+   * 进程 pid 确实不存在，或启动时刻不吻合）才回收；否则拒绝。回收后该端点可重新 warm。
+   */
+  reclaimEndpoint(
+    endpointId: string
+  ): Promise<{ outcome: "reclaimed" | "held" | "unknown" }>;
 
   // ── 事件与观测 ──
   on<K extends keyof MeshEvents>(e: K, h: (p: MeshEvents[K]) => void): Unsubscribe;
@@ -895,6 +902,12 @@ export interface MeshOptions {
    * 默认 5000）。0 = 立即失败（`SQLITE_BUSY` 抛给调用方），多进程部署建议显式设置。
    */
   busyTimeoutMs?: number;
+  /**
+   * §27.4 / M-R10：启动时回收「死写者」遗留的陈旧锁（实例锁 + 端点锁）。
+   * 接管前验证持锁者 pid 真的不存在（kill -0 失败）+ 启动时刻吻合，才回收；
+   * 无法判定时保持拒绝、绝不猜（M3）。默认 false（崩溃后由运维人工清理）。
+   */
+  recoverDeadEndpoints?: boolean;
 }
 
 export declare function createMesh(options: MeshOptions): Promise<MeshHost>;

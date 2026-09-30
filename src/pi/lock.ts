@@ -18,11 +18,15 @@
 // 写入前校验本进程仍持有锁且租约未过期。
 // ═══════════════════════════════════════════════════════════════════════════
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { constants } from "node:fs";
 import { mkdir, open, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { MeshLease } from "../core/types.js";
 import { isoNow } from "../core/util.js";
+
+const execFileP = promisify(execFile);
 
 export interface LockInfo {
   writerId: string;
@@ -30,6 +34,29 @@ export interface LockInfo {
   lease: MeshLease;
   acquiredAt: string;
   leaseUntil: string | null;
+  /** 持锁进程的启动时刻（M-R10 的 pid 复用护栏）；取不到 ⇒ 空串 */
+  procStartedAt: string;
+}
+
+/** 进程存活判据（§27.4）：kill -0 可为 ESRCH（死）/ EPERM（活但无权限）/ 0（活） */
+async function pidAlive(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** 读某 pid 的进程启动时刻（ps -o lstart=，macOS/Linux 一致）；失败 ⇒ undefined */
+async function procStartedAt(pid: number): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="]);
+    const s = stdout.trim();
+    return s === "" ? undefined : s;
+  } catch {
+    return undefined;
+  }
 }
 
 export type LockMode = "single" | "multi";
@@ -56,6 +83,7 @@ export class EndpointLock {
     private lease: MeshLease,
     private leaseUntilMs: number | null,
     private readonly mode: LockMode,
+    private readonly procStartedAt: string,
   ) {}
 
   /**
@@ -71,7 +99,9 @@ export class EndpointLock {
     const mode = opts.mode ?? "single";
     const leaseUntilMs =
       lease === "exclusive" ? Date.now() + (opts.leaseTtlMs ?? 60_000) : null;
-    const lock = new EndpointLock(lockPath, opts.writerId, lease, leaseUntilMs, mode);
+    // 记录本进程启动时刻（M-R10）：接管的 pid 复用护栏要拿它与候选 pid 比对
+    const myStartedAt = (await procStartedAt(process.pid)) ?? "";
+    const lock = new EndpointLock(lockPath, opts.writerId, lease, leaseUntilMs, mode, myStartedAt);
     await mkdir(dirname(lockPath), { recursive: true });
     try {
       const fh = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
@@ -102,10 +132,28 @@ export class EndpointLock {
         lease: parsed.lease === "shared" ? "shared" : "exclusive",
         acquiredAt: typeof parsed.acquiredAt === "string" ? parsed.acquiredAt : "",
         leaseUntil: typeof parsed.leaseUntil === "string" ? parsed.leaseUntil : null,
+        procStartedAt: typeof parsed.procStartedAt === "string" ? parsed.procStartedAt : "",
       };
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * 死写者判定（§27.4 / M-R10）：锁文件的持有者是否「进程真的不存在」。
+   * - "dead"：pid 不存在（kill -0 失败），或其启动时刻与记录不符（pid 已被复用）——允许接管。
+   * - "alive"：pid 存活且启动时刻吻合——另一活进程持有，拒绝接管。
+   * - "unknown"：读到 pid 存活但取不到启动时刻，无法排除 pid 复用——保守拒绝，绝不猜（M3）。
+   * 锁文件不存在或不可读 ⇒ "dead"（无持有者）。
+   */
+  static async ownerIsLive(lockPath: string): Promise<"alive" | "dead" | "unknown"> {
+    const info = await EndpointLock.readInfo(lockPath);
+    if (!info) return "dead";
+    if (!(await pidAlive(info.pid))) return "dead";
+    if (!info.procStartedAt) return "unknown"; // 旧锁没有启动时刻，无法比对
+    const cur = await procStartedAt(info.pid);
+    if (cur === undefined) return "unknown";
+    return cur === info.procStartedAt ? "alive" : "dead";
   }
 
   /** 显式清除锁文件（宿主运维 / 测试用；恢复流程不得自动调用，M3） */
@@ -120,6 +168,7 @@ export class EndpointLock {
       lease: this.lease,
       acquiredAt: isoNow(),
       leaseUntil: this.leaseUntilMs === null ? null : new Date(this.leaseUntilMs).toISOString(),
+      procStartedAt: this.procStartedAt,
     };
   }
 
