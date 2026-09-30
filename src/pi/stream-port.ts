@@ -509,8 +509,9 @@ export class PiStreamPort implements StreamPort {
   private async ensureHot(endpointId: string): Promise<StreamRec> {
     const rec = this.streams.get(endpointId);
     if (rec) return rec;
-    // §8.3：投给 cold 流先恢复再投（恢复期间新消息在 Inbox 排队——调用方语义）
-    await this.warm(endpointId);
+    // §8.3：投给 cold 流先恢复再投（恢复期间新消息在 Inbox 排队——调用方语义）。
+    // 常规投递以 shared 恢复（§8.3 投递→shared），exclusive 只留给宿主显式 warm。
+    await this.warm(endpointId, "shared");
     const hot = this.streams.get(endpointId);
     if (!hot) throw new PiPortError("NOT_HOT", `mesh-pi: warm did not yield a stream for ${endpointId}`);
     return hot;

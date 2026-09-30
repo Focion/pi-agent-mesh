@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pi Agent Mesh · 面板</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⬡</span>
+    <h1>Pi Agent Mesh 面板</h1>
+    <span id="credBadge" class="badge badge--muted">凭据 …</span>
+  </div>
+  <div class="sub">真实 PiStreamPort + 真实 LLM · SSE 实时事件流</div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="status" class="tab is-active">状态 / 事件</button>
+  <button data-tab="accounts" class="tab">账号与端点</button>
+  <button data-tab="convos" class="tab">会话与成员</button>
+  <button data-tab="send" class="tab">发送</button>
+  <button data-tab="sink" class="tab">Sink</button>
+  <button data-tab="stream" class="tab">流控制 / Agent</button>
+  <button data-tab="observer" class="tab">Observer / Trace</button>
+  <button data-tab="accept" class="tab">验收 P0 / P1</button>
+  <button data-tab="topic" class="tab">Topic 订阅广播</button>
+  <button data-tab="reqreply" class="tab">请求-应答</button>
+  <button data-tab="queue" class="tab">Queue 队列</button>
+  <button data-tab="shared" class="tab">共享空间</button>
+  <button data-tab="replay" class="tab">Observer Replay</button>
+</nav>
+
+<main>
+  <section id="tab-status" class="panel is-visible"></section>
+  <section id="tab-accounts" class="panel"></section>
+  <section id="tab-convos" class="panel"></section>
+  <section id="tab-send" class="panel"></section>
+  <section id="tab-sink" class="panel"></section>
+  <section id="tab-stream" class="panel"></section>
+  <section id="tab-observer" class="panel"></section>
+  <section id="tab-accept" class="panel"></section>
+  <section id="tab-topic" class="panel"></section>
+  <section id="tab-reqreply" class="panel"></section>
+  <section id="tab-queue" class="panel"></section>
+  <section id="tab-shared" class="panel"></section>
+  <section id="tab-replay" class="panel"></section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

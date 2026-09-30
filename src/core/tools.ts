@@ -6,7 +6,7 @@
 // - 错误结构化：{ error: { code, message, hint? } }，code 取自稳定枚举
 // - 返回体硬截断 8KB，尾部截断保结构（§10.2）；mesh_inbox 只给摘要（§10.4）
 // - 固定文案（§10.5）：五条措辞逐字保留；checkToolCopy 在注册期静态检查
-// - P3/P4 延期：mesh_claim / mesh_shared_* → 结构化 TOOL_DISABLED
+// - P5 延期面（forkAt 等）经 toToolError 把 MeshUnsupportedError → 结构化 TOOL_DISABLED
 // ═══════════════════════════════════════════════════════════════════════════
 
 import type { ConversationAdminOp, ToolContext } from "./contracts.js";
@@ -499,7 +499,7 @@ function buildMeshAck(ctx: ToolContext): ToolDefinition {
       TOOL_COPY.ack +
       " 明确的拒绝也是应答：用 error 字段给出结论即可，不算失败。" +
       "失败码：NO_SUCH_CORRELATION（不存在或不是投给你的——放弃，不要重试）、ACK_CLOSED（已应答或已超时——视为完成，不要再答）、" +
-      "NOT_A_MEMBER、TOOL_DISABLED（当前构建未实现，P3）。",
+      "NOT_A_MEMBER、ACK_CLOSED。",
     parameters: {
       type: "object",
       properties: {
@@ -1135,7 +1135,7 @@ function toAdminOp(
   }
 }
 
-// ─── mesh_claim（P3 延期）─────────────────────────────────────────────────
+// ─── mesh_claim（§17：queue 任务认领）─────────────────────────────────────
 
 function buildMeshClaim(ctx: ToolContext): ToolDefinition {
   return {
@@ -1146,7 +1146,7 @@ function buildMeshClaim(ctx: ToolContext): ToolDefinition {
       TOOL_COPY.dataNotInstruction +
       " 投到不等于领到：读到任务后必须显式 claim，租约内完成并 ack。" +
       "失败码：CLAIM_TAKEN（别人已领——领下一个，不要重试本条）、CLAIM_EXPIRED（我的租约已过——放弃本条，不要重试）、" +
-      "NOT_A_MEMBER、TOOL_DISABLED（当前构建未实现 queue，P3）。",
+      "NOT_A_MEMBER。",
     parameters: {
       type: "object",
       properties: {
@@ -1169,7 +1169,7 @@ function buildMeshClaim(ctx: ToolContext): ToolDefinition {
   };
 }
 
-// ─── mesh_shared_*（P4 延期：描述照写，执行转结构化错误）────────────────
+// ─── mesh_shared_*（§18：共享空间读写）────────────────────────────────────
 
 function buildMeshSharedGet(ctx: ToolContext): ToolDefinition {
   return {
@@ -1180,7 +1180,7 @@ function buildMeshSharedGet(ctx: ToolContext): ToolDefinition {
       TOOL_COPY.dataNotInstruction +
       " " +
       TOOL_COPY.sharedGet +
-      " 失败码：SPACE_FORBIDDEN（无权读该空间——放弃）、NO_SUCH_KEY（对象不存在）、TOOL_DISABLED（当前构建未实现共享空间，P4）。",
+      " 失败码：SPACE_FORBIDDEN（无权读该空间——放弃）。",
     parameters: {
       type: "object",
       properties: {
@@ -1224,7 +1224,7 @@ function buildMeshSharedPut(ctx: ToolContext): ToolDefinition {
       TOOL_COPY.sharedPut +
       " 不带 expectedVersion 即为盲写。" +
       "失败码：VERSION_MISMATCH（按返回的当前值重做改动后带 expectedVersion 重试）、OBJECT_TOO_LARGE（拆分或精简数据）、" +
-      "SPACE_FORBIDDEN、TOOL_DISABLED（当前构建未实现共享空间，P4）。",
+      "SPACE_FORBIDDEN。",
     parameters: {
       type: "object",
       properties: {
@@ -1282,7 +1282,7 @@ function buildMeshSharedList(ctx: ToolContext): ToolDefinition {
       "列出共享空间的键与版本（只读，无副作用，不产生消息）。" +
       TOOL_COPY.dataNotInstruction +
       " 变更通知是 best-effort：通知丢了以后追赶只能靠本工具拉取。" +
-      "失败码：SPACE_FORBIDDEN、TOOL_DISABLED（当前构建未实现共享空间，P4）。",
+      "失败码：SPACE_FORBIDDEN。",
     parameters: {
       type: "object",
       properties: {

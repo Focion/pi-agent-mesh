@@ -17,6 +17,7 @@ import type {
   Endpoint,
   Envelope,
   Limits,
+  Policies,
   RegisterAccountInput,
   SinkHandler,
 } from "../../src/core/types.js";
@@ -41,7 +42,7 @@ interface Harness {
 }
 
 function makeHarness(
-  opts: { limits?: Partial<Limits> } = {},
+  opts: { limits?: Partial<Limits>; policies?: Partial<Policies> } = {},
 ): Harness {
   const tdb = openTestDb();
   const limits: Limits = { ...DEFAULT_LIMITS, ...opts.limits };
@@ -51,7 +52,7 @@ function makeHarness(
   const port = new FakeStreamPort();
   const sinkHandlers = new Map<string, SinkHandler>();
   const awaiting = new Map<string, Set<string>>();
-  const policies = {
+  const policies: Policies = {
     ...createDefaultPolicies({
       isAwaiting: (acct: string, cid: string | undefined) =>
         cid !== undefined && (awaiting.get(acct) ?? new Set()).has(cid),
@@ -66,6 +67,7 @@ function makeHarness(
       create: async () => ({ session: {}, piSessionId: "pi-test" }),
       open: async () => ({ session: {} }),
     },
+    ...opts.policies,
   };
   const mailbox = new MeshMailbox({
     store,
@@ -477,7 +479,7 @@ describe("mailbox: verbatim budget and paths", () => {
     h.store.close();
   });
 
-  it("silent to a cold stream stays queued without warming (§7.2 silent×cold)", async () => {
+  it("silent to a cold stream parks without warming (§7.2 silent×cold → parked)", async () => {
     const h = makeHarness();
     await addAcc(h, "A", { presence: "available" });
     await addAcc(h, "B", { presence: "available" });
@@ -497,7 +499,8 @@ describe("mailbox: verbatim budget and paths", () => {
       .prepare("SELECT * FROM mesh_deliveries WHERE account_id = 'B'")
       .get() as Record<string, unknown>;
     expect(row.grade).toBe("silent"); // low ⇒ silent（矩阵行 8）
-    expect(row.state).toBe("queued"); // 冷流 silent 不升温，只入 Inbox
+    expect(row.state).toBe("parked"); // §7.2 表：冷流 silent → parked（非终态，warm 后重投）
+    expect(row.parked_reason).toBe("ENDPOINT_GONE");
     expect(h.port.delivered).toHaveLength(0);
     h.store.close();
   });
@@ -753,6 +756,223 @@ describe("mailbox: backpressure", () => {
       .prepare("SELECT value AS n FROM mesh_counters WHERE name = 'backpressure_downgrade'")
       .get() as { n: number } | undefined;
     expect(n?.n ?? 0).toBe(1);
+    h.store.close();
+  });
+});
+
+// ─── 策略槽 I21：渲染器 / retention（④-A/④-C）────────────────────────────
+
+describe("mailbox: renderer & retention 策略槽保护（I21, §12.3/§20）", () => {
+  it("renderer 抛错 → 降级内建渲染器，仍 delivered 且 policy_degraded(renderer/threw)", async () => {
+    const degraded: Array<{ slot: string; reason: string; degradedTo: string }> = [];
+    const renderer = {
+      renderMessage: () => {
+        throw new Error("host renderer boom");
+      },
+      renderInbox: () => "",
+      renderSystem: () => "",
+    };
+    const h = makeHarness({ policies: { renderer } });
+    h.events.on("policy_degraded", (p) =>
+      degraded.push({ slot: p.slot, reason: p.reason, degradedTo: p.degradedTo }),
+    );
+    await addAcc(h, "A", { presence: "available" });
+    await addAcc(h, "B", { presence: "available" });
+    await addHotEndpoint(h, "A");
+    await addHotEndpoint(h, "B");
+    const conv = await h.registry.ensureDirect("A", "B");
+    const r = await h.router.route(msg("A", conv.id));
+    await flush();
+
+    const row = deliveryRow(h, r.messageId, "B");
+    expect(row.state).toBe("consumed"); // 降级未阻断投递
+    expect(degraded).toContainEqual({
+      slot: "renderer",
+      reason: "threw",
+      degradedTo: "builtin_renderer",
+    });
+    // 内建降级产物仍是 M4 包裹体
+    const rendered = h.port.delivered[h.port.delivered.length - 1]?.rendered;
+    expect(rendered).toContain("<<<MSG");
+    expect(rendered).toContain("<<<END MSG>>>");
+    h.store.close();
+  });
+
+  it("renderer 返回未包裹文本 → devMode 抛错（§23.7）", async () => {
+    const renderer = {
+      renderMessage: () => "RAW not wrapped",
+      renderInbox: () => "",
+      renderSystem: () => "",
+    };
+    const h = makeHarness({ policies: { renderer } });
+    await addAcc(h, "A", { presence: "available" });
+    await addAcc(h, "B", { presence: "available" });
+    await addHotEndpoint(h, "A");
+    await addHotEndpoint(h, "B");
+    const conv = await h.registry.ensureDirect("A", "B");
+    await expect(h.router.route(msg("A", conv.id))).rejects.toThrow(/renderer output/);
+    h.store.close();
+  });
+
+  it("retention 收到全量会话清单（宿主策略据此算预算），不再是单会话", async () => {
+    const seen: Array<{ accountId: string; convIds: string[] }> = [];
+    const retention = {
+      verbatimBudget(ctx: {
+        accountId: string;
+        conversations: Array<{ id: string }>;
+      }) {
+        seen.push({ accountId: ctx.accountId, convIds: ctx.conversations.map((c) => c.id) });
+        return { bytes: Number.MAX_SAFE_INTEGER, ttlSeq: 20 };
+      },
+    };
+    const h = makeHarness({ policies: { retention } });
+    await addAcc(h, "A", { presence: "available" });
+    await addAcc(h, "B", { presence: "available" });
+    const g1 = await h.registry.createConversation({
+      type: "group",
+      creator: "A",
+      members: ["B"],
+    });
+    const g2 = await h.registry.createConversation({
+      type: "group",
+      creator: "A",
+      members: ["B"],
+    });
+    // B 在两个群都发过言 ⇒ 越过「从未发言/被 @ 的刚性超预算」检查，进入 retention 决策
+    h.registry.recordSpoke(g1.id, "B", 1);
+    h.registry.recordSpoke(g2.id, "B", 1);
+    await addHotEndpoint(h, "A");
+    await addHotEndpoint(h, "B");
+    await h.router.route(msg("A", g1.id, { clientToken: "rt1" }));
+    await flush();
+
+    const forB = seen.find((s) => s.accountId === "B");
+    expect(forB).toBeDefined();
+    expect(forB!.convIds).toHaveLength(2);
+    expect(forB!.convIds).toContain(g1.id);
+    expect(forB!.convIds).toContain(g2.id);
+    h.store.close();
+  });
+});
+
+// ─── claim / ackQueue / reclaimExpiredClaims（§17）───────────────────────────
+
+describe("mailbox: queue claim and ack", () => {
+  /** 在 queue conversation 中直接 INSERT 消息+delivery，绕开 fanout 避免 auto-consume */
+  function insertQueueMessage(
+    h: Harness,
+    queueId: string,
+    worker: string,
+    opts: { state?: string; attempts?: number } = {},
+  ) {
+    const msgId = "test-msg-" + Math.random().toString(36).slice(2);
+    const now = new Date().toISOString();
+    h.db
+      .prepare(
+        "INSERT INTO mesh_messages (id, conversation_id, from_account, kind, expect, seq, payload, routed_at, idempotency_key, client_token) VALUES (?,?,?,?,?,?,?,?,?,?)",
+      )
+      .run(msgId, queueId, "A", "task", "ack", 1, JSON.stringify({ text: "job" }), now, msgId, null);
+    const dId = "test-d-" + Math.random().toString(36).slice(2);
+    h.db
+      .prepare(
+        "INSERT INTO mesh_deliveries (id, message_id, account_id, endpoint_id, path, state, state_changed_at, delivered_at, attempts) VALUES (?,?,?,NULL,?,?,?,?,?)",
+      )
+      .run(dId, msgId, worker, "P1", opts.state ?? "delivered", now, now, opts.attempts ?? 0);
+    h.registry.ensureInboxRow(worker, queueId);
+    return { msgId, dId };
+  }
+
+  it("claim: delivered → claimed returns {ok:true, leaseUntil}", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "W");
+    const q = await h.registry.createConversation({ type: "queue", creator: "A", members: ["W"] });
+    const { msgId, dId } = insertQueueMessage(h, q.id, "W");
+    const r = await h.mailbox.claim(msgId, "W");
+    expect(r.ok).toBe(true);
+    expect(r.leaseUntil).toBeDefined();
+    const row = h.db.prepare("SELECT state FROM mesh_deliveries WHERE id = ?").get(dId) as { state: string };
+    expect(row.state).toBe("claimed");
+    h.store.close();
+  });
+
+  it("claim: not delivered → {ok:false}", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "W");
+    const q = await h.registry.createConversation({ type: "queue", creator: "A", members: ["W"] });
+    const { msgId } = insertQueueMessage(h, q.id, "W", { state: "routed" });
+    const r = await h.mailbox.claim(msgId, "W");
+    expect(r.ok).toBe(false);
+    h.store.close();
+  });
+
+  it("ackQueue: success marks claimed→acked", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "W");
+    const q = await h.registry.createConversation({ type: "queue", creator: "A", members: ["W"] });
+    const { msgId, dId } = insertQueueMessage(h, q.id, "W");
+    await h.mailbox.claim(msgId, "W");
+    await h.mailbox.ackQueue(msgId, "W");
+    const row = h.db.prepare("SELECT state FROM mesh_deliveries WHERE id = ?").get(dId) as { state: string };
+    expect(row.state).toBe("acked");
+    h.store.close();
+  });
+
+  it("ackQueue: nack (error) requeues and increments attempts", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "W");
+    const q = await h.registry.createConversation({ type: "queue", creator: "A", members: ["W"] });
+    await addHotEndpoint(h, "W");
+    const { msgId, dId } = insertQueueMessage(h, q.id, "W");
+    await h.mailbox.claim(msgId, "W");
+    await h.mailbox.ackQueue(msgId, "W", "processing failed");
+    const row = h.db.prepare("SELECT state, attempts FROM mesh_deliveries WHERE id = ?").get(dId) as { state: string; attempts: number };
+    // nack requeues then deliverOne auto-consumes via hot endpoint
+    expect(["queued", "delivered", "consumed"]).toContain(row.state);
+    expect(row.attempts).toBe(1);
+    h.store.close();
+  });
+
+  it("ackQueue: MAX_ATTEMPTS reached → dropped + message_dropped event", async () => {
+    const h = makeHarness({ limits: { maxAttempts: 1 } });
+    await addAcc(h, "A");
+    await addAcc(h, "W");
+    const q = await h.registry.createConversation({ type: "queue", creator: "A", members: ["W"] });
+    const { msgId, dId } = insertQueueMessage(h, q.id, "W", { attempts: 1 });
+    await h.mailbox.claim(msgId, "W");
+    const droppedEvents: Array<{ messageId: string; reason: string }> = [];
+    h.events.on("message_dropped", (p) =>
+      droppedEvents.push({ messageId: p.envelope.id, reason: p.reason }),
+    );
+    await h.mailbox.ackQueue(msgId, "W", "failed again");
+    const row = h.db.prepare("SELECT state, drop_reason FROM mesh_deliveries WHERE id = ?").get(dId) as { state: string; drop_reason: string };
+    expect(row.state).toBe("dropped");
+    expect(row.drop_reason).toBe("MAX_ATTEMPTS");
+    expect(droppedEvents).toHaveLength(1);
+    h.store.close();
+  });
+
+  it("reclaimExpiredClaims: expired claimed → nack (queued)", async () => {
+    const h = makeHarness({ limits: { claimTtlMs: 100 } });
+    await addAcc(h, "A");
+    await addAcc(h, "W");
+    const q = await h.registry.createConversation({ type: "queue", creator: "A", members: ["W"] });
+    await addHotEndpoint(h, "W");
+    const { msgId, dId } = insertQueueMessage(h, q.id, "W", { attempts: 1 });
+    const past = new Date(Date.now() - 200).toISOString();
+    h.db
+      .prepare("UPDATE mesh_messages SET payload = json_set(payload, '$.claim', json_object('by','W','at',?)) WHERE id = ?")
+      .run(past, msgId);
+    h.db
+      .prepare("UPDATE mesh_deliveries SET state='claimed', claim_until=? WHERE id=?")
+      .run(past, dId);
+    await h.mailbox.reclaimExpiredClaims(Date.now());
+    const row = h.db.prepare("SELECT state, attempts FROM mesh_deliveries WHERE id = ?").get(dId) as { state: string; attempts: number };
+    // reclaim nacks then deliverOne auto-consumes via hot endpoint
+    expect(["queued", "delivered", "consumed"]).toContain(row.state);
     h.store.close();
   });
 });

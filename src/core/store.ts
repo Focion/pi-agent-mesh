@@ -42,6 +42,11 @@ export const REGISTERED_COUNTERS = new Set([
   "cold_hit",
 ]);
 
+/** schema 版本基准（§28.3）：与 migrations/ 的最大序号一致。DB 的 schema_version 大于此即拒绝启动。 */
+const SCHEMA_VERSION = 1;
+/** 库版本（§11.7 / §28.3 的 `library_version` 键），与 package.json version 同步。 */
+export const LIBRARY_VERSION = "0.1.0";
+
 function migrationsDir(): string {
   // migrations/ 是与 dist/ 并列的包根资产（package.json `files` 声明、`exports`
   // 暴露）。从本模块位置向上走，找到含 package.json 的目录即包根，再拼 migrations/。
@@ -59,6 +64,8 @@ function migrationsDir(): string {
 
 export interface OpenStoreOptions {
   devMode?: boolean;
+  /** SQLite busy_timeout（§19.5 / 附录 F.2，0–60000，默认 5000） */
+  busyTimeoutMs?: number;
   /** 测试注入内存库 */
   db?: Database.Database;
 }
@@ -71,12 +78,13 @@ export class SqliteStore implements Store {
   private stmtMetaGet: Database.Statement;
   private stmtMetaSet: Database.Statement;
 
-  constructor(db: Database.Database, devMode = false) {
+  constructor(db: Database.Database, devMode = false, busyTimeoutMs = 5000) {
     this.db = db;
     this.devMode = devMode;
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
-    db.pragma("busy_timeout = 5000");
+    db.pragma(`busy_timeout = ${busyTimeoutMs}`);
+    db.pragma("wal_autocheckpoint = 1000");
     db.pragma("synchronous = NORMAL");
     this.migrate();
     this.stmtMetaGet = db.prepare<[string], { v: string }>(
@@ -85,11 +93,21 @@ export class SqliteStore implements Store {
     this.stmtMetaSet = db.prepare(
       "INSERT INTO mesh_meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
     );
+    this.seedMeta();
+  }
+
+  /** §11.7 / §28.3：元信息表必须存在的键（schema_version 由迁移脚本写，schema_applied_at 由 migrate() 写） */
+  private seedMeta(): void {
+    if (this.getMeta("created_at") === undefined) {
+      this.setMeta("created_at", isoNow());
+    }
+    // library_version 反映“最近一次打开该 DB 的库版本”（§28.3），每次打开都刷新。
+    this.setMeta("library_version", LIBRARY_VERSION);
   }
 
   static open(dbPath: string, opts: OpenStoreOptions = {}): SqliteStore {
     const db = opts.db ?? new Database(dbPath);
-    return new SqliteStore(db, opts.devMode);
+    return new SqliteStore(db, opts.devMode, opts.busyTimeoutMs);
   }
 
   private migrate(): void {
@@ -107,6 +125,18 @@ export class SqliteStore implements Store {
           )
           .get() as { n: number }
       ).n > 0;
+    // §28.3：旧库不得打开新 DB——schema_version 大于本库预期必须拒绝启动。
+    if (hasMeta) {
+      const sv = this.db
+        .prepare("SELECT v FROM mesh_meta WHERE k = 'schema_version'")
+        .get() as { v: string } | undefined;
+      const n = sv?.v ? Number.parseInt(sv.v, 10) : 0;
+      if (Number.isInteger(n) && n > SCHEMA_VERSION) {
+        throw new Error(
+          `mesh: database schema_version=${sv!.v} is newer than library (${SCHEMA_VERSION}); upgrade the library (§28.3)`,
+        );
+      }
+    }
     const applied = new Set(
       hasMeta
         ? (
@@ -118,6 +148,7 @@ export class SqliteStore implements Store {
           ).map((r) => r.k.replace("migration:", ""))
         : [],
     );
+    let ranAny = false;
     for (const f of files) {
       if (applied.has(f)) continue;
       const tx = this.db.transaction(() => {
@@ -130,6 +161,16 @@ export class SqliteStore implements Store {
           .run(migrationKey, isoNow());
       });
       tx();
+      ranAny = true;
+    }
+    // §28.3：schema_applied_at = 最近一次迁移完成时间（仅当本次真的跑了迁移才盖章）。
+    // schema_version 本身由迁移脚本维护（000_init.sql 置 '1'）。
+    if (ranAny) {
+      this.db
+        .prepare(
+          "INSERT OR REPLACE INTO mesh_meta (k, v) VALUES ('schema_applied_at', ?)",
+        )
+        .run(isoNow());
     }
   }
 
@@ -183,30 +224,40 @@ export class SqliteStore implements Store {
       .run(name, hourBucket(), by);
   }
 
-  /** 测试/恢复用：重算某账号全部收件箱缓存（§8.4④：以 deliveries 为真相） */
+  /** 测试/恢复用：重算全部收件箱缓存字段（§8.4④：以 deliveries/messages 为真相）。
+   * 缓存字段：pending_count / pending_bytes（未读，真相在 mesh_deliveries）、verbatim_bytes
+   * （发送方原文预算，真相在 mesh_messages，topic 不计，§7.4）、overflow_count（溢出折叠
+   * 次数，真相在 mesh_deliveries.state='dropped' && drop_reason='folded'，§7.5）。
+   * overflow_summary 是折叠摘要文本，无法从行重建，恢复时置 NULL（下次折叠经 || 重建），
+   * 绝不伪造。cursor_seq / folded_to_seq 是权威状态（§7.7/§7.5），本函数不重算、不动。 */
   recomputeInboxCaches(): void {
     this.db.exec(`
       UPDATE mesh_inboxes AS i SET
-        pending_count = COALESCE(x.n, 0),
-        pending_bytes = COALESCE(x.b, 0)
-      FROM (
-        SELECT d.account_id AS aid, m.conversation_id AS cid,
-               COUNT(*) AS n, COALESCE(SUM(LENGTH(m.payload)), 0) AS b
-        FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id
-        WHERE d.state IN ('routed','queued','parked','delivered')
-        GROUP BY d.account_id, m.conversation_id
-      ) AS x
-      WHERE i.account_id = x.aid AND i.conversation_id = x.cid
-    `);
-    // 补上 pending=0 的行（LEFT JOIN 没覆盖到）
-    this.db.exec(`
-      UPDATE mesh_inboxes AS i SET
-        pending_count = 0, pending_bytes = 0
-      WHERE NOT EXISTS (
-        SELECT 1 FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id
-        WHERE d.account_id = i.account_id AND m.conversation_id = i.conversation_id
-          AND d.state IN ('routed','queued','parked','delivered')
-      )
+        pending_count = COALESCE((
+          SELECT COUNT(*)
+          FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id
+          WHERE d.account_id = i.account_id AND m.conversation_id = i.conversation_id
+            AND d.state IN ('routed','queued','parked','delivered')
+        ), 0),
+        pending_bytes = COALESCE((
+          SELECT COALESCE(SUM(LENGTH(CAST(m.payload AS BLOB))), 0)
+          FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id
+          WHERE d.account_id = i.account_id AND m.conversation_id = i.conversation_id
+            AND d.state IN ('routed','queued','parked','delivered')
+        ), 0),
+        verbatim_bytes = COALESCE((
+          SELECT COALESCE(SUM(LENGTH(CAST(m.payload AS BLOB))), 0)
+          FROM mesh_messages m JOIN mesh_conversations c ON c.id = m.conversation_id
+          WHERE m.from_account = i.account_id AND m.conversation_id = i.conversation_id
+            AND c.type != 'topic'
+        ), 0),
+        overflow_count = COALESCE((
+          SELECT COUNT(*)
+          FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id
+          WHERE d.account_id = i.account_id AND m.conversation_id = i.conversation_id
+            AND d.state = 'dropped' AND d.drop_reason = 'folded'
+        ), 0),
+        overflow_summary = NULL
     `);
   }
 

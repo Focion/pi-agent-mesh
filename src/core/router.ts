@@ -9,14 +9,15 @@
 // 事务内四件事（§11.8）：分配 seq、插消息（含 FTS 行）、插全部 delivery 行
 // （state='routed'）、bump inbox 计数与计数器。事件在提交后派发。
 //
-// 本构建的显式收窄（父任务约定，见报告）：
-// - topic publish 零 delivery 行（§16.6 的订阅者提档投递延后）
-// - queue 只存消息（claim/requeue 是 P3）；expect 由 Router 强制为 "ack"
-// - pending_acks 全部 sync=0（宿主 await:true 为 P3）
+// 分发规则（§16.6 §17 §14）：
+// - topic：对每个 from_seq ≤ seq 的订阅者各插一行 silent/P3 delivery（§16.3）
+// - queue：EndpointSelector 选单消费者，插一行 routed delivery + pending_acks(sync=0)
+// - request（blocking）：pending_acks.sync=1（§14.5 阻塞轴）
 // - REQUEST_CYCLE 检测照 §14.5 算法：只遍历 sync=1 开集边 + 自环
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { createHmac } from "node:crypto";
+import type Database from "better-sqlite3";
 import type { RouteInput, Router } from "./contracts.js";
 import type { MeshEventBus } from "./events.js";
 import { withPolicyGuard, withPolicyTimeout } from "./policies.js";
@@ -65,6 +66,8 @@ export interface RouterDeps {
   isAwaiting: (accountId: string, correlationId: string) => boolean;
   /** §22.4：宿主提供的 HMAC 密钥；缺省 seal 关闭（默认形态） */
   sealKey?: string;
+  /** §6.1/F.2：放行 @all 的能力位；缺省 "speak"（装配层从 MeshOptions 透传） */
+  mentionAllCap?: Cap;
 }
 
 interface MessageRow {
@@ -122,14 +125,9 @@ export class MeshRouter implements Router {
     const key = idempotencyKey(convId, from, clientToken);
 
     // ── 第 0 步：幂等（§5.5）──
-    const dup = d.store.db
-      .prepare<
-        [string],
-        { id: string; seq: number; correlation_id: string | null }
-      >(
-        "SELECT id, seq, correlation_id FROM mesh_messages WHERE idempotency_key = ?",
-      )
-      .get(key);
+    // 这是事务外的快路径预检；并发同键的真闸是 UNIQUE(idempotency_key)，
+    // 冲突在事务外捕获后同样按幂等命中返回（见 ⑥ 的 catch）。
+    const dup = findIdempotentDup(d.store.db, key);
     if (dup) {
       d.store.bumpCounter("dedup_hit");
       return {
@@ -217,7 +215,13 @@ export class MeshRouter implements Router {
       );
     }
     if (replyOf) {
-      // §14.1：应答消息的 expect 强制 none，否则无限往返
+      // §14.1：应答消息的 expect 强制 none，否则无限往返；强制降级须记 warning
+      if (input.expect !== undefined && input.expect !== "none") {
+        console.warn(
+          `[pi-agent-mesh] reply on correlationId ${replyOf.correlation_id}: ` +
+            `expect "${input.expect}" forced to "none" (§14.1)`,
+        );
+      }
       expect = "none";
     }
 
@@ -251,11 +255,9 @@ export class MeshRouter implements Router {
     const memberRows = d.registry.listMembers(convId);
     const memberCaps = new Map<string, Cap[]>();
     for (const m of memberRows) memberCaps.set(m.accountId, m.caps);
-    const subscriberIds = new Set(
-      conv.kind === "topic"
-        ? d.registry.listSubscribers(convId).map((s) => s.accountId)
-        : [],
-    );
+    const subscribers =
+      conv.kind === "topic" ? d.registry.listSubscribers(convId) : [];
+    const subscriberIds = new Set(subscribers.map((s) => s.accountId));
 
     // ── ③ mentions 过滤（§5.4③：非成员剔除并记 warning；topic 非订阅者忽略）──
     const mentionPool =
@@ -265,9 +267,29 @@ export class MeshRouter implements Router {
     const mentions = mentionsRaw.filter(
       (m) => m === MENTION_ALL || (m !== from && mentionPool.has(m)),
     );
+    const strippedMentions = mentionsRaw.filter((m) => !mentions.includes(m));
+    if (strippedMentions.length > 0) {
+      // §5.4③：非成员（topic：非订阅者）剔除并记 warning，不是拒绝
+      console.warn(
+        `[pi-agent-mesh] mentions stripped (not ` +
+          `${conv.kind === "topic" ? "subscribers" : "members"} of ${convId}): ` +
+          strippedMentions.join(", ") + " (§5.4③)",
+      );
+    }
 
-    // ── @all 两道闸（§6.1：权限已由 speak 覆盖；频率 = 每小时 N 次 + 冷却，先命中者拒绝）──
+    // ── @all 两道闸（§6.1/§9.5）──
+    // 闸一·权限 = mentionAllCap 能力位（此处）+ AccessControl.canMentionAll
+    //（draft 建成后与 canSend 同段执行）；闸二·频率 = 每小时 N 次 + 冷却，先命中者拒绝。
+    // 两道闸都是同步拒绝、不落 delivery。
     if (mentionsAll) {
+      const capNeeded = d.mentionAllCap ?? "speak";
+      // @system 豁免：非成员、无 caps（与 Floor/speak 豁免同理）
+      if (!isSystem && !(membership?.caps ?? []).includes(capNeeded)) {
+        throw new MeshRejectError(
+          "NO_SPEAK_CAP",
+          `@all requires "${capNeeded}" cap in ` + convId,
+        );
+      }
       const perHour = conv.config.mentionAllPerHour ?? 3;
       const hourAgoIso = isoFromMs(Date.now() - 3_600_000);
       const recent = d.store.db
@@ -300,8 +322,8 @@ export class MeshRouter implements Router {
     }
 
     // ── expect ≠ none ⇒ 恰好一个目标（§14.1 pending_acks 单对端）──
-    // queue 例外：本构建 queue 只存消息（claim/requeue 是 P3），不落
-    // pending_acks，故无单对端要求；expect:'ack' 仅作为存储值固化。
+    // queue 例外：单消费者由 selector 选出（非调用方定向），故跳过单对端校验；
+    // pending_acks 仍会写入（sync=0，to_account=消费者，§17.6）。
     let expectTarget: string | null = null;
     if (expect !== "none" && conv.kind !== "queue") {
       if (toNorm.length === 1) {
@@ -417,6 +439,26 @@ export class MeshRouter implements Router {
     );
     if (!okSend) throw new MeshRejectError("NOT_A_MEMBER", "canSend denied");
 
+    // ── @all 闸一·AccessControl 半边（§9.5:1726；fail-closed：超时/抛错 → 否决）──
+    if (mentionsAll) {
+      const okMentionAll = await withPolicyTimeout(
+        this.guardDeps("accessControl", "deny"),
+        () =>
+          d.policies.accessControl.canMentionAll?.({
+            envelope: draft,
+            from: sender,
+            conversation: conv,
+            membership,
+          }) ?? true,
+        false,
+      );
+      if (!okMentionAll)
+        throw new MeshRejectError(
+          "NO_SPEAK_CAP",
+          "mention_all denied by AccessControl",
+        );
+    }
+
     // ── tombstone 前置校验（§5.6：唯一更正路径）──
     if (kind === "tombstone") {
       if (!input.replyTo) {
@@ -436,7 +478,14 @@ export class MeshRouter implements Router {
     }
 
     // ── ⑥ 单事务（§11.8）──
-    const out = d.store.tx(() => {
+    let out: {
+      envelope: Envelope;
+      deliveryCount: number;
+      tombDropped: Array<{ account_id: string }>;
+      tombOriginal: Envelope | null;
+    };
+    try {
+      out = d.store.tx(() => {
       const seq = d.registry.allocateSeq(convId);
       const seal = d.sealKey
         ? computeSeal(d.sealKey, draft, seq, payloadJson)
@@ -486,9 +535,65 @@ export class MeshRouter implements Router {
         .prepare("INSERT INTO mesh_messages_fts (rowid, text) VALUES (?, ?)")
         .run(rowid, ftsText);
 
-      // ── delivery 集（§6.1：to ∪ mentions(@all 展开) − sender；无 read cap 无行）──
-      const recipientSet = new Set<string>();
-      if (conv.kind !== "topic" && conv.kind !== "queue") {
+      // ── delivery 集（group/direct：to ∪ mentions(@all 展开) − sender；无 read cap 无行）──
+      // topic：每个 from_seq ≤ seq 的订阅者一行（silent/P3，不唤醒）；queue：单消费者一行。
+      let queueConsumer: string | null = null;
+      let deliveryCount = 0;
+      const insDelivery = d.store.db.prepare(
+        "INSERT INTO mesh_deliveries (id, message_id, account_id, endpoint_id, path, state, state_changed_at) " +
+          "VALUES (?,?,?,NULL,?,?,?)",
+      );
+      if (conv.kind === "topic") {
+        // §16.3：仅投递给订阅起始 seq ≤ 本条 seq 的订阅者（退订断档不补容）
+        for (const s of [...subscribers].sort((a, b) =>
+          a.accountId < b.accountId ? -1 : 1,
+        )) {
+          if (s.fromSeq > seq) continue;
+          insDelivery.run(
+            ulid(),
+            envelope.id,
+            s.accountId,
+            "P3",
+            "routed",
+            routedAt,
+          );
+          deliveryCount++;
+          d.registry.ensureInboxRow(s.accountId, convId);
+          d.store.db
+            .prepare(
+              "UPDATE mesh_inboxes SET pending_count = pending_count + 1, pending_bytes = pending_bytes + ? " +
+                "WHERE account_id = ? AND conversation_id = ?",
+            )
+            .run(payloadBytes, s.accountId, convId);
+        }
+      } else if (conv.kind === "queue") {
+        // §17.1：每条消息 = 一条 delivery，终态 acked；由 least-in-flight 选出单消费者。
+        const queueCandidates = [...memberCaps.keys()].filter((m) => m !== from);
+        queueConsumer = selectQueueConsumer(d, convId, queueCandidates);
+        if (!queueConsumer) {
+          throw new MeshRejectError(
+            "FANOUT_TOO_LARGE",
+            "queue has no worker to consume message",
+          );
+        }
+        insDelivery.run(
+          ulid(),
+          envelope.id,
+          queueConsumer,
+          "P1",
+          "routed",
+          routedAt,
+        );
+        deliveryCount++;
+        d.registry.ensureInboxRow(queueConsumer, convId);
+        d.store.db
+          .prepare(
+            "UPDATE mesh_inboxes SET pending_count = pending_count + 1, pending_bytes = pending_bytes + ? " +
+              "WHERE account_id = ? AND conversation_id = ?",
+          )
+          .run(payloadBytes, queueConsumer, convId);
+      } else {
+        const recipientSet = new Set<string>();
         if (toNorm.length > 0) {
           for (const t of toNorm) recipientSet.add(t);
         } else {
@@ -497,35 +602,30 @@ export class MeshRouter implements Router {
         if (mentionsAll) for (const m of memberCaps.keys()) recipientSet.add(m);
         for (const m of mentions) if (m !== MENTION_ALL) recipientSet.add(m);
         recipientSet.delete(from);
-      }
 
-      let deliveryCount = 0;
-      const insDelivery = d.store.db.prepare(
-        "INSERT INTO mesh_deliveries (id, message_id, account_id, endpoint_id, path, state, state_changed_at) " +
-          "VALUES (?,?,?,NULL,?,?,?)",
-      );
-      for (const accountId of [...recipientSet].sort((a, b) =>
-        a < b ? -1 : 1,
-      )) {
-        const caps = memberCaps.get(accountId);
-        if (!caps || !caps.includes("read")) continue; // 无 read ⇒ 无行
-        const path = caps.includes("speak") ? "P1" : "P3";
-        insDelivery.run(
-          ulid(),
-          envelope.id,
-          accountId,
-          path,
-          "routed",
-          routedAt,
-        );
-        deliveryCount++;
-        d.registry.ensureInboxRow(accountId, convId);
-        d.store.db
-          .prepare(
-            "UPDATE mesh_inboxes SET pending_count = pending_count + 1, pending_bytes = pending_bytes + ? " +
-              "WHERE account_id = ? AND conversation_id = ?",
-          )
-          .run(payloadBytes, accountId, convId);
+        for (const accountId of [...recipientSet].sort((a, b) =>
+          a < b ? -1 : 1,
+        )) {
+          const caps = memberCaps.get(accountId);
+          if (!caps || !caps.includes("read")) continue; // 无 read ⇒ 无行
+          const path = caps.includes("speak") ? "P1" : "P3";
+          insDelivery.run(
+            ulid(),
+            envelope.id,
+            accountId,
+            path,
+            "routed",
+            routedAt,
+          );
+          deliveryCount++;
+          d.registry.ensureInboxRow(accountId, convId);
+          d.store.db
+            .prepare(
+              "UPDATE mesh_inboxes SET pending_count = pending_count + 1, pending_bytes = pending_bytes + ? " +
+                "WHERE account_id = ? AND conversation_id = ?",
+            )
+            .run(payloadBytes, accountId, convId);
+        }
       }
 
       // 发送方自己的行：不算未读（§6.1），但计入原文预算（§7.4）
@@ -547,19 +647,24 @@ export class MeshRouter implements Router {
           if (m !== from) mentionedAccounts.add(m);
       d.registry.recordMentioned(convId, [...mentionedAccounts], seq);
 
-      // ── pending_acks（§14.2：ack 30s / reply 5min）──
-      if (expect !== "none" && expectTarget) {
-        const cycle = detectRequestCycle(
-          d.store,
-          from,
-          expectTarget,
-          d.limits.requestChainMaxDepth,
-        );
-        if (cycle.result !== "ok") {
-          throw new MeshRejectError(
-            "REQUEST_CYCLE",
-            cycle.result + (cycle.path ? ": " + cycle.path.join(" -> ") : ""),
+      // ── pending_acks（§14.2：ack 30s / reply 5min；queue 恒 sync=0，to_account=消费者）──
+      const ackTarget = conv.kind === "queue" ? queueConsumer : expectTarget;
+      if (expect !== "none" && ackTarget) {
+        // §14.5：sync=1（阻塞式）才参与环检测；queue 与普通 request 均为 sync=0
+        const sync = conv.kind === "queue" ? 0 : input.blocking ? 1 : 0;
+        if (sync === 1) {
+          const cycle = detectRequestCycle(
+            d.store,
+            from,
+            ackTarget,
+            d.limits.requestChainMaxDepth,
           );
+          if (cycle.result !== "ok") {
+            throw new MeshRejectError(
+              "REQUEST_CYCLE",
+              cycle.result + (cycle.path ? ": " + cycle.path.join(" -> ") : ""),
+            );
+          }
         }
         const timeoutMs =
           expect === "ack" ? d.limits.ackTimeoutMs : d.limits.replyTimeoutMs;
@@ -573,10 +678,10 @@ export class MeshRouter implements Router {
             envelope.id,
             expect,
             from,
-            expectTarget,
+            ackTarget,
             convId,
             input.requestType ?? null,
-            0,
+            sync,
             isoFromMs(Date.now() + timeoutMs),
           );
       }
@@ -624,7 +729,24 @@ export class MeshRouter implements Router {
       if (warnSize) d.store.bumpCounter("fanout_warn");
 
       return { envelope, deliveryCount, tombDropped, tombOriginal };
-    });
+      });
+    } catch (err) {
+      // §5.5：第 0 步预检在事务外，UNIQUE(idempotency_key) 才是真闸。并发同键
+      // 重试会双双通过预检 ⇒ 后者在事务内撞约束。这不是错误而是幂等命中：
+      // 事务已整体回滚（seq 无空洞），重查原结果返回，并记 dedup_hit。
+      if (isIdempotencyConflict(err)) {
+        const orig = findIdempotentDup(d.store.db, key);
+        if (orig) {
+          d.store.bumpCounter("dedup_hit");
+          return {
+            messageId: orig.id,
+            seq: orig.seq,
+            correlationId: orig.correlation_id ?? undefined,
+          };
+        }
+      }
+      throw err;
+    }
 
     // ── 提交后：事件（§12.5 硬规定三）→ fanout ──
     d.events.emit("message_routed", { envelope: out.envelope });
@@ -667,6 +789,32 @@ export class MeshRouter implements Router {
 }
 
 // ─── 纯函数 ────────────────────────────────────────────────────────────────
+
+/** §5.5：按幂等键取原结果（第 0 步预检与 UNIQUE 冲突回退共用） */
+function findIdempotentDup(
+  db: Database.Database,
+  key: string,
+): { id: string; seq: number; correlation_id: string | null } | undefined {
+  return db
+    .prepare<
+      [string],
+      { id: string; seq: number; correlation_id: string | null }
+    >(
+      "SELECT id, seq, correlation_id FROM mesh_messages WHERE idempotency_key = ?",
+    )
+    .get(key);
+}
+
+/** better-sqlite3 的 UNIQUE 冲突判定，仅限 mesh_messages.idempotency_key */
+function isIdempotencyConflict(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown };
+  return (
+    typeof e?.code === "string" &&
+    e.code.startsWith("SQLITE_CONSTRAINT") &&
+    typeof e?.message === "string" &&
+    e.message.includes("mesh_messages.idempotency_key")
+  );
+}
 
 function buildPayload(input: RouteInput): EnvelopePayload {
   const base = input.payload ? { ...input.payload } : {};
@@ -716,6 +864,35 @@ function lastSpeakersOf(d: RouterDeps, convId: string): string[] {
     }
   }
   return out;
+}
+
+/** §17.1：从 queue 成员挑出当前 in-flight 最少的消费者（相等取字典序最小，保证确定性） */
+function selectQueueConsumer(
+  d: RouterDeps,
+  convId: string,
+  candidates: string[],
+): string | null {
+  const sorted = [...candidates].sort();
+  if (sorted.length === 0) return null;
+  const rows = d.store.db
+    .prepare<[string], { account_id: string; n: number }>(
+      "SELECT d.account_id, COUNT(*) AS n FROM mesh_deliveries d " +
+        "JOIN mesh_messages m ON m.id = d.message_id " +
+        "WHERE m.conversation_id = ? AND d.state IN ('queued','delivered','routed','parked') " +
+        "GROUP BY d.account_id",
+    )
+    .all(convId);
+  const inflight = new Map(rows.map((r) => [r.account_id, r.n]));
+  let best = sorted[0]!;
+  let bestN = inflight.get(best) ?? 0;
+  for (const m of sorted.slice(1)) {
+    const n = inflight.get(m) ?? 0;
+    if (n < bestN) {
+      best = m;
+      bestN = n;
+    }
+  }
+  return best;
 }
 
 /**

@@ -7,3 +7,12 @@ data/
 *.db-wal
 *.db-shm
 .DS_Store
+
+# mesh demo runtime data (db, locks, sessions)
+demo/.data/
+# mesh demo local config (commit demo.config.example.json instead)
+demo/demo.config.json
+# npm pack 产物（本地 tarball）
+dist-tarball/
+# 本地 agent 工具记忆目录（非项目代码）
+.workbuddy/

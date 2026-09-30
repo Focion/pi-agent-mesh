@@ -1,3 +1,13 @@
+---
+title: Pi Agent Mesh 规范 v1.0.0
+date: 2026-09-07
+status: active
+owner: unassigned
+tags: [spec, multi-agent, messaging, pi-sdk, sqlite]
+related:
+  - notes/plan/2026-09-07-p0-p1-rollout.md
+---
+
 # Pi Agent Mesh
 
 **多持久 Agent 的消息传递与数据共享方案**

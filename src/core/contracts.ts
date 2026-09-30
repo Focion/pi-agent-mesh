@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Pi Agent Mesh — 内部组件契约（非公共 API，不从包根导出）
-// 依据：docs/Pi-Agent-Mesh.md §3 架构 / §11 存储 / §12 API
+// 依据：.agents/notes/tech/2026-09-07-pi-agent-mesh-spec.md §3 架构 / §11 存储 / §12 API
 // L1 实现 Store/Registry/EventBus/Transport；L2 消费它们并实现 Router/Mailbox；
 // L5/L6 按 ToolContext / Observer 契约实现。签名变更必须回报父 agent。
 // ═══════════════════════════════════════════════════════════════════════════
@@ -9,6 +9,7 @@ import type Database from "better-sqlite3";
 import type {
   Account,
   AccountId,
+  Acl,
   Cap,
   Conversation,
   ConversationId,
@@ -30,6 +31,8 @@ import type {
   RegisterAccountInput,
   RegisterEndpointInput,
   SendInput,
+  SharedObjectMeta,
+  SpaceId,
   StreamTopology,
   Unsubscribe
 } from "./types.js";
@@ -131,6 +134,8 @@ export interface RouteInput extends SendInput {
   fromEndpoint?: EndpointId;
   /** 幂等键原料：工具层强制取 tool_call id；宿主缺省时退化为 5s 时间窗（§5.5） */
   clientToken?: string;
+  /** request-response 阻塞轴（§14.5）：true ⇒ pending_acks.sync=1，参与环检测 */
+  blocking?: boolean;
 }
 
 export interface Router {
@@ -172,8 +177,39 @@ export interface Mailbox {
   inboxOf(accountId: AccountId): InboxView;
   /** P2 注入体（context 钩子每次 LLM 调用前重算，不落盘） */
   inboxInjection(endpointId: EndpointId): string | null;
+  /** §7.6：P2 注入完成即 delivered（无 entry_id；turn_end 再 consumed） */
+  markInjectedDelivered(endpointId: EndpointId): void;
   /** 背压自持计数：该端点 queued+delivered 行数（F3） */
   inFlightCount(endpointId: EndpointId): number;
+
+  // ── queue（§17）：claim / ack / 租约回收 ──
+  /** delivered → claimed，写入 claim_until 与 payload.claim（被他人持有 → CLAIM_TAKEN；自己的已过期 → CLAIM_EXPIRED） */
+  claim(messageId: MessageId, by: AccountId): Promise<{ ok: boolean; leaseUntil?: string }>;
+  /** queue 确认或拒绝：成功 claimed → acked；error → nack（claimed → queued / MAX_ATTEMPTS → dropped） */
+  ackQueue(messageId: MessageId, by: AccountId, error?: unknown): Promise<void>;
+  /** sweep ⑤：回收过期的 claimed / delivered-claimable 租约（满足 C13） */
+  reclaimExpiredClaims(nowMs?: number): Promise<void>;
+}
+
+// ─── SharedSpace（§18：共享空间持久化与 ACL，零 pi）─────────────────────
+
+export interface SharedSpace {
+  /** 读对象（含 data）；从未存在或已 del → null；version 命中读历史版本 */
+  get(spaceId: SpaceId, key: string, as: AccountId, version?: number): Promise<SharedObjectMeta | null>;
+  put(
+    spaceId: SpaceId,
+    key: string,
+    data: unknown,
+    opts: { as: AccountId; expectedVersion?: number; contentType?: string; acl?: Acl; ext?: unknown },
+  ): Promise<{ version: number }>;
+  append(
+    spaceId: SpaceId,
+    key: string,
+    item: unknown,
+    opts: { as: AccountId; maxLen?: number },
+  ): Promise<{ version: number }>;
+  del(spaceId: SpaceId, key: string, opts: { as: AccountId }): Promise<void>;
+  list(spaceId: SpaceId, opts: { as: AccountId; keyPrefix?: string }): Promise<SharedObjectMeta[]>;
 }
 
 // ─── ToolContext（§10.2：工具执行上下文，身份由闭包注入，M6）─────────────
@@ -201,7 +237,7 @@ export interface ToolContext {
   lookup(q: { query?: string; capabilities?: string[]; limit?: number }): Promise<Account[]>;
   createConversation(input: Omit<CreateConversationInput, "creator">): Promise<Conversation>;
   conversationAdmin(conversationId: string, op: ConversationAdminOp): Promise<void>;
-  /** P3/P4 面：本构建可抛 MeshUnsupportedError，工具层转结构化错误 */
+  /** 应答 / 队列 / 共享空间（ToolContext 面）：拒绝统一 reject，工具层转结构化错误 */
   ack(r: { correlationId: string; data?: unknown; error?: unknown }): Promise<void>;
   claim(messageId: string): Promise<{ ok: boolean; leaseUntil?: string }>;
   sharedGet(spaceId: string, key: string, version?: number): Promise<unknown>;

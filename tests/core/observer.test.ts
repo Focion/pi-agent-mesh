@@ -894,8 +894,11 @@ describe("MeshObserver.counters", () => {
 // ─── 回放延期与只读性 ─────────────────────────────────────────────────────
 
 describe("MeshObserver misc", () => {
-  it("replay/forkAt throw MeshUnsupportedError (P2 deferred)", async () => {
-    await expect(obs.replay("e1")).rejects.toThrow(MeshUnsupportedError);
+  it("replay returns ReplayResult (implemented), forkAt still throws MeshUnsupportedError", async () => {
+    const result = await obs.replay("e1");
+    expect(result).toBeDefined();
+    expect(result.entries).toBeDefined();
+    expect(result.inbox).toBeDefined();
     await expect(obs.forkAt("e1", "en1")).rejects.toThrow(MeshUnsupportedError);
   });
 

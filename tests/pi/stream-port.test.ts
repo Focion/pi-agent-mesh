@@ -268,6 +268,18 @@ describe("PiStreamPort: deliver / onEntry / inFlight（F3/F5）", () => {
     expect(ep.state).toBe("hot");
     expect(entries.some((e) => e.envelopeId === "m_4")).toBe(true);
   });
+
+  it("deliver 驱动的自动 warm 以 shared 租约恢复（§8.3 投递→shared，⑤-D）", async () => {
+    const ep = addEndpoint();
+    expect(ep.state).toBe("cold");
+    await port.deliver(ep.id, "auto-warm-shared", makeEnvelope("m_4s"), "followUp", {
+      triggerTurn: false,
+    });
+    expect(ep.state).toBe("hot");
+    // 常规投递是 shared，不是 exclusive —— 否则后续并发消息会全部 park(LEASE_HELD)
+    expect(ep.lease).toBe("shared");
+    expect(ep.leaseUntil).toBe(null);
+  });
 });
 
 describe("PiStreamPort: note / hasEntries / evict", () => {
@@ -290,28 +302,47 @@ describe("PiStreamPort: note / hasEntries / evict", () => {
     expect(alive.has("nonexistent")).toBe(false);
   });
 
-  it("evict 释放锁、转 cold；之后可重新 warm", async () => {
+  it("evict 释放锁、转 cold；之后可重新 warm（single 释放即删锁文件，§8.3）", async () => {
     const ep = addEndpoint();
     await port.warm(ep.id, "shared");
     await port.evict(ep.id);
     expect(ep.state).toBe("cold");
-    expect(await EndpointLock.readInfo(join(dir, "locks", `${ep.id}.lock`))).toBeUndefined();
+    // single 模式：endpoint 锁释放即删文件，下次 warm 可重新抢
+    const info = await EndpointLock.readInfo(join(dir, "locks", `${ep.id}.lock`));
+    expect(info).toBeUndefined();
     await port.warm(ep.id, "shared");
     expect(ep.state).toBe("hot");
   });
 });
 
 describe("EndpointLock 单元行为", () => {
-  it("双抢同一路径 ⇒ LockHeldError 带持锁者信息；release 后可再抢", async () => {
+  it("single 模式：任何租约撞 EEXIST ⇒ LockHeldError（M3 全局单写者）", async () => {
     const p = join(dir, "locks", "unit.lock");
+    // shared 撞 shared 也排他（M3：同一 endpointId 全局最多一个持锁写者）
     const a = await EndpointLock.acquire(p, { writerId: "w-a", lease: "shared" });
-    await expect(EndpointLock.acquire(p, { writerId: "w-b", lease: "shared" })).rejects.toThrow(
-      LockHeldError,
-    );
-    await a.release();
-    const b = await EndpointLock.acquire(p, { writerId: "w-b", lease: "shared" });
+    await expect(
+      EndpointLock.acquire(p, { writerId: "w-b", lease: "shared" }),
+    ).rejects.toThrow(LockHeldError);
+    await a.release(); // single 释放即删
+    // exclusive 撞 shared 同理排他
+    const c = await EndpointLock.acquire(p, { writerId: "w-c", lease: "exclusive", leaseTtlMs: 60_000 });
+    await expect(
+      EndpointLock.acquire(p, { writerId: "w-d", lease: "shared" }),
+    ).rejects.toThrow(LockHeldError);
+    await c.release();
+  });
+
+  it("multi 模式：shared-shared 共存（instance 锁 §19.3，释放不删文件）", async () => {
+    const p = join(dir, "locks", "instance.lock");
+    const a = await EndpointLock.acquire(p, { writerId: "w-a", lease: "shared", mode: "multi" });
+    const b = await EndpointLock.acquire(p, { writerId: "w-b", lease: "shared", mode: "multi" });
+    expect(a.held()).toBe(true);
     expect(b.held()).toBe(true);
+    await a.release();
     await b.release();
+    // multi 不删文件（多进程共享标记）
+    expect(await EndpointLock.readInfo(p)).toBeDefined();
+    await EndpointLock.forceRelease(p);
   });
 
   it("exclusive 租约过期 ⇒ held() = false，assertHeld 抛 invariant_violated（§23.7）", async () => {

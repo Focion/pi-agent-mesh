@@ -94,14 +94,18 @@ export function withPolicyGuard<T>(
 
 // ─── ① DeliveryPolicy：§7.2 档位映射矩阵 ─────────────────────────────────
 
-/** 规模列：direct=0, 小群(3–8)=1, 中群(9–30)=2, 大群(30+)=3 */
+/**
+ * 规模列：direct=0, 小群(3–8)=1, 中群(9–30)=2, 大群(30+)=3。
+ * `groupTiers` 语义（附录 F.1）= [小群下界, 小群上界, 中群上界]（默认 [3,8,30]），
+ * 因此小群上界取 `tiers[1]`、中群上界取 `tiers[2]`（`tiers[0]` 是下界，上界判定不读它）。
+ */
 export function memberTier(
   memberCount: number,
   tiers: [number, number, number],
 ): 0 | 1 | 2 | 3 {
   if (memberCount <= 2) return 0;
-  if (memberCount <= tiers[0]) return 1; // 3–8
-  if (memberCount <= tiers[1]) return 2; // 9–30
+  if (memberCount <= tiers[1]) return 1; // 3–8
+  if (memberCount <= tiers[2]) return 2; // 9–30
   return 3; // 30+
 }
 

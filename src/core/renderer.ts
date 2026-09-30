@@ -38,7 +38,9 @@ export function escapeDelims(s: string): string {
 function attrs(parts: Array<[string, string | number | undefined]>): string {
   return parts
     .filter(([, v]) => v !== undefined && v !== null && v !== "")
-    .map(([k, v]) => `${k}="${String(v).replaceAll('"', "'")}"`)
+    // 防线 1（§10.3）：一切外来内容都转义。属性值可能含发送方可控的 ts/name/mentions，
+    // 未转义的 `<<<`/`>>>` 会提前截断 <<<MSG 开标签。先清定界符再清引号。
+    .map(([k, v]) => `${k}="${escapeDelims(String(v)).replaceAll('"', "'")}"`)
     .join(" ");
 }
 

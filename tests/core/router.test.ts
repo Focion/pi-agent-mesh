@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import type Database from "better-sqlite3";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MeshEventBus } from "../../src/core/events.js";
 import { createDefaultPolicies } from "../../src/core/policies.js";
 import { MeshRegistry } from "../../src/core/registry.js";
@@ -12,6 +12,7 @@ import { MeshRouter } from "../../src/core/router.js";
 import { SqliteStore } from "../../src/core/store.js";
 import type { RouteInput } from "../../src/core/contracts.js";
 import type {
+  Cap,
   Envelope,
   Limits,
   Policies,
@@ -36,7 +37,7 @@ interface Harness {
 }
 
 function makeHarness(
-  opts: { limits?: Partial<Limits>; sealKey?: string } = {},
+  opts: { limits?: Partial<Limits>; sealKey?: string; mentionAllCap?: Cap } = {},
 ): Harness {
   const tdb = openTestDb();
   const limits: Limits = { ...DEFAULT_LIMITS, ...opts.limits };
@@ -77,6 +78,7 @@ function makeHarness(
     },
     isAwaiting: () => false,
     sealKey: opts.sealKey,
+    mentionAllCap: opts.mentionAllCap,
   });
   return {
     db: tdb.db,
@@ -284,6 +286,30 @@ describe("router: idempotency", () => {
     expect(r2.seq).toBe(r1.seq + 1);
     h.store.close();
   });
+
+  it("concurrent same-key routes: UNIQUE conflict falls back to the idempotent original (§5.5)", async () => {
+    const h = makeHarness();
+    const convId = await group3(h);
+    const input = msg("A", convId, { clientToken: "race-token" });
+    // 两次 route 并发：都通过事务外预检（无行），后者在事务内撞
+    // UNIQUE(idempotency_key) ⇒ 必须幂等返回原结果而不是抛错（§5.5）。
+    const [r1, r2] = await Promise.all([
+      h.router.route({ ...input }),
+      h.router.route({ ...input }),
+    ]);
+    expect(r1.messageId).toBe(r2.messageId);
+    expect(r1.seq).toBe(r2.seq);
+    const n = h.db
+      .prepare("SELECT COUNT(*) AS n FROM mesh_messages")
+      .get() as { n: number };
+    expect(n.n).toBe(1);
+    // 恰一次 dedup_hit（冲突回退路径记账，与预检命中同语义）
+    expect(counter(h, "dedup_hit")).toBe(1);
+    // 扇出只发生一次：delivery 行数 = 成员数-1（B、C）
+    expect(deliveriesOf(h, r1.messageId)).toHaveLength(2);
+    expect(h.routed).toHaveLength(1);
+    h.store.close();
+  });
 });
 
 // ─── 准入校验（§5.4 ①②）──────────────────────────────────────────────────
@@ -403,9 +429,14 @@ describe("router: mentions and @all", () => {
     const h = makeHarness();
     const convId = await group3(h);
     await addAcc(h, "ghost");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const r = await h.router.route(
       msg("A", convId, { mentions: ["B", "ghost"] }),
     );
+    // §5.4③：剔除并记 warning
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("stripped"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("ghost"));
+    warn.mockRestore();
     const m = h.db
       .prepare<[string], { mentions: string }>(
         "SELECT mentions FROM mesh_messages WHERE id = ?",
@@ -466,6 +497,66 @@ describe("router: mentions and @all", () => {
         msg("A", convId, { mentions: ["@all"], clientToken: "m4" }),
       ),
     ).rejects.toMatchObject({ code: "MENTION_ALL_THROTTLED" });
+    h.store.close();
+  });
+
+  // ── @all 闸一·权限（§6.1/§9.5/F.2：mentionAllCap + AccessControl）──
+
+  it("mentionAllCap tightened: @all rejected with NO_SPEAK_CAP when sender lacks the cap", async () => {
+    const h = makeHarness({ mentionAllCap: "setCaps" });
+    const convId = await group3(h);
+    // A 是 creator（持全部 caps）；收窄为 speak+read 后不得再 @all
+    h.registry.setCaps(convId, "A", ["speak", "read"]);
+    await expect(
+      h.router.route(msg("A", convId, { mentions: ["@all"] })),
+    ).rejects.toMatchObject({ code: "NO_SPEAK_CAP" });
+    // 同步拒绝：零消息、零 delivery（§9.5"要么整条生效，要么整条不受理"）
+    const n = h.db
+      .prepare("SELECT COUNT(*) AS n FROM mesh_messages")
+      .get() as { n: number };
+    expect(n.n).toBe(0);
+    h.store.close();
+  });
+
+  it("mentionAllCap tightened: holder of the cap still passes @all", async () => {
+    const h = makeHarness({ mentionAllCap: "setCaps" });
+    const convId = await group3(h);
+    // creator A 默认持全部 caps（含 setCaps）⇒ @all 放行
+    const r = await h.router.route(msg("A", convId, { mentions: ["@all"] }));
+    expect(deliveriesOf(h, r.messageId)).toHaveLength(2); // B、C
+    h.store.close();
+  });
+
+  it("AccessControl.canMentionAll veto rejects @all with NO_SPEAK_CAP (fail-closed)", async () => {
+    const h = makeHarness();
+    h.policies.accessControl = {
+      ...h.policies.accessControl,
+      canMentionAll: () => false,
+    };
+    const convId = await group3(h);
+    await expect(
+      h.router.route(msg("A", convId, { mentions: ["@all"] })),
+    ).rejects.toMatchObject({ code: "NO_SPEAK_CAP" });
+    // 不带 @all 的普通消息不受 canMentionAll 影响
+    const r = await h.router.route(msg("A", convId, { text: "plain" }));
+    expect(deliveriesOf(h, r.messageId)).toHaveLength(2);
+    h.store.close();
+  });
+
+  it("AccessControl.canMentionAll timeout degrades to deny (fail-closed, policy_degraded)", async () => {
+    const h = makeHarness({ limits: { policyTimeoutMs: 1 } });
+    h.policies.accessControl = {
+      ...h.policies.accessControl,
+      canMentionAll: async () => {
+        await new Promise((res) => setTimeout(res, 50));
+        return true;
+      },
+    };
+    const convId = await group3(h);
+    await expect(
+      h.router.route(msg("A", convId, { mentions: ["@all"] })),
+    ).rejects.toMatchObject({ code: "NO_SPEAK_CAP" });
+    expect(h.degraded.some((x) => x.slot === "accessControl")).toBe(true);
     h.store.close();
   });
 });
@@ -589,6 +680,7 @@ describe("router: expect and pending_acks", () => {
     h.db
       .prepare("UPDATE mesh_accounts SET initiate = '[]' WHERE id = ?")
       .run("B");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const reply = await h.router.route(
       msg("B", convId, {
         correlationId: req.correlationId,
@@ -596,6 +688,11 @@ describe("router: expect and pending_acks", () => {
         clientToken: "b1",
       }),
     );
+    // §14.1：强制降级须记 warning
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('forced to "none"'),
+    );
+    warn.mockRestore();
     const stored = h.db
       .prepare<[string], { expect: string }>(
         "SELECT expect FROM mesh_messages WHERE id = ?",
@@ -653,7 +750,7 @@ describe("router: request cycle detection", () => {
       );
     await expect(
       h.router.route(
-        msg("A", convId, { expect: "ack", to: ["B"], clientToken: "cyc1" }),
+        msg("A", convId, { expect: "ack", to: ["B"], clientToken: "cyc1", blocking: true }),
       ),
     ).rejects.toMatchObject({ code: "REQUEST_CYCLE" });
     h.store.close();
@@ -663,7 +760,7 @@ describe("router: request cycle detection", () => {
     const h = makeHarness();
     const convId = await group3(h);
     await expect(
-      h.router.route(msg("A", convId, { expect: "ack", to: ["A"] })),
+      h.router.route(msg("A", convId, { expect: "ack", to: ["A"], blocking: true })),
     ).rejects.toMatchObject({ code: "REQUEST_CYCLE" });
     h.store.close();
   });
@@ -701,7 +798,7 @@ describe("router: request cycle detection", () => {
 // ─── topic / queue 收窄（§16.6 §17.1）─────────────────────────────────────
 
 describe("router: topic and queue narrowing", () => {
-  it("topic publish stores the message with zero delivery rows", async () => {
+  it("topic publish creates a delivery per subscriber (including B who subscribed fromSeq=0)", async () => {
     const h = makeHarness();
     await addAcc(h, "A");
     await addAcc(h, "B");
@@ -714,8 +811,9 @@ describe("router: topic and queue narrowing", () => {
       msg("A", topic.id, { kind: "event", text: "broadcast" }),
     );
     expect(r.seq).toBe(1);
-    expect(deliveriesOf(h, r.messageId)).toHaveLength(0);
-    expect(counter(h, "deliveries_total")).toBe(0);
+    // B subscribed from fromSeq=0, seq=1 > 0 => B gets a delivery
+    expect(deliveriesOf(h, r.messageId)).toHaveLength(1);
+    expect(counter(h, "deliveries_total")).toBe(1);
     h.store.close();
   });
 
@@ -752,7 +850,7 @@ describe("router: topic and queue narrowing", () => {
     h.store.close();
   });
 
-  it("queue stores the message with expect forced to ack, no deliveries, no pending_acks", async () => {
+  it("queue stores message with expect forced to ack, creates 1 delivery for consumer + 1 pending_ack", async () => {
     const h = makeHarness();
     await addAcc(h, "A");
     await addAcc(h, "B");
@@ -770,11 +868,14 @@ describe("router: topic and queue narrowing", () => {
       )
       .get(r.messageId);
     expect(m?.expect).toBe("ack");
-    expect(deliveriesOf(h, r.messageId)).toHaveLength(0);
+    // queue: exactly one delivery for the selected consumer (B)
+    const ds = deliveriesOf(h, r.messageId);
+    expect(ds).toHaveLength(1);
+    expect(ds[0]!.account_id).toBe("B");
     const n = h.db
       .prepare("SELECT COUNT(*) AS n FROM mesh_pending_acks")
       .get() as { n: number };
-    expect(n.n).toBe(0);
+    expect(n.n).toBe(1);
     // 显式 expect:"reply" 在 queue 上被拒绝（§17.6）；显式 "none" 同样被覆写为 ack
     await expect(
       h.router.route(

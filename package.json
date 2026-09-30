@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Multi-agent messaging and shared-state layer on top of the pi SDK",
   "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "license": "MIT",
   "engines": {
     "node": ">=20"
@@ -29,7 +32,11 @@
     "build": "tsup",
     "test": "vitest run",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
-    "check:imports": "node scripts/check-imports.mjs"
+    "check:imports": "node scripts/check-imports.mjs",
+    "demo": "node demo/src/server.ts",
+    "demo:start": "bash scripts/start-demo.sh",
+    "pack": "node scripts/pack.mjs",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3"

@@ -31,6 +31,7 @@ import type {
   Observer,
   Priority,
   RecentPreview,
+  ReplayResult,
   StreamEntry,
 } from "./types.js";
 import { MeshUnsupportedError } from "./types.js";
@@ -630,13 +631,47 @@ export class MeshObserver implements Observer {
     }));
   }
 
-  // ── 回放（P2 延期，§23.2）──
+  // ── 回放（§23.2：零 LLM 转写）──
 
   async replay(
-    _endpointId: string,
-    _opts?: { untilSeq?: number },
-  ): Promise<never> {
-    throw new MeshUnsupportedError("Observer.replay");
+    endpointId: string,
+    opts?: { untilSeq?: number },
+  ): Promise<ReplayResult> {
+    const endpoint = this.registry.getEndpoint(endpointId);
+    const accountId = endpoint?.accountId ?? "";
+    let entries: StreamEntry[] = [];
+    if (endpoint?.piSessionId) {
+      entries = await this.streamEntries(endpoint.piSessionId);
+      const untilSeq = opts?.untilSeq;
+      if (untilSeq !== undefined) {
+        entries = entries.filter((e) => e.seqInStream <= untilSeq);
+      }
+    }
+    const inbox: InboxView = accountId
+      ? await this.inboxOf(accountId)
+      : { conversations: [], awaitingMyAck: [], awaitingTheirAck: [] };
+    // 注入体：以 InboxView 为骨架的 P2 摘要（逐会话一段）
+    const injected: string[] = [];
+    for (const conv of inbox.conversations) {
+      const lines: string[] = [];
+      if (conv.summary) lines.push(`[summary] ${conv.summary}`);
+      lines.push(`[digest] ${conv.unread} unread in ${conv.conversationId}`);
+      injected.push(lines.join("\n"));
+    }
+    const prompt = entries
+      .map((e) => {
+        let text = e.rawJson;
+        try {
+          const j = JSON.parse(e.rawJson) as { text?: unknown; content?: unknown };
+          if (typeof j.text === "string") text = j.text;
+          else if (typeof j.content === "string") text = j.content;
+        } catch {
+          // rawJson 保持原文
+        }
+        return `[${e.entryType}] ${text}`;
+      })
+      .join("\n");
+    return { prompt, entries, inbox, injected };
   }
 
   async forkAt(_endpointId: string, _entryId: string): Promise<never> {

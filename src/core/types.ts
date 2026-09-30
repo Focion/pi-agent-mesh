@@ -1,9 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Pi Agent Mesh — 公共类型面
-// 依据：docs/Pi-Agent-Mesh.md §5.2 §12.1–§12.6 §2.4 §19.2 附录 F
+// 依据：.agents/notes/tech/2026-09-07-pi-agent-mesh-spec.md §5.2 §12.1–§12.6 §2.4 §19.2 附录 F
 // 本文件是全库唯一类型契约：枚举与原因码的漂移是最贵的漂移（§12.6 末）。
 // 零外部依赖（M1：不得出现宿主业务词汇；session 字段为 unknown 以保住
-// mesh-core 零 pi import 门禁，见 PLAN.md §0）。
+// mesh-core 零 pi import 门禁，见 .agents/notes/plan/2026-09-07-p0-p1-rollout.md §0）。
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ─── ① 标识与字面量联合（§12.6 ①）──────────────────────────────────────────
@@ -86,6 +86,9 @@ export type ToolErrorCode =
   | "VERSION_MISMATCH"
   | "OBJECT_TOO_LARGE"
   | "SPACE_FORBIDDEN";
+
+/** MeshRejectError 可携带的码 = 纯 reject 码 ∪ 工具层错误码（host 面与工具面同源） */
+export type MeshErrorCode = RejectCode | ToolErrorCode;
 
 export type Unsubscribe = () => void;
 
@@ -354,8 +357,11 @@ export interface AclRule {
   tag?: string;
 }
 
+/** §18 三向 ACL：read（get/list）、write（put/del/append）、admin（改 ACL/管理）各自裁决 */
 export interface Acl {
-  rules: AclRule[];
+  read: AclRule[];
+  write: AclRule[];
+  admin: AclRule[];
 }
 
 export interface SharedObjectMeta {
@@ -366,6 +372,8 @@ export interface SharedObjectMeta {
   size: number;
   contentType?: string;
   updatedAt: string;
+  /** `get` 填充、`list` 不填（避免大对象整表回传） */
+  data?: unknown;
 }
 
 export interface AclCtx {
@@ -480,6 +488,13 @@ export interface AccessControl {
     membership?: Membership;
   }): boolean | Promise<boolean>;
   canPublish?(ctx: { envelope: Envelope; from: Account; conversation: Conversation }): boolean | Promise<boolean>;
+  /** §6.1/§9.5 @all 权限闸的 AccessControl 半边：否决 → reject(NO_SPEAK_CAP)；缺省放行 */
+  canMentionAll?(ctx: {
+    envelope: Envelope;
+    from: Account;
+    conversation: Conversation;
+    membership?: Membership;
+  }): boolean | Promise<boolean>;
   canInitiateDirect?(from: Account, to: Account): boolean | Promise<boolean>;
   canJoin?(conv: Conversation, account: Account): boolean | Promise<boolean>;
   resolveCustomTag?(tag: string, ctx: AclCtx): boolean | Promise<boolean>;
@@ -863,10 +878,23 @@ export interface MeshHost {
 export interface MeshOptions {
   dbPath: string;
   policies: Partial<Policies> & Pick<Policies, "sessionFactory">;
-  transport?: Transport;
+  /** Transport 实现：默认 InProcessTransport；传 "sameHost" 创建 SameHostTransport（§19.3） */
+  transport?: Transport | "sameHost";
+  /** SameHostTransport 配置（仅 transport="sameHost" 时生效） */
+  transportOptions?: { pollIntervalMs?: number; claimTtlMs?: number; maxAttempts?: number };
   streamPort?: StreamPort;
   limits?: Partial<Limits>;
   devMode?: boolean;
+  /**
+   * §6.1/F.2：放行 `mentions: ["@all"]` 的能力位（默认 `"speak"`，须为 §4.4
+   * 七能力位之一；收紧如 `"setCaps"` 可让全员唤醒只归管理员）。
+   */
+  mentionAllCap?: Cap;
+  /**
+   * §19.5 / 附录 F.2：SQLite `busy_timeout`（拿不到写锁时的等待上限，0–60000，
+   * 默认 5000）。0 = 立即失败（`SQLITE_BUSY` 抛给调用方），多进程部署建议显式设置。
+   */
+  busyTimeoutMs?: number;
 }
 
 export declare function createMesh(options: MeshOptions): Promise<MeshHost>;
@@ -875,8 +903,8 @@ export declare function createMesh(options: MeshOptions): Promise<MeshHost>;
 
 /** reject(code)：同步返回发送方，不落任何 delivery（§7.10） */
 export class MeshRejectError extends Error {
-  readonly code: RejectCode;
-  constructor(code: RejectCode, message?: string) {
+  readonly code: MeshErrorCode;
+  constructor(code: MeshErrorCode, message?: string) {
     super(message ?? code);
     this.name = "MeshRejectError";
     this.code = code;

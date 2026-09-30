@@ -7,15 +7,15 @@
 // 推进（delivered 的判据是 entry_appended，不是 deliver() 返回，F5）。
 //
 // 本构建的收窄（PLAN §1，P0+P1）：
-// - queue 的 claim/requeue/P1 恢复核对是 P3 阶段；本文件不处理 claimed/acked
-// - 崩溃恢复属性测试是 P2；sweep 提供投递侧的清扫（parked TTL / handoff
-//   超时 / 溢出折叠 / pending_acks 超时）
+// - 崩溃恢复的「双向核对」属性测试仍是 P2 形式（sweep 只做投递侧清扫：
+//   parked TTL / handoff 超时 / 溢出折叠 / pending_acks 超时 / queue claim 回收）
 // - 合并唤醒只在流空闲时执行（§7.8：忙流上 steer 会与 followUp 顺序反转）
 // ═══════════════════════════════════════════════════════════════════════════
 
 import type { Mailbox } from "./contracts.js";
 import type { MeshEventBus } from "./events.js";
 import { withPolicyTimeout } from "./policies.js";
+import { withPolicyGuard } from "./policies.js";
 import type { MeshRegistry } from "./registry.js";
 import type { SqliteStore } from "./store.js";
 import type { InProcessTransport } from "./transport.js";
@@ -26,27 +26,56 @@ import type {
   Conversation,
   DeliveryId,
   DegradeTarget,
+  DropReason,
   EndpointId,
   Envelope,
   Grade,
   InboxView,
   Limits,
   MeshLease,
+  MessageId,
   ParkReason,
+  PendingDelivery,
   Policies,
   PolicySlot,
   PresenceState,
   SinkHandler,
   StreamPort,
+  Transport,
   Unsubscribe,
 } from "./types.js";
 import { MeshRejectError } from "./types.js";
 import { mechanicalDigest } from "./renderer.js";
+import { DefaultRenderer, escapeDelims, verifyWrapped } from "./renderer.js";
 import { WakeRateLimiter } from "./policies.js";
 import { isoFromMs, isoNow, msFromIso, truncate, ulid } from "./util.js";
 
 /** 折叠后仍是「在收件箱里」的状态（§7.5 未读口径 = C5 口径） */
 const PENDING_STATES = "('routed','queued','parked','delivered')";
+
+/** §7.10 原因码总表（drop）；devMode 下写入未登记码直接抛错（§7.10②） */
+const DROP_REASONS = new Set<string>([
+  "folded",
+  "TTL_EXPIRED",
+  "TRANSPORT_FAILED",
+  "MAX_ATTEMPTS",
+  "ACL_DENIED",
+  "MUTED",
+  "TOMBSTONED",
+  "WAKE_THROTTLED_AND_EXPIRED",
+]);
+/** §7.10 原因码总表（parked）；同上，devMode 下写入未登记码抛错 */
+const PARK_REASONS = new Set<string>([
+  "ENDPOINT_GONE",
+  "LEASE_HELD",
+  "NO_SINK_HANDLER",
+  "SINK_REFUSED",
+  "PORT_TIMEOUT",
+  "NO_SESSION",
+]);
+
+/** 渲染槽 I21 降级回的内建渲染器（M4 包裹保底，§12.3④） */
+const builtinRenderer = new DefaultRenderer();
 
 export interface MailboxDeps {
   store: SqliteStore;
@@ -54,7 +83,9 @@ export interface MailboxDeps {
   events: MeshEventBus;
   policies: Policies;
   limits: Limits;
-  transport: InProcessTransport;
+  transport: Transport;
+  /** 该端点是否本进程持有（sameHost 判断：本进程→直派，他进程→outbox）；可异步，缺省恒 true */
+  isEndpointLocal?: (endpointId: EndpointId) => boolean | Promise<boolean>;
   /** StreamPort：装配层必须已接线（FakeStreamPort 或 mesh-pi 的 PiStreamPort） */
   port: StreamPort;
   /** sink/external 账号的宿主处理器（MeshHost.registerSinkHandler 注册） */
@@ -79,6 +110,8 @@ interface DeliveryRow {
   grade: string | null;
   path: string | null;
   state: string;
+  woke: number;
+  note: string | null;
   attempts: number;
   handoff_at: string | null;
   parked_at: string | null;
@@ -91,6 +124,8 @@ export class MeshMailbox implements Mailbox {
   private readonly rateLimiter: WakeRateLimiter;
   /** entryId → deliveryId：entry_appended 归因（handleEntryAppended 用） */
   private entryIndex = new Map<string, DeliveryId>();
+  /** §7.4 降级留痕：已写过「转入摘要模式」note 的 (account, conv)（一次/跃迁） */
+  private verbatimExitNoted = new Set<string>();
 
   constructor(deps: MailboxDeps) {
     this.d = deps;
@@ -221,8 +256,10 @@ export class MeshMailbox implements Mailbox {
 
     // ── 背压（§7.8 扇出时层）：库自持 inFlight，不读 SDK 计数（F3）──
     const inFlight = this.inFlightCount(endpointId);
+    let note: string | null = null;
     if (grade !== "silent" && inFlight >= this.d.limits.maxInFlight) {
       grade = "silent";
+      note = "backpressure_downgrade"; // §23.4：降级留痕
       d.store.bumpCounter("backpressure_downgrade");
     }
     if (grade === "silent") d.store.bumpCounter("silent_grade");
@@ -279,6 +316,7 @@ export class MeshMailbox implements Mailbox {
       if (want && this.rateLimiter.exceeds(row.account_id)) {
         want = false;
         grade = "silent";
+        note = "wake_throttled"; // §7.3：限流仍投不出 ⇒ 终态 WAKE_THROTTLED_AND_EXPIRED
         d.store.bumpCounter("wake_throttled");
       }
       if (want) this.rateLimiter.record(row.account_id);
@@ -288,11 +326,26 @@ export class MeshMailbox implements Mailbox {
     // 定档与选端结果落库（queued = 定档完成，§7.9）
     this.d.store.db
       .prepare(
-        "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, grade = ?, endpoint_id = ?, path = ?, woke = ?, state_changed_at = ? " +
+        "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, grade = ?, endpoint_id = ?, path = ?, woke = ?, note = ?, state_changed_at = ? " +
           "WHERE id = ?",
       )
-      .run(isoNow(), grade, endpointId, path, woke ? 1 : 0, isoNow(), row.id);
+      .run(isoNow(), grade, endpointId, path, woke ? 1 : 0, note, isoNow(), row.id);
     const live: DeliveryRow = { ...row, state: "queued", grade, endpoint_id: endpointId, path };
+
+    // sameHost 跨进程：目标端点不在本进程 → 发布到 outbox（§19.3），由端点的持锁进程认领投递。
+    // 定档/路径/唤醒已在上面判定并落库，接收方只渲染+入流（不再重定档）。
+    const isLocal = await (this.d.isEndpointLocal?.(endpointId) ?? true);
+    if (!isLocal) {
+      const pending: PendingDelivery = {
+        deliveryId: row.id,
+        envelope,
+        grade,
+        accountId: row.account_id,
+        endpointId,
+      };
+      await this.d.transport.publish(pending);
+      return;
+    }
 
     if (path === "P3") {
       // 只记账：note() ⇒ appendCustomEntry，进历史不进 LLM 上下文（§7.6）
@@ -313,17 +366,23 @@ export class MeshMailbox implements Mailbox {
 
     if (path === "P2") {
       // 超预算：不碰 session，只留 Inbox；激活时经 context 注入摘要（§7.6）。
-      // delivery 留在 queued —— 注入完成才 delivered。
+      // delivery 留在 queued —— 注入完成才 delivered（markInjectedDelivered）。
+      // §7.4 降级留痕：该会话此前在预算内、本条起超预算 ⇒ 写一条 P3 note（一次/跃迁）。
+      await this.noteVerbatimExit(envelope, row.account_id, endpointId);
       return;
     }
 
     // ── P1 ──
-    // silent + 冷流：不升温，只入 Inbox（§7.2 表；成本决定，库不自作主张）
+    // silent + 冷流：不升温，只入 Inbox；§7.2 表规定冷流 silent 落 parked（非终态）
     const portState = d.port.status(endpointId);
     if (grade === "silent" && portState.state === "cold") {
       d.store.bumpCounter("cold_hit");
-      return; // 留 queued，等热起来后经 P2 注入或 sweep 重投
+      this.parkDelivery(row.id, envelope, "ENDPOINT_GONE", endpointId);
+      return;
     }
+
+    // 预算内：若此前因挤出写过降级 note，复位以便下次挤出再留痕
+    this.verbatimExitNoted.delete(row.account_id + "/" + envelope.conversationId);
 
     // CATCHUP（§7.6）：从超预算回到预算内的跃迁点，固化一次追赶摘要
     await this.maybeCatchup(envelope, row.account_id, endpointId, conv);
@@ -342,26 +401,35 @@ export class MeshMailbox implements Mailbox {
       .run(woke ? 1 : 0, row.id);
     live.grade = grade;
 
-    // 连续段（§7.7）：只投 cursorSeq 之后的下一条；有更早未投的先等
+    // 连续段（§7.7）：只投 cursorSeq 之后的下一条；有更早未投的先等（超时见 sweep ⑥）
     if (
       conv.kind !== "queue" &&
       !this.isNextInSegment(envelope, row.account_id, live)
     ) {
-      return; // 留 queued；前面的投完（turn_end / sweep）后由 retryEndpoint 续投
+      return; // 留 queued；前面的投完（turn_end → drainQueued）或超时（sweep ⑥）后续投
     }
 
-    const rendered = this.d.policies.renderer.renderMessage(envelope, {
-      recipient: account,
-      senderName: this.nameOf(envelope.from),
-    });
+    await this.renderAndDeliver(envelope, live, endpointId, account, grade, woke);
+  }
+
+  /** P1 渲染 + 投递（§7.6 P1）：deliver resolve ≠ delivered（F5，entry_appended 才推进） */
+  private async renderAndDeliver(
+    envelope: Envelope,
+    row: DeliveryRow,
+    endpointId: EndpointId,
+    account: Account,
+    grade: Grade,
+    woke: boolean,
+  ): Promise<void> {
+    const d = this.d;
+    const rendered = this.renderForStream(account, envelope);
     d.store.bumpCounter("verbatim_copies");
     try {
       const res = await d.port.deliver(endpointId, rendered, envelope, grade, {
         triggerTurn: woke,
       });
-      // deliver resolve ≠ delivered（F5）：留 queued + handoff_at 诊断戳，
-      // entry_appended 到达才推进（handleEntryAppended）
-      this.d.store.db
+      // 留 queued + handoff_at 诊断戳；entry_appended 到达才推进（handleEntryAppended）
+      d.store.db
         .prepare(
           "UPDATE mesh_deliveries SET handoff_at = ?, entry_id = ? WHERE id = ?",
         )
@@ -370,6 +438,38 @@ export class MeshMailbox implements Mailbox {
     } catch {
       this.parkDelivery(row.id, envelope, "PORT_TIMEOUT", endpointId);
     }
+  }
+
+  /**
+   * 渲染 stream 正文（§7.6 P1）：渲染槽受 I21 保护（抛错降级回内建渲染器），
+   * 输出再走 M4 包裹校验（§10.3 防线 1）：devMode 未包裹直接抛错，生产强制加壳。
+   */
+  private renderForStream(account: Account, envelope: Envelope): string {
+    const d = this.d;
+    const ctx = { recipient: account, senderName: this.nameOf(envelope.from) };
+    const rendered = withPolicyGuard(
+      this.guardDeps("renderer"),
+      () => d.policies.renderer.renderMessage(envelope, ctx),
+      builtinRenderer.renderMessage(envelope, ctx),
+    );
+    const check = verifyWrapped(rendered);
+    if (d.devMode && !check.ok) {
+      throw new Error(
+        "mesh: renderer output is not <<<MSG>>>-wrapped (§10.3 M4 / §23.7)",
+      );
+    }
+    return check.ok ? rendered : check.fixed;
+  }
+
+  /** sink/external 渲染（§6.3③ 结构化 JSON，不套壳、不校验 M4 包裹） */
+  private renderForSink(account: Account, envelope: Envelope): string {
+    const d = this.d;
+    const ctx = { recipient: account, senderName: this.nameOf(envelope.from) };
+    return withPolicyGuard(
+      this.guardDeps("renderer"),
+      () => d.policies.renderer.renderMessage(envelope, ctx),
+      builtinRenderer.renderMessage(envelope, ctx),
+    );
   }
 
   /** sink / external（§6.3③）：渲染 JSON 交给宿主处理器，accepted 即 delivered */
@@ -390,10 +490,7 @@ export class MeshMailbox implements Mailbox {
         "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, path = 'P1', grade = ?, state_changed_at = ? WHERE id = ?",
       )
       .run(isoNow(), "followUp", isoNow(), row.id);
-    const rendered = d.policies.renderer.renderMessage(envelope, {
-      recipient: account,
-      senderName: this.nameOf(envelope.from),
-    });
+    const rendered = this.renderForSink(account, envelope);
     let result: { accepted: boolean; consumedImmediately?: boolean };
     try {
       result = await handler.deliver(rendered, envelope, "followUp");
@@ -432,18 +529,15 @@ export class MeshMailbox implements Mailbox {
       // 从未发言且从未被 @ ⇒ 恒定超预算（初值 0 当 -∞，§7.4 刚性条款）
       return false;
     }
-    const budget = this.d.policies.retention.verbatimBudget({
-      accountId,
-      conversations: [
-        {
-          id: envelope.conversationId,
-          kind: conv.kind,
-          gap: this.gapOf(envelope.conversationId, accountId),
-          lastActiveSeq: conv.lastSeq,
-          unreadBytes: 0,
-        },
-      ],
-    });
+    const budget = withPolicyGuard(
+      this.guardDeps("retention"),
+      () =>
+        this.d.policies.retention.verbatimBudget({
+          accountId,
+          conversations: this.retentionCandidates(accountId),
+        }),
+      { bytes: Number.MAX_SAFE_INTEGER, ttlSeq: this.d.limits.verbatimGapK },
+    );
     const gap = this.gapOf(envelope.conversationId, accountId);
     const gapOk = budget.ttlSeq === undefined || gap <= budget.ttlSeq;
     if (!gapOk) return false;
@@ -486,6 +580,36 @@ export class MeshMailbox implements Mailbox {
       if (r.next - 1 - Math.max(r.s, r.m) <= this.d.limits.verbatimGapK) n++;
     }
     return n;
+  }
+
+  /** 预算决策的全量会话清单（§7.4：宿主 RetentionPolicy 据此算 bytes/count 预算） */
+  private retentionCandidates(
+    accountId: AccountId,
+  ): Array<{
+    id: string;
+    kind: Conversation["kind"];
+    gap: number;
+    lastActiveSeq: number;
+    unreadBytes: number;
+  }> {
+    const rows = this.d.store.db
+      .prepare<
+        [string],
+        { conversation_id: string; s: number; m: number; next: number; type: string }
+      >(
+        "SELECT ms.conversation_id, ms.last_spoke_seq AS s, ms.last_mentioned_seq AS m, " +
+          "c.next_seq AS next, c.type AS type " +
+          "FROM mesh_memberships ms JOIN mesh_conversations c ON c.id = ms.conversation_id " +
+          "WHERE ms.account_id = ? AND ms.left_at IS NULL",
+      )
+      .all(accountId);
+    return rows.map((r) => ({
+      id: r.conversation_id,
+      kind: r.type as Conversation["kind"],
+      gap: r.next - 1 - Math.max(r.s, r.m),
+      lastActiveSeq: r.next - 1,
+      unreadBytes: 0, // P0：字节预算的未读字节不计（DefaultRetentionPolicy 不看 bytes）
+    }));
   }
 
   /**
@@ -666,7 +790,7 @@ export class MeshMailbox implements Mailbox {
           endpointId: e.endpointId,
           accountId: row.account_id,
           grade: (row.grade ?? "followUp") as Grade,
-          woke: false, // 唤醒判定已在 deliverOne 落库；事件侧重放投递事实
+          woke: !!row.woke, // §12.5：woke 是本投递是否触发轮次（deliverOne 已落库）
           path: (row.path ?? "P1") as "P1" | "P2" | "P3",
         });
       }
@@ -721,6 +845,37 @@ export class MeshMailbox implements Mailbox {
         });
       }
     }
+    // §7.7：turn_end 前移了 cursorSeq，缺口可能已关闭——续投被阻塞的队头
+    void this.drainQueued(endpointId);
+  }
+
+  /** sameHost 收件：由 Transport poller 认领后调用，渲染并写入目标端点的流。
+   *  定档/唤醒判定已在发端完成（deliverOne 落库到 mesh_deliveries）；这里只负责
+   *  stream 入流 → entry_appended 推进状态机（F5）。 */
+  async handleOutboxDelivery(d: PendingDelivery): Promise<void> {
+    const account = this.d.registry.getAccount(d.accountId);
+    if (!account) {
+      throw new Error(
+        `mesh: outbox delivery to unknown account ${d.accountId}`,
+      );
+    }
+    const rendered = this.renderForStream(account, d.envelope);
+    const res = await this.d.port.deliver(
+      d.endpointId ?? "",
+      rendered,
+      d.envelope,
+      d.grade,
+      { triggerTurn: false }, // 唤醒判定已在发端完成
+    );
+    this.d.store.db
+      .prepare(
+        "UPDATE mesh_deliveries SET handoff_at = ?, entry_id = ? WHERE id = ?",
+      )
+      .run(isoNow(), res.entryId ?? null, d.deliveryId);
+    if (res.entryId) this.entryIndex.set(res.entryId, d.deliveryId);
+    // 推进 outbox 终态（§19.3）：投递成功 ⇒ done，避免 claimTtl 回收后重复投递。
+    // InProcessTransport.ack 为 no-op；SameHostTransport.ack 落 done。
+    await this.d.transport.ack(d.deliveryId, "delivered");
   }
 
   // ── 周期清扫（§8.4 ③ 的运行时形态）──────────────────────────────────
@@ -735,7 +890,10 @@ export class MeshMailbox implements Mailbox {
       .all(isoFromMs(nowMs - d.limits.parkTtlMs)) as DeliveryRow[];
     for (const row of expired) {
       const env = this.envelopeOf(row.message_id);
-      this.dropDelivery(row.id, env, "TTL_EXPIRED");
+      // §7.3：被 A3 限流且始终投不出（冷流 parked）的，TTL 时落专用原因码
+      const reason =
+        row.note === "wake_throttled" ? "WAKE_THROTTLED_AND_EXPIRED" : "TTL_EXPIRED";
+      this.dropDelivery(row.id, env, reason);
       d.store.bumpCounter("park_expired");
     }
 
@@ -759,6 +917,31 @@ export class MeshMailbox implements Mailbox {
 
     // ③ 溢出折叠（§7.5）：两个上限，任一触发即折最旧一半
     this.foldOverflow();
+
+    // ⑥ seq 缺口超时（§7.7）：连续段等待超 seqGapTimeoutMs 就跳过，宁乱序不卡死
+    const gapRows = d.store.db
+      .prepare<[string], DeliveryRow & { seq: number }>(
+        "SELECT d.*, m.seq FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
+          "WHERE d.state = 'queued' AND d.path = 'P1' AND d.handoff_at IS NULL AND d.endpoint_id IS NOT NULL " +
+          "AND d.queued_at < ? ORDER BY m.seq",
+      )
+      .all(isoFromMs(nowMs - d.limits.seqGapTimeoutMs)) as Array<DeliveryRow & { seq: number }>;
+    for (const row of gapRows) {
+      const env = this.envelopeOf(row.message_id);
+      if (!env || !row.endpoint_id) continue;
+      if (this.isNextInSegment(env, row.account_id, row)) continue; // 缺口已关：留给 drainQueued 保序
+      const account = d.registry.getAccount(row.account_id);
+      if (!account) continue;
+      d.store.bumpCounter("seq_gap");
+      await this.renderAndDeliver(
+        env,
+        row,
+        row.endpoint_id,
+        account,
+        (row.grade ?? "followUp") as Grade,
+        !!row.woke,
+      );
+    }
 
     // ④ pending_acks 超时（§14.3）：转 timeout、发事件、@system 通知发起方
     const timedOut = d.store.db
@@ -808,7 +991,8 @@ export class MeshMailbox implements Mailbox {
       }
     }
 
-    // ⑤ queue 租约回收（§17.2）——P3 收窄，本构建没有 claimed 态可回收
+    // ⑤ queue 租约回收（§17.2）：过期 claimed 回队或死信（满足 C13）
+    await this.reclaimExpiredClaims(nowMs);
   }
 
   /** 溢出折叠（§7.5）：cursorSeq 前移 + dropped(folded) 两件事必须同时做 */
@@ -993,6 +1177,93 @@ export class MeshMailbox implements Mailbox {
     }
   }
 
+  /** §7.6：P2 注入完成即 delivered（无 entry_id）；turn_end 再 consumed 并前移 cursorSeq */
+  markInjectedDelivered(endpointId: EndpointId): void {
+    const d = this.d;
+    const ep = d.registry.getEndpoint(endpointId);
+    if (!ep) return;
+    const rows = d.store.db
+      .prepare<[string], DeliveryRow>(
+        "SELECT * FROM mesh_deliveries WHERE account_id = ? AND path = 'P2' AND state = 'queued'",
+      )
+      .all(ep.accountId) as DeliveryRow[];
+    if (rows.length === 0) return;
+    const now = isoNow();
+    const upd = d.store.db.prepare(
+      "UPDATE mesh_deliveries SET state = 'delivered', delivered_at = ?, entry_id = NULL, handoff_at = NULL, state_changed_at = ? WHERE id = ?",
+    );
+    d.store.tx(() => {
+      for (const r of rows) upd.run(now, now, r.id);
+    });
+    for (const r of rows) {
+      const env = this.envelopeOf(r.message_id);
+      if (!env) continue;
+      d.events.emit("message_delivered", {
+        envelope: env,
+        endpointId,
+        accountId: r.account_id,
+        grade: (r.grade ?? "followUp") as Grade,
+        woke: !!r.woke,
+        path: "P2",
+      });
+    }
+  }
+
+  /** §7.7 续投：缺口关闭后把被连续段阻塞的 queued P1 队头投出去（F5：一次只投一条） */
+  private async drainQueued(endpointId: EndpointId): Promise<void> {
+    const d = this.d;
+    const rows = d.store.db
+      .prepare<[string], DeliveryRow>(
+        "SELECT d.* FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
+          "WHERE d.endpoint_id = ? AND d.state = 'queued' AND d.path = 'P1' AND d.handoff_at IS NULL " +
+          "ORDER BY m.seq",
+      )
+      .all(endpointId) as DeliveryRow[];
+    for (const row of rows) {
+      const env = this.envelopeOf(row.message_id);
+      if (!env) continue;
+      if (!this.isNextInSegment(env, row.account_id, row)) break; // 更早的还没完：停，保序
+      const account = d.registry.getAccount(row.account_id);
+      if (!account) continue;
+      await this.renderAndDeliver(
+        env,
+        row,
+        endpointId,
+        account,
+        (row.grade ?? "followUp") as Grade,
+        !!row.woke,
+      );
+    }
+  }
+
+  /** §7.4 降级留痕：会话从预算内被挤出时写一条 P3 note（不进 LLM 上下文，一次/跃迁） */
+  private async noteVerbatimExit(
+    envelope: Envelope,
+    accountId: AccountId,
+    endpointId: EndpointId,
+  ): Promise<void> {
+    const d = this.d;
+    const key = accountId + "/" + envelope.conversationId;
+    if (this.verbatimExitNoted.has(key)) return;
+    // 只有「此前拿过原文」的会话才有资格谈「挤出」（从未发言/被 @ 的恒超预算不算）
+    const hadVerbatim = d.store.db
+      .prepare<[string, string, number], { n: number }>(
+        "SELECT COUNT(*) AS n FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
+          "WHERE d.account_id = ? AND m.conversation_id = ? AND d.path = 'P1' AND m.seq < ?",
+      )
+      .get(accountId, envelope.conversationId, envelope.seq);
+    if (!hadVerbatim || hadVerbatim.n === 0) return;
+    this.verbatimExitNoted.add(key);
+    try {
+      await d.port.note(endpointId, "mesh.verbatim_exit", {
+        conv: envelope.conversationId,
+        atSeq: envelope.seq,
+      });
+    } catch {
+      this.verbatimExitNoted.delete(key); // 失败则下次再试
+    }
+  }
+
   // ── 读路径 ──────────────────────────────────────────────────────────────
 
   inboxOf(accountId: AccountId): InboxView {
@@ -1058,13 +1329,13 @@ export class MeshMailbox implements Mailbox {
       }>;
       recent.reverse();
       const lines: string[] = [];
-      if (conv.summary) lines.push(`[summary] ${conv.summary}`);
+      if (conv.summary) lines.push(`[summary] ${escapeDelims(conv.summary)}`);
       lines.push(`[digest] ${conv.unread} unread message(s) in this conversation.`);
       if (recent.length > 0) {
         lines.push("[recent]");
         for (const r of recent) {
           lines.push(
-            `  <<<MSG seq="${r.seq}" from="${r.from_account}">>> ${truncate(r.text ?? "", 40)} <<<END MSG>>>`,
+            `  <<<MSG seq="${r.seq}" from="${r.from_account}">>> ${escapeDelims(truncate(r.text ?? "", 40))} <<<END MSG>>>`,
           );
         }
       }
@@ -1087,6 +1358,245 @@ export class MeshMailbox implements Mailbox {
     return row?.n ?? 0;
   }
 
+  // ── queue（§17）：claim / ack / 租约回收 ────────────────────────────────
+
+  async claim(
+    messageId: MessageId,
+    by: AccountId,
+  ): Promise<{ ok: boolean; leaseUntil?: string }> {
+    const d = this.d;
+    const nowMs = Date.now();
+    const row = d.store.db
+      .prepare<
+        [string],
+        { id: string; account_id: string; state: string; claim_until: string | null; claim_by: string | null }
+      >(
+        "SELECT d.id, d.account_id, d.state, d.claim_until, " +
+          "json_extract(m.payload, '$.claim.by') AS claim_by " +
+          "FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
+          "WHERE d.message_id = ? ORDER BY m.seq LIMIT 1",
+      )
+      .get(messageId) as
+      | {
+          id: string;
+          account_id: string;
+          state: string;
+          claim_until: string | null;
+          claim_by: string | null;
+        }
+      | undefined;
+    if (!row) return { ok: false };
+
+    if (row.state === "claimed") {
+      const expired =
+        row.claim_until !== null && msFromIso(row.claim_until) <= nowMs;
+      if (row.claim_by === by) {
+        if (expired) {
+          throw new MeshRejectError(
+            "CLAIM_EXPIRED",
+            "your claim lease expired on " + messageId,
+          );
+        }
+        return { ok: true, leaseUntil: row.claim_until ?? undefined };
+      }
+      if (!expired) {
+        throw new MeshRejectError(
+          "CLAIM_TAKEN",
+          "message is claimed by " + (row.claim_by ?? "another worker"),
+        );
+      }
+      // 他人租约已过期 → 回收后可再认领（fall through）
+    }
+
+    // C3：claimed/acked 必须曾经 delivered（已投递到流才可认领）
+    if (row.state !== "delivered") return { ok: false };
+
+    const convId = this.convOfMessage(messageId);
+    const conv = d.registry.getConversation(convId);
+    const claimTtlMs = conv?.config.claimTtlMs ?? d.limits.claimTtlMs;
+    const until = isoFromMs(nowMs + claimTtlMs);
+    const now = isoNow();
+    d.store.tx(() => {
+      d.store.db
+        .prepare(
+          "UPDATE mesh_deliveries SET state = 'claimed', claim_until = ?, state_changed_at = ? WHERE id = ?",
+        )
+        .run(until, now, row.id);
+      d.store.db
+        .prepare(
+          "UPDATE mesh_messages SET payload = json_set(payload, '$.claim', json_object('by', ?, 'at', ?)) WHERE id = ?",
+        )
+        .run(by, now, messageId);
+      this.resetInboxPending(row.account_id, convId);
+    });
+    return { ok: true, leaseUntil: until };
+  }
+
+  async ackQueue(messageId: MessageId, by: AccountId, error?: unknown): Promise<void> {
+    const row = this.claimedRowFor(messageId);
+    if (!row || row.state !== "claimed") {
+      throw new MeshRejectError(
+        "NO_SUCH_CORRELATION",
+        "message is not currently claimed: " + messageId,
+      );
+    }
+    if (row.claim_by !== by) {
+      throw new MeshRejectError(
+        "CLAIM_TAKEN",
+        "cannot ack a message claimed by " + (row.claim_by ?? "another worker"),
+      );
+    }
+    if (error !== undefined) {
+      await this.nackClaim(row);
+      return;
+    }
+    const now = isoNow();
+    this.d.store.db
+      .prepare(
+        "UPDATE mesh_deliveries SET state = 'acked', claim_until = NULL, state_changed_at = ? WHERE id = ?",
+      )
+      .run(now, row.id);
+  }
+
+  async reclaimExpiredClaims(nowMs = Date.now()): Promise<void> {
+    const cutoff = isoFromMs(nowMs);
+    const d = this.d;
+    const rows = d.store.db
+      .prepare<[string], { id: string }>(
+        "SELECT d.id FROM mesh_deliveries d " +
+          "JOIN mesh_messages m ON m.id = d.message_id " +
+          "JOIN mesh_conversations c ON c.id = m.conversation_id " +
+          "WHERE c.type = 'queue' AND d.state = 'claimed' AND d.claim_until IS NOT NULL AND d.claim_until < ?",
+      )
+      .all(cutoff) as Array<{ id: string }>;
+    for (const r of rows) {
+      const row = this.claimedRowForDelivery(r.id);
+      if (row) await this.nackClaim(row);
+    }
+  }
+
+  /** 取一条 queue delivery 的 claim 归属（用于 ack 断言与回收） */
+  private claimedRowFor(messageId: MessageId): {
+    id: string;
+    message_id: string;
+    account_id: string;
+    conversation_id: string;
+    state: string;
+    attempts: number;
+    claim_by: string | null;
+  } | null {
+    return this.d.store.db
+      .prepare<
+        [string],
+        {
+          id: string;
+          message_id: string;
+          account_id: string;
+          conversation_id: string;
+          state: string;
+          attempts: number;
+          claim_by: string | null;
+        }
+      >(
+        "SELECT d.id, d.message_id, d.account_id, d.state, d.attempts, m.conversation_id, " +
+          "json_extract(m.payload, '$.claim.by') AS claim_by " +
+          "FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
+          "WHERE d.message_id = ? ORDER BY m.seq LIMIT 1",
+      )
+      .get(messageId) as
+      | {
+          id: string;
+          message_id: string;
+          account_id: string;
+          conversation_id: string;
+          state: string;
+          attempts: number;
+          claim_by: string | null;
+        }
+      | null;
+  }
+
+  private claimedRowForDelivery(deliveryId: DeliveryId): {
+    id: string;
+    message_id: string;
+    account_id: string;
+    conversation_id: string;
+    state: string;
+    attempts: number;
+    claim_by: string | null;
+  } | null {
+    return this.d.store.db
+      .prepare<
+        [string],
+        {
+          id: string;
+          message_id: string;
+          account_id: string;
+          conversation_id: string;
+          state: string;
+          attempts: number;
+          claim_by: string | null;
+        }
+      >(
+        "SELECT d.id, d.message_id, d.account_id, d.state, d.attempts, m.conversation_id, " +
+          "json_extract(m.payload, '$.claim.by') AS claim_by " +
+          "FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
+          "WHERE d.id = ?",
+      )
+      .get(deliveryId) as
+      | {
+          id: string;
+          message_id: string;
+          account_id: string;
+          conversation_id: string;
+          state: string;
+          attempts: number;
+          claim_by: string | null;
+        }
+      | null;
+  }
+
+  /** nack / 租约过期：claimed → queued（重投）或 MAX_ATTEMPTS → dropped */
+  private async nackClaim(row: {
+    id: string;
+    message_id: string;
+    account_id: string;
+    conversation_id: string;
+    attempts: number;
+  }): Promise<void> {
+    const d = this.d;
+    const attempts = row.attempts + 1;
+    const env = this.envelopeOf(row.message_id);
+    if (attempts > d.limits.maxAttempts) {
+      d.store.tx(() => {
+        d.store.db
+          .prepare(
+            "UPDATE mesh_deliveries SET state = 'dropped', drop_reason = 'MAX_ATTEMPTS', claim_until = NULL, attempts = ?, state_changed_at = ? WHERE id = ?",
+          )
+          .run(attempts, isoNow(), row.id);
+      });
+      if (env) d.events.emit("message_dropped", { envelope: env, reason: "MAX_ATTEMPTS" });
+      return;
+    }
+    const now = isoNow();
+    d.store.tx(() => {
+      d.store.db
+        .prepare(
+          "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, claim_until = NULL, endpoint_id = NULL, attempts = ?, " +
+            "state_changed_at = ? WHERE id = ?",
+        )
+        .run(now, attempts, now, row.id);
+      this.resetInboxPending(row.account_id, row.conversation_id);
+    });
+    // 回队后重投（本 worker 重试：单 consumers 简化，见 notes/review）
+    const live = d.store.db
+      .prepare<[string], DeliveryRow>("SELECT * FROM mesh_deliveries WHERE id = ?")
+      .get(row.id) as DeliveryRow | undefined;
+    if (env && live) {
+      await this.deliverOne(env, { ...live, state: "queued", endpoint_id: null, attempts });
+    }
+  }
+
   // ── 内部：状态跃迁与事件 ────────────────────────────────────────────────
 
   private markDelivered(deliveryId: DeliveryId, entryId: string | null): void {
@@ -1107,6 +1617,9 @@ export class MeshMailbox implements Mailbox {
     endpointId?: EndpointId,
   ): void {
     const d = this.d;
+    if (d.devMode && !PARK_REASONS.has(reason)) {
+      throw new Error(`mesh: unregistered parked_reason "${reason}" (§7.10②)`);
+    }
     const now = isoNow();
     d.store.db
       .prepare(
@@ -1127,9 +1640,12 @@ export class MeshMailbox implements Mailbox {
   private dropDelivery(
     deliveryId: DeliveryId,
     envelope: Envelope | null,
-    reason: "TTL_EXPIRED" | "TRANSPORT_FAILED" | "MUTED",
+    reason: DropReason,
   ): void {
     const d = this.d;
+    if (d.devMode && !DROP_REASONS.has(reason)) {
+      throw new Error(`mesh: unregistered drop_reason "${reason}" (§7.10②)`);
+    }
     const now = isoNow();
     d.store.db
       .prepare(
@@ -1219,11 +1735,21 @@ export class MeshMailbox implements Mailbox {
   }
 
   private guardDeps(
-    slot: "delivery" | "activation" | "endpointSelector",
+    slot:
+      | "delivery"
+      | "activation"
+      | "endpointSelector"
+      | "renderer"
+      | "retention",
   ): {
-    slot: "delivery" | "activation" | "endpointSelector";
+    slot:
+      | "delivery"
+      | "activation"
+      | "endpointSelector"
+      | "renderer"
+      | "retention";
     timeoutMs: number;
-    degradedTo: "silent_no_wake" | "parked";
+    degradedTo: DegradeTarget;
     onDegraded: (
       reason: "timeout" | "threw",
       slot: PolicySlot,
@@ -1231,10 +1757,14 @@ export class MeshMailbox implements Mailbox {
     ) => void;
   } {
     const d = this.d;
-    const degradedTo =
+    const degradedTo: DegradeTarget =
       slot === "endpointSelector"
-        ? ("parked" as const)
-        : ("silent_no_wake" as const);
+        ? "parked"
+        : slot === "renderer"
+          ? "builtin_renderer"
+          : slot === "retention"
+            ? "cursor_only"
+            : "silent_no_wake";
     return {
       slot,
       timeoutMs: d.limits.policyTimeoutMs,
