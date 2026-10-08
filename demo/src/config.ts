@@ -385,7 +385,8 @@ function resolveModel(config: DemoConfig): ModelResolution {
         model: buildCustomModel(config.provider, entry, custom.provider, custom.path),
         source: "custom",
         validIds: custom.provider.models?.map((m) => m.id) ?? [],
-        custom,
+        // 此处 custom.provider 已被上面的 if 收窄为非空，显式构造以匹配返回类型。
+        custom: { path: custom.path, provider: custom.provider },
       };
     }
     throw new ConfigError(
@@ -417,6 +418,9 @@ function resolveModel(config: DemoConfig): ModelResolution {
 
 /**
  * 启动校验（§配置层 5 步）。任何一步失败即在 mesh 建立之前抛 ConfigError。
+ *
+ * 本面板 100% 真实：必须解析到模型 + 检测到真实 LLM 凭据，否则 fail-fast。
+ * 不提供 faux / 离线 / EchoStreamPort 兜底——没有凭据就起不来，绝不假装真 LLM。
  */
 export function loadAndValidateDemo(): ResolvedDemo {
   // ① Node 版本守卫（pi-ai/pi-coding-agent 需要 ≥22.19）。
@@ -448,13 +452,10 @@ export function loadAndValidateDemo(): ResolvedDemo {
 
   // ③ model 解析（内建 → 自定义 models.json；失败内部已抛详尽 ConfigError）。
   const { model, source, custom } = resolveModel(config);
-
   // ④ 凭据（无密钥不跑）。
   const credential = resolveCredentials(config, custom);
-
   process.stderr.write(
     `[mesh-demo] model=${config.provider}/${config.modelId} [${source}] · thinking=${config.thinkingLevel} · 凭据来源=${credential.source} · db=${config.dbPath} · stateDir=${config.stateDir}\n`,
   );
-
   return { config, model, credential };
 }

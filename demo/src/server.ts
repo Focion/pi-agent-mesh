@@ -42,8 +42,8 @@ const sse = new SseHub();
 
 const hooks: ControllerHooks = {
   meshEvent: (type, payload) => sse.publish("mesh", { type, payload }),
-  scenario: (frame) => sse.publish("scenario", frame),
   delivery: (payload) => sse.publish("delivery", payload),
+  meshMessage: (env) => sse.publish("meshmsg", env),
 };
 
 const controller = new MeshController(config, model, hooks);
@@ -77,6 +77,8 @@ function serveStatic(reqPath: string, res: ServerResponse): void {
   res.writeHead(200, {
     "Content-Type": MIME[extname(filePath)] ?? "application/octet-stream",
     "Content-Length": body.length,
+    // 开发面板：禁止缓存静态资源，确保每次加载都是最新 JS/CSS（避免旧 app.js 导致按钮无响应）。
+    "Cache-Control": "no-store",
   });
   res.end(body);
 }
@@ -182,7 +184,7 @@ server.listen(config.port, () => {
       `            model  = ${config.provider}/${config.modelId} · thinking=${config.thinkingLevel}\n` +
       `            凭据    = ${credential.source}\n` +
       `            db     = ${config.dbPath}\n` +
-      `            事件流  = /api/events（15 个 MeshEvent + delivery/scenario/tick 每秒）\n`,
+      `            事件流  = /api/events（15 个 MeshEvent + delivery/meshmsg/tick 每秒）\n`,
   );
 });
 
@@ -200,19 +202,46 @@ tickTimer.unref?.();
 // ── 优雅关闭 ──────────────────────────────────────────────────────────────────
 
 let shuttingDown = false;
+
+// 给一个 promise 套超时：超时则 reject，避免 await 一个永不 settle 的关闭步骤把进程吊住。
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} 超时（${ms}ms）`)), ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   process.stderr.write(`\n[mesh-demo] ${signal} 收到，关闭中…\n`);
   clearInterval(tickTimer);
   sse.close();
+
+  // 绝对看门狗：先布防。无论下面的 dispose / server.close 是否卡死，最迟 4s 强制退出。
+  // （旧实现把兜底 exit 放在 await dispose 之后，dispose 一挂就永远走不到 → 进程吊死。）
+  const watchdog = setTimeout(() => {
+    process.stderr.write(`[mesh-demo] 关闭超时，强制退出\n`);
+    process.exit(1);
+  }, 4000);
+
   try {
-    await controller.dispose();
+    await withTimeout(controller.dispose(), 2500, "dispose");
   } catch (err) {
-    process.stderr.write(`[mesh-demo] close 报错：${String(err)}\n`);
+    process.stderr.write(`[mesh-demo] dispose 未完成：${String(err)}\n`);
   }
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 1500).unref?.();
+
+  try {
+    await withTimeout(new Promise<void>((r) => server.close(() => r())), 1200, "server.close");
+  } catch (err) {
+    process.stderr.write(`[mesh-demo] server.close 未完成：${String(err)}\n`);
+  }
+
+  clearTimeout(watchdog);
+  process.exit(0);
 }
 
 process.on("SIGINT", () => void shutdown("SIGINT"));

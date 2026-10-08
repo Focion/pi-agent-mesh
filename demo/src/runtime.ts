@@ -1,17 +1,18 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// mesh 面板 · 运行时控制器（全真实装配）。
+// mesh 面板 · 运行时控制器（全真实装配，实时 LLM）。
 //
 // 一行 import 组装真实 MeshHost：createMesh 不填 streamPort/transport，由库自动
 // 装配真实 PiStreamPort + InProcessTransport；createPiSessionFactory 注入真实
-// Model（config 层已 fail-fast 校验）。无 faux、无 FakeStreamPort。
+// Model（config 层已 fail-fast 校验）。无 faux、无 FakeStreamPort、无离线模拟。
+//
+// 每个 agent 端点都跑一个真实 pi AgentSession（sessionFactory 捕获留存），
+// 群聊「接龙」由控制器显式驱动：发消息后，群里其它 agent 各自用真实 session
+// 生成一句回复，再经 host.send 回发到群——全部走真实 LLM，没有任何 canned 文案。
 //
 // MeshHost 没有「列出端点/会话」「读端点 piSessionId」的公开接口，故本控制器：
 //  - 自记 accounts/endpoints/conversations/presence/sinkModes 投影；
-//  - 给 sessionFactory 包一层以捕获每端点 piSessionId（Stream 页需要它）；
+//  - 给 sessionFactory 包一层以捕获每端点 piSessionId 与真实 session 对象；
 //  - 用 endpoint_state_changed / presence_changed 事件维持最新投影。
-//
-// 断言只在乎「唤醒决策」（投递时已落库），与 LLM 轮时延/成本无关 —— P0/P1
-// 的验收比值由 counters 现算，确定性读得出来。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { createMesh, createPiSessionFactory } from "../../dist/index.js";
@@ -21,6 +22,7 @@ import type {
   Conversation,
   DeliveryTrace,
   Endpoint,
+  Envelope,
   Grade,
   MeshEvents,
   MeshHost,
@@ -31,23 +33,34 @@ import type {
 } from "../../dist/core/index.js";
 import type { DemoConfig } from "./config.ts";
 
-// ── 服务端回调（由 server.ts 注入；runtime 不感知 HTTP/SSE）─────────────────
-
-export interface ScenarioFrame {
-  name: "P0" | "P1";
-  phase: string;
-  step: string;
-  ok: boolean;
-  detail?: unknown;
-}
+const isoNow = () => new Date().toISOString();
 
 export interface ControllerHooks {
   meshEvent(type: string, payload: unknown): void;
-  scenario(frame: ScenarioFrame): void;
   delivery(payload: { messageId: string; traces: DeliveryTrace[] }): void;
+  /** 每条路由消息（SSE "meshmsg"）—— 供前端"多 agent 活动流"可视化。 */
+  meshMessage(env: Envelope): void;
 }
 
-const isoNow = () => new Date().toISOString();
+/** 群聊花名册中的单个 agent。 */
+export interface AgentInfo {
+  id: string;
+  displayName: string;
+  persona: string;
+  isSeed: boolean;
+  state?: string;
+}
+
+/** 一条群聊消息（首屏历史 + 实时去重）。 */
+export interface ChatEntry {
+  id: string;
+  from: string;
+  fromName: string;
+  conversationId: string;
+  kind: string;
+  text: string;
+  at: string;
+}
 
 export class MeshController {
   readonly config: DemoConfig;
@@ -62,6 +75,15 @@ export class MeshController {
   presence = new Map<string, PresenceState>();
   sinkModes = new Map<string, "accept" | "refuse">();
   private sinkUnsubs = new Map<string, Unsubscribe>();
+
+  /** 每个 agent 端点的真实 pi AgentSession（驱动 LLM 回复用）。 */
+  private sessions = new Map<string, unknown>();
+
+  // ── 群聊面板状态（注册 agent · 群组 · 多 agent 互聊）────────────────────
+  private chatGroupId?: string;
+  private agentProfiles = new Map<string, { persona?: string; isSeed?: boolean }>();
+  private chatLog = new Map<string, ChatEntry>();
+  private chatBusy = false;
 
   constructor(config: DemoConfig, model: unknown, hooks: ControllerHooks) {
     this.config = config;
@@ -78,25 +100,32 @@ export class MeshController {
       thinkingLevel: this.config.thinkingLevel,
       ...(this.config.tools.length > 0 ? { tools: this.config.tools } : {}),
     });
-    // 包一层捕获 piSessionId：open 恢复用的 id 在 ctx 上，create 的在返回值里。
+    // 包一层捕获 piSessionId 与真实 session 对象（接龙回复要用）。
     const controller = this;
     const sessionFactory: SessionFactory = {
       async create(ctx) {
         const r = await base.create(ctx);
         controller.captureSession(ctx.endpoint.id, r.piSessionId);
+        controller.sessions.set(ctx.endpoint.id, r.session);
         return r;
       },
       async open(ctx) {
         controller.captureSession(ctx.endpoint.id, ctx.piSessionId);
-        return base.open(ctx);
+        const r = await base.open(ctx);
+        controller.sessions.set(ctx.endpoint.id, r.session);
+        return r;
       },
     };
     this.host = await createMesh({
       dbPath: this.config.dbPath,
       policies: { sessionFactory },
       devMode: true,
+      // 单进程面板：崩溃/被 SIGKILL 后 .instance.lock 与端点锁会残留并挡住重启。
+      // 开启后 createMesh 先用 pid 存活 + 启动时刻核验持锁者「确实已死」再回收（M3 安全）。
+      recoverDeadEndpoints: true,
     });
     this.wireEvents();
+    await this.seedChatRoom();
   }
 
   private captureSession(endpointId: string, piSessionId: string): void {
@@ -116,7 +145,23 @@ export class MeshController {
       this.hooks.meshEvent(e, { at: isoNow(), ...(p as object) });
       this.updateFromEvent(e, p);
     };
-    this.host.on("message_routed", (p) => fwd("message_routed", p));
+    this.host.on("message_routed", (p) => {
+      fwd("message_routed", p);
+      const env = (p as MeshEvents["message_routed"]).envelope;
+      if (env) {
+        this.hooks.meshMessage(env);
+        if (env.kind === "chat" || env.kind === "system") {
+          this.pushChat({
+            id: env.id,
+            from: env.from,
+            conversationId: env.conversationId,
+            kind: env.kind,
+            text: ((env.payload as { text?: string } | undefined)?.text) ?? "",
+            at: ((env as unknown as { at?: string }).at) ?? isoNow(),
+          });
+        }
+      }
+    });
     this.host.on("message_delivered", (p) => fwd("message_delivered", p));
     this.host.on("message_consumed", (p) => fwd("message_consumed", p));
     this.host.on("message_parked", (p) => fwd("message_parked", p));
@@ -350,7 +395,7 @@ export class MeshController {
       ...(m.to?.length ? { to: m.to } : {}),
       ...(m.mentions?.length ? { mentions: m.mentions } : {}),
       ...(m.replyTo ? { replyTo: m.replyTo } : {}),
-    });
+    } as unknown as Parameters<typeof this.host.send>[0]);
   }
 
   async request(m: {
@@ -373,7 +418,7 @@ export class MeshController {
       { await: m.blocking },
     );
     // AckResult 不可序列化（含 timestamp Date），归一化为 plain object
-    if (r && typeof r === "object" && "ok" in r) return { ...(r as Record<string, unknown>) };
+    if (r && typeof r === "object" && "ok" in r) return { ...(r as unknown as Record<string, unknown>) };
     return r;
   }
   ack(opts: { correlationId: string; from: string; data?: unknown; error?: string }): Promise<void> {
@@ -400,6 +445,8 @@ export class MeshController {
     if (ep) {
       ep.lease = (lease ?? "exclusive") as Endpoint["lease"];
       ep.leaseUntil = null;
+      // warm 后即 hot（事件异步，这里同步投影保证"会话/端点"稳定）。
+      ep.state = "hot";
     }
   }
 
@@ -513,140 +560,239 @@ export class MeshController {
   }
 
   // ═════════════════════════════════════════════════════════════════════════
-  // 场景（P0 / P1）
+  // 群聊面板（注册 agent · 群组 · 多 agent 互聊）
   // ═════════════════════════════════════════════════════════════════════════
 
-  async runScenario(name: "P0" | "P1"): Promise<void> {
+  /** 默认群聊会话（懒创建）。 */
+  private async ensureChatGroup(): Promise<string> {
+    if (this.chatGroupId) return this.chatGroupId;
+    const members = this.rosterIds();
+    const creator = members[0] ?? "system";
+    const g = await this.createConversation({ type: "group", creator, members });
+    this.chatGroupId = g.id;
+    return g.id;
+  }
+
+  /** 注册一个聊天 agent（建账号 + 端点 + warm + 入群 + 记录人设）。 */
+  async registerAgent(args: { displayName: string; persona?: string }): Promise<AgentInfo> {
+    return this.registerAgentInternal(args.displayName, args.persona, false);
+  }
+
+  private async registerAgentInternal(displayName: string, persona: string | undefined, isSeed: boolean): Promise<AgentInfo> {
+    const base = this.slug(displayName) || "agent";
+    const id = `${base}-${Math.random().toString(36).slice(2, 6)}`;
+    const acc = await this.registerAccount({
+      id,
+      displayName: displayName || id,
+      endpointClass: "stream",
+      initiate: ["chat", "event", "task"],
+    });
+    const ep = await this.registerEndpoint({ accountId: id, topology: { kind: "unified" } });
+    await this.warm(ep.id, "shared");
+    this.agentProfiles.set(id, { persona: persona || undefined, isSeed });
+    const groupId = await this.ensureChatGroup();
     try {
-      if (name === "P1") await this.p1();
-      else await this.p0();
-    } catch (err) {
-      this.frame("场景异常中止", false, { error: serializeErrorLike(err) });
+      await this.addMember(groupId, id, { by: id });
+    } catch {
+      /* 群成员加入失败不致命 */
     }
+    this.pushSystem(`${acc.displayName} 加入了群聊`);
+    return { id, displayName: acc.displayName, persona: persona ?? "", isSeed, state: ep.state };
   }
 
-  private frame(step: string, ok: boolean, detail?: unknown, phase = ""): void {
-    this.hooks.scenario({ name: phase.startsWith("P1") ? "P1" : "P0", phase, step, ok, detail });
+  /** 首启：预置 3 个示例 agent，让群聊立即"活"起来（真实 LLM 驱动）。 */
+  private async seedChatRoom(): Promise<void> {
+    const seeds: Array<{ name: string; persona: string }> = [
+      { name: "Alice", persona: "产品负责人，关注体验" },
+      { name: "Bob", persona: "后端工程师，务实直接" },
+      { name: "Carol", persona: "设计师，重视细节" },
+    ];
+    for (const s of seeds) await this.registerAgentInternal(s.name, s.persona, true);
+    await this.ensureChatGroup();
+    this.pushSystem("群聊已就绪 · 发一条消息，大家会用真实 LLM 接力回复 ✨");
   }
 
-  private async waitForTrace(
-    messageId: string,
-    predicate: (t: DeliveryTrace) => boolean,
-    timeoutMs: number,
-  ): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      try {
-        const traces = await this.host.observer.trace(messageId);
-        if (traces.some(predicate)) return true;
-      } catch {
-        // 尚未可见
-      }
-      if (Date.now() >= deadline) return false;
-      await sleepMs(150);
-    }
+  /** 当前聊天 agent（stream 账号）id 列表。 */
+  rosterIds(): string[] {
+    return [...this.accounts.values()].filter((a) => a.endpointClass === "stream").map((a) => a.id);
   }
 
-  /**
-   * P0（确定性、零 LLM 轮）：走真实 warm/投递/消费，但不唤起任何 LLM 轮。
-   *  alice/bob 两 stream 账号 warm 后，alice 发 10 条 expect:none 逐条 markConsumed；
-   *  worker(sink)+accept+consumeImmediately 自动 consumed 1 条；收尾 checkInvariants。
-   */
-  private async p0(): Promise<void> {
-    const ids = `p0-${Date.now().toString(36)}`;
-    const alice = `${ids}-alice`;
-    const bob = `${ids}-bob`;
-    const worker = `${ids}-worker`;
+  /** 前端花名册。 */
+  getRoster(): AgentInfo[] {
+    return this.rosterIds().map((id) => {
+      const a = this.accounts.get(id)!;
+      const prof = this.agentProfiles.get(id);
+      const ep = [...this.endpoints.values()].find((e) => e.accountId === id);
+      return {
+        id,
+        displayName: a.displayName,
+        persona: prof?.persona ?? "",
+        isSeed: prof?.isSeed ?? false,
+        state: ep?.state,
+      };
+    });
+  }
 
-    this.frame("注册账号", true, { alice, bob, worker }, "P0 · 装配");
-    await this.registerAccount({ id: alice, displayName: "Alice", endpointClass: "stream", initiate: ["chat"] });
-    await this.registerAccount({ id: bob, displayName: "Bob", endpointClass: "stream", initiate: ["chat"] });
-    await this.registerAccount({ id: worker, displayName: "Worker", endpointClass: "sink" });
-    this.setSinkMode(worker, "accept", true);
+  /** 群聊元信息（前端据此筛选 SSE 消息 + 渲染标题）。 */
+  chatInfo(): { groupId?: string; topic: string } {
+    return { groupId: this.chatGroupId, topic: "# lounge · 多 agent 群聊" };
+  }
 
-    this.frame("warm alice+bob（真实冷起）", true, {}, "P0 · 装配");
-    const aliceEp = await this.registerEndpoint({ accountId: alice, topology: { kind: "unified" } });
-    const bobEp = await this.registerEndpoint({ accountId: bob, topology: { kind: "unified" } });
-    await this.warm(aliceEp.id, "shared");
-    await this.warm(bobEp.id, "shared");
-
-    const dm = await this.ensureDirect(alice, bob);
-    this.frame("确保直聊", true, { conversationId: dm.id }, "P0 · 装配");
-
-    let consumed = 0;
-    for (let i = 0; i < 10; i++) {
-      const r = await this.send({ from: alice, conversationId: dm.id, kind: "chat", expect: "none", text: `hello ${i}` });
-      const traces = await this.host.observer.trace(r.messageId);
-      const target = traces.find((t) => t.accountId === bob);
-      if (target) {
-        await this.markConsumed(target.deliveryId);
-        consumed++;
-      }
-    }
-
-    // worker(sink) 自动 consumed 1 条（consumeImmediately:true）
-    const dmw = await this.ensureDirect(alice, worker);
-    const sinkMsg = await this.send({ from: alice, conversationId: dmw.id, kind: "chat", expect: "none", text: "sink auto-consume" });
-    const sinkTraces = await this.host.observer.trace(sinkMsg.messageId);
-    const sinkOk = sinkTraces.some((t) => t.accountId === worker && t.state === "consumed");
-
-    const report = await this.host.observer.checkInvariants();
-    this.frame("sink 自动 consumed", sinkOk, {}, "P0 · Sink");
-    this.frame("checkInvariants", report.ok, {
-      checked: report.checked,
-      violations: report.violations.length,
-      streamConsumed: consumed,
-    }, "P0 · 验收");
-    this.frame("P0 完成", report.ok && sinkOk, { streamConsumed: consumed }, "P0 · 验收");
+  /** 历史消息（首屏铺满）。 */
+  getChatLog(): ChatEntry[] {
+    return [...this.chatLog.values()].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
   }
 
   /**
-   * P1（§25.2）：20 账号群 × 50 条。47 条 expect:none 广播（silent→冷→cold_hit，
-   * 零轮、确定性）+ 3 条 to:[不同冷成员] expect:reply（各自精确唤醒 1 条 idle 流，
-   * 共 ≤3 真实轮）。断言读 counters，不看墙钟。
+   * 以某 agent 身份在群里发一条消息；随后群里其它 agent 各自用真实 session
+   * 生成一句回复并回发（有界：rounds × 其它 agent 数，绝不循环）。
    */
-  private async p1(): Promise<void> {
-    const ids = `p1-${Date.now().toString(36)}`;
-    const N = 20;
-    const members = Array.from({ length: N }, (_, i) => `${ids}-g${i}`);
+  async postToGroup(args: { asId: string; text: string; rounds?: number; to?: string }): Promise<{ messageId: string }> {
+    const groupId = await this.ensureChatGroup();
+    const text = (args.text || "").slice(0, 2000);
+    if (!text.trim()) throw new Error("消息为空");
 
-    this.frame("注册 20 账号 + 建群", true, { N }, "P1 · 装配");
-    for (const m of members) {
-      await this.registerAccount({ id: m, displayName: `G-${m.slice(-5)}`, endpointClass: "stream", initiate: ["chat"] });
+    // 定向：to 指定单个成员（须是群内、且非发送者本人）→ 仅该成员回一次；否则全体广播。
+    const target =
+      args.to && args.to !== args.asId && this.rosterIds().includes(args.to) ? args.to : undefined;
+
+    const r = await this.send({
+      from: args.asId,
+      conversationId: groupId,
+      kind: "chat",
+      expect: "none",
+      text,
+      ...(target ? { to: [target] } : {}),
+    });
+
+    if (!this.chatBusy) {
+      // 定向 → responders 只含被 @ 成员、且只回 1 条；全体 → 其余成员 × rounds 轮接力。
+      const responders = target ? [target] : this.rosterIds().filter((id) => id !== args.asId);
+      const rounds = target ? 1 : Math.max(0, Math.min(3, args.rounds ?? 1));
+      if (responders.length > 0 && rounds > 0) {
+        void this.runLiveChat(groupId, args.asId, text, responders, rounds).catch((e) => {
+          console.error("[chat] runLiveChat failed:", e);
+        });
+      }
     }
-    const g = await this.createConversation({ type: "group", creator: members[0]!, members: members.slice(1) });
-    this.frame("群已建", true, { conversationId: g.id, members: N }, "P1 · 装配");
+    return { messageId: r.messageId };
+  }
 
-    for (let i = 0; i < 47; i++) {
-      await this.send({ from: members[0]!, conversationId: g.id, kind: "chat", expect: "none", text: `broadcast ${i}` });
+  private async runLiveChat(groupId: string, starterId: string, starterText: string, others: string[], rounds: number): Promise<void> {
+    if (this.chatBusy) return;
+    this.chatBusy = true;
+    try {
+      let lastText = starterText;
+      let lastSpeaker = starterId;
+      for (let r = 0; r < rounds; r++) {
+        for (const responder of others) {
+          const prompt = this.buildReplyPrompt(responder, lastText, lastSpeaker);
+          const reply = await this.liveReply(responder, prompt);
+          if (reply) {
+            await this.send({ from: responder, conversationId: groupId, kind: "chat", expect: "none", text: reply });
+            lastText = reply;
+            lastSpeaker = responder;
+            await sleepMs(250);
+          }
+        }
+      }
+    } finally {
+      this.chatBusy = false;
     }
-    this.frame("47 条 expect:none 广播完成（零唤醒）", true, {}, "P1 · 广播");
+  }
 
-    const responders = [members[1]!, members[2]!, members[3]!];
-    const repIds: Array<{ id: string; responder: string }> = [];
-    for (const responder of responders) {
-      const r = await this.send({
-        from: members[0]!,
-        conversationId: g.id,
-        kind: "chat",
-        expect: "reply",
-        to: [responder],
-        text: `please reply (to ${responder.slice(-5)})`,
+  /** 为某 agent 拼接待 LLM 回复的提示词（人设 + 最近群聊上下文）。 */
+  private buildReplyPrompt(responderId: string, _lastText: string, _lastSpeakerId: string): string {
+    const responderName = this.accounts.get(responderId)?.displayName ?? responderId;
+    const persona = this.agentProfiles.get(responderId)?.persona?.trim();
+    const recent = [...this.chatLog.values()]
+      .filter((m) => m.kind === "chat")
+      .slice(-6)
+      .map((m) => `${m.fromName}：${m.text}`)
+      .join("\n");
+    const roleLine = persona ? `你是「${responderName}」，${persona}。` : `你是「${responderName}」。`;
+    return (
+      `${roleLine}你们正在一个多 agent 群聊里，成员包括你和其他几个 agent。\n` +
+      `最近的群聊记录：\n${recent}\n\n` +
+      `请只以「${responderName}」的口吻，针对最新一条消息，用简体中文写一句自然的群聊回复（1–3 句）。` +
+      `直接输出回复文字本身，不要调用任何工具，不要添加前缀或引号。`
+    );
+  }
+
+  /** 用某 agent 的真实 session 生成一句回复（真实 LLM），返回纯文本或 null。 */
+  private async liveReply(responderId: string, prompt: string): Promise<string | null> {
+    const ep = this.endpointOfAccount(responderId);
+    const session = ep ? (this.sessions.get(ep.id) as LiveReplySession | undefined) : undefined;
+    if (!session) return null;
+    // 只在 message_end 且 role=assistant 时取「完整」回复：流式增量事件不带 .message，
+    // 早期实现按任意事件覆盖 pending，会把分块残片（如单个「？」）当成回复贴进群。
+    let assistantText: string | null = null;
+    let unsub: () => void = () => {};
+    try {
+      unsub = session.subscribe((ev) => {
+        if (ev.type === "message_end" && ev.message?.role === "assistant") {
+          const t = contentToText(ev.message.content);
+          if (t && t.trim()) assistantText = t.trim();
+        }
       });
-      repIds.push({ id: r.messageId, responder });
+    } catch {
+      unsub = () => {};
     }
-    this.frame("3 条 expect:reply 已发（真实轮次进行中）", true, { responders: responders.map((x) => x.slice(-5)) }, "P1 · 唤醒");
-
-    for (const { id, responder } of repIds) {
-      // 唤醒决策在投递时已落库：只等 trace 出现 woke=true（快速），不等轮次跑完。
-      const woke = await this.waitForTrace(id, (t) => t.accountId === responder && t.woke === true, 20000);
-      this.frame(`reply→${responder.slice(-5)} 唤醒已投递`, woke, {}, "P1 · 唤醒");
+    try {
+      // 触发一整轮并等待完成：followUp/steer 只入队（空闲 session 不会起轮，
+      // waitForIdle 会秒退），prompt() 才真正调用 LLM 并 await 到 assistant 落定。
+      await session.prompt(prompt);
+      const reply = (assistantText ?? session.getLastAssistantText?.() ?? "").trim();
+      // 只取第一段，避免把长思考/工具调用一并贴出
+      const firstPara = reply.split(/\n{2,}/)[0]?.trim() ?? "";
+      return firstPara || null;
+    } catch (err) {
+      console.error("[chat] liveReply failed for", responderId, err);
+      return null;
+    } finally {
+      try {
+        unsub();
+      } catch {
+        /* ignore */
+      }
     }
+  }
 
-    const report = await this.host.observer.checkInvariants();
-    const acc = await this.computeAcceptance();
-    this.frame("checkInvariants", report.ok, { checked: report.checked, violations: report.violations.length }, "P1 · 验收");
-    this.frame("P1 完成", report.ok, { acceptance: acc }, "P1 · 验收");
+  private endpointOfAccount(accountId: string): Endpoint | undefined {
+    return [...this.endpoints.values()].find((e) => e.accountId === accountId);
+  }
+
+  /** 记录一条群聊消息（去重，按 id）。fromName 由内部按发送方派生，故入参无需携带。 */
+  private pushChat(entry: Omit<ChatEntry, "fromName">): void {
+    if (this.chatGroupId && entry.conversationId !== this.chatGroupId) return;
+    if (this.chatLog.has(entry.id)) return;
+    const name = this.accounts.get(entry.from)?.displayName ?? entry.from;
+    this.chatLog.set(entry.id, { ...entry, fromName: name });
+  }
+
+  /** 系统提示（入群 / 就绪），居中渲染。 */
+  private pushSystem(text: string): void {
+    const id = `sys-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+    const entry: ChatEntry = { id, from: "system", fromName: "system", conversationId: this.chatGroupId ?? "", kind: "system", text, at: isoNow() };
+    this.pushChat(entry);
+    this.hooks.meshMessage({
+      id,
+      from: "system",
+      conversationId: this.chatGroupId ?? "",
+      kind: "system",
+      at: isoNow(),
+      payload: { text },
+    } as unknown as Envelope);
+  }
+
+  private slug(s: string): string {
+    const out = (s || "")
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9一-龥]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 24);
+    return out || "agent";
   }
 }
 
@@ -654,16 +800,36 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-interface ErrorLike {
-  name: string;
-  message: string;
-  code?: string;
+/** 从 pi 会话消息的 content（string | 分块数组 | 对象）中抽取纯文本。 */
+function contentToText(content: unknown): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (typeof c === "string" ? c : (c as { text?: string })?.text ?? ""))
+      .join("");
+  }
+  if (typeof content === "object") {
+    const c = content as { text?: string };
+    if (typeof c.text === "string") return c.text;
+    try {
+      return JSON.stringify(c);
+    } catch {
+      return "";
+    }
+  }
+  return String(content);
 }
 
-function serializeErrorLike(err: unknown): ErrorLike {
-  if (err instanceof Error) {
-    const code = (err as { code?: string }).code;
-    return { name: err.name, message: err.message, ...(code ? { code } : {}) };
-  }
-  return { name: "Error", message: String(err) };
+/**
+ * demo 群聊接龙用到的 pi AgentSession 结构子集（真机由 createPiSessionFactory 产出）。
+ * 事件与方法的形状对齐 pi-coding-agent/dist/core/agent-session：仅 message_end 事件
+ * 携带完整的 event.message；waitForIdle/getLastAssistantText 是取整轮回复的稳定原语。
+ */
+interface LiveReplySession {
+  subscribe(
+    listener: (event: { type?: string; message?: { role?: string; content?: unknown } }) => void,
+  ): () => void;
+  prompt(text: string, options?: { streamingBehavior?: "steer" | "followUp" }): Promise<void>;
+  getLastAssistantText?(): string | undefined;
 }

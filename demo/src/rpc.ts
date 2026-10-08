@@ -174,7 +174,13 @@ const HANDLERS: Record<string, Handler> = {
 
   // 综合
   state: (c) => c.snapshot(),
-  runScenario: (c, a) => c.runScenario((a.name as "P0" | "P1") ?? "P0"),
+
+  // 群聊面板（注册 agent · 群组 · 多 agent 互聊）
+  listAgents: (c) => c.getRoster(),
+  chatInfo: (c) => c.chatInfo(),
+  chatHistory: (c) => c.getChatLog(),
+  registerAgent: (c, a) => c.registerAgent({ displayName: str(a.displayName, "Agent"), persona: str2(a.persona) }),
+  postToGroup: (c, a) => c.postToGroup({ asId: str(a.asId), text: str(a.text), rounds: num(a.rounds) ?? 1, to: str2(a.to) }),
 };
 
 export async function dispatch(

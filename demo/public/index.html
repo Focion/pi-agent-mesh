@@ -3,49 +3,76 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pi Agent Mesh · 面板</title>
+<title>Pi Agent Mesh · 群聊</title>
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
 <header class="topbar">
   <div class="brand">
     <span class="logo">⬡</span>
-    <h1>Pi Agent Mesh 面板</h1>
-    <span id="credBadge" class="badge badge--muted">凭据 …</span>
+    <h1>Pi Agent Mesh</h1>
+    <span class="sub brand-sub">多智能体群聊 · 真实 MeshHost 驱动</span>
+    <span id="modeBadge" class="badge">实时 LLM 模式</span>
   </div>
-  <div class="sub">真实 PiStreamPort + 真实 LLM · SSE 实时事件流</div>
 </header>
 
-<nav class="tabs" id="tabs">
-  <button data-tab="status" class="tab is-active">状态 / 事件</button>
-  <button data-tab="accounts" class="tab">账号与端点</button>
-  <button data-tab="convos" class="tab">会话与成员</button>
-  <button data-tab="send" class="tab">发送</button>
-  <button data-tab="sink" class="tab">Sink</button>
-  <button data-tab="stream" class="tab">流控制 / Agent</button>
-  <button data-tab="observer" class="tab">Observer / Trace</button>
-  <button data-tab="accept" class="tab">验收 P0 / P1</button>
-  <button data-tab="topic" class="tab">Topic 订阅广播</button>
-  <button data-tab="reqreply" class="tab">请求-应答</button>
-  <button data-tab="queue" class="tab">Queue 队列</button>
-  <button data-tab="shared" class="tab">共享空间</button>
-  <button data-tab="replay" class="tab">Observer Replay</button>
-</nav>
+<main class="layout">
+  <!-- 左侧：注册 + 花名册 -->
+  <aside class="sidebar">
+    <section class="panel register">
+      <h2>注册 Agent</h2>
+      <input id="agentName" class="inp" placeholder="名字，如 Dave" maxlength="24" />
+      <input id="agentPersona" class="inp" placeholder="人设 / 角色（可选），如 数据分析师" maxlength="40" />
+      <button id="btnRegister" class="btn btn--primary">＋ 注册并加入群聊</button>
+      <p class="hint">注册后该 agent 会出现在右侧群里，并能参与对话。</p>
+    </section>
 
-<main>
-  <section id="tab-status" class="panel is-visible"></section>
-  <section id="tab-accounts" class="panel"></section>
-  <section id="tab-convos" class="panel"></section>
-  <section id="tab-send" class="panel"></section>
-  <section id="tab-sink" class="panel"></section>
-  <section id="tab-stream" class="panel"></section>
-  <section id="tab-observer" class="panel"></section>
-  <section id="tab-accept" class="panel"></section>
-  <section id="tab-topic" class="panel"></section>
-  <section id="tab-reqreply" class="panel"></section>
-  <section id="tab-queue" class="panel"></section>
-  <section id="tab-shared" class="panel"></section>
-  <section id="tab-replay" class="panel"></section>
+    <section class="panel roster">
+      <h2>群成员 <span id="rosterCount" class="count">0</span></h2>
+      <ul id="rosterList" class="roster-list"></ul>
+    </section>
+  </aside>
+
+  <!-- 中间：群聊 -->
+  <section class="chat">
+    <header class="chat-head">
+      <div class="chat-title" id="chatTitle"># lounge</div>
+      <div class="chat-sub">多 agent 实时通讯 · 在下面发言，群里的其它 agent 会接力回复</div>
+    </header>
+
+    <div class="messages" id="messages">
+      <div class="empty" id="chatEmpty">还没有消息。用左侧身份在下方发一条，大家就开始聊了 ✨</div>
+    </div>
+
+    <footer class="composer">
+      <div class="composer-row">
+        <label class="sendas">
+          以
+          <select id="sendAs" class="inp inp--sm"></select>
+          身份
+        </label>
+        <label class="rounds">
+          自动接力
+          <select id="rounds" class="inp inp--sm">
+            <option value="0">关</option>
+            <option value="1" selected>1 轮</option>
+            <option value="2">2 轮</option>
+            <option value="3">3 轮</option>
+          </select>
+        </label>
+        <label class="rounds">
+          定向
+          <select id="replyTo" class="inp inp--sm">
+            <option value="">全体</option>
+          </select>
+        </label>
+      </div>
+      <div class="composer-row composer-input">
+        <textarea id="msgInput" class="inp" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）" rows="2"></textarea>
+        <button id="btnSend" class="btn btn--primary btn--send">发送</button>
+      </div>
+    </footer>
+  </section>
 </main>
 
 <div id="toast" class="toast" hidden></div>
