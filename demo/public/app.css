@@ -90,6 +90,27 @@ body {
 }
 .msg.me .bubble { background: var(--accent); color: #fff; border-color: var(--accent); border-radius: 12px; border-top-right-radius: 4px; }
 
+/* 定向消息：正文前的 @收件人 chip */
+.at-chip {
+  display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  background: var(--accent-soft); color: var(--accent-2); vertical-align: baseline; line-height: 1.7;
+}
+.msg.me .at-chip { background: rgba(255,255,255,.24); color: #fff; }
+
+/* 「正在思考中」占位气泡 —— 文本点 · 逐个显示，不做位移动画 */
+.msg.thinking { opacity: .8; }
+.msg.thinking .bubble { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-style: italic; }
+.msg.thinking .dots { display: inline-flex; gap: 0; }
+.msg.thinking .dots .d { opacity: 0; animation: dotShow 1.6s infinite; }
+.msg.thinking .dots .d:nth-child(1) { animation-delay: 0s; }
+.msg.thinking .dots .d:nth-child(2) { animation-delay: 0.3s; }
+.msg.thinking .dots .d:nth-child(3) { animation-delay: 0.6s; }
+@keyframes dotShow {
+  0%, 5%   { opacity: 0; }
+  15%, 80% { opacity: 1; }
+  100%     { opacity: 0; }
+}
+
 .sys { align-self: center; color: var(--muted); font-size: 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; }
 
 /* ── 输入区 ── */

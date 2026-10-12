@@ -60,6 +60,8 @@ export interface ChatEntry {
   kind: string;
   text: string;
   at: string;
+  /** 定向投递的收件人 accountId 列表；空/undefined = 全体广播。 */
+  to?: string[];
 }
 
 export class MeshController {
@@ -158,6 +160,7 @@ export class MeshController {
             kind: env.kind,
             text: ((env.payload as { text?: string } | undefined)?.text) ?? "",
             at: ((env as unknown as { at?: string }).at) ?? isoNow(),
+            ...(env.to && env.to.length ? { to: [...env.to] } : {}),
           });
         }
       }
@@ -665,6 +668,15 @@ export class MeshController {
       ...(target ? { to: [target] } : {}),
     });
 
+    // 「定向=全体」的历史持久化：Envelope 本身不带 to（广播），但前端把 "全体" 视作
+    // 虚拟 @all 目标渲染成 @所有人 chip。乐观气泡在 SSE 回显时被认领路径保留；页面刷新
+    // 走 chatHistory 就没这个信息了。这里只给 chatLog 里的展示元数据补 to:["@all"]，
+    // 不改 Envelope、不影响路由/投递，专供 getChatLog() 回放。
+    if (!target) {
+      const entry = this.chatLog.get(r.messageId);
+      if (entry) this.chatLog.set(r.messageId, { ...entry, to: ["@all"] });
+    }
+
     if (!this.chatBusy) {
       // 定向 → responders 只含被 @ 成员、且只回 1 条；全体 → 其余成员 × rounds 轮接力。
       const responders = target ? [target] : this.rosterIds().filter((id) => id !== args.asId);
@@ -682,23 +694,62 @@ export class MeshController {
     if (this.chatBusy) return;
     this.chatBusy = true;
     try {
-      let lastText = starterText;
-      let lastSpeaker = starterId;
+      // 并发算、并发贴：本轮所有 responder 同时开跑，谁先算完谁先 send 进群。
+      // 轮间保留 barrier：`Promise.allSettled` 全 settle 后才进下一轮，
+      // 于是下一轮 buildReplyPrompt 读到的 chatLog 已含本轮所有回复。
+      // 单元素 others（定向=某人）等价串行；多人（定向=全体）等价并发。
       for (let r = 0; r < rounds; r++) {
-        for (const responder of others) {
-          const prompt = this.buildReplyPrompt(responder, lastText, lastSpeaker);
-          const reply = await this.liveReply(responder, prompt);
-          if (reply) {
-            await this.send({ from: responder, conversationId: groupId, kind: "chat", expect: "none", text: reply });
-            lastText = reply;
-            lastSpeaker = responder;
-            await sleepMs(250);
-          }
-        }
+        // 本轮 anchor：本轮开始瞬间 chatLog 里最后一条 chat 的作者；无则回落起始人。
+        // 三人共用同一 anchor，仅作 agent_thinking 事件的 replyTo 展示引用。
+        const anchor = this.lastChatSpeaker(starterId);
+        await Promise.allSettled(
+          others.map(async (responder) => {
+            const displayName = this.accounts.get(responder)?.displayName ?? responder;
+            const prompt = this.buildReplyPrompt(responder, starterText, anchor);
+            this.hooks.meshEvent("agent_thinking", {
+              at: isoNow(),
+              accountId: responder,
+              displayName,
+              replyTo: anchor,
+            });
+            // 全流程走完再发 thinking_end：让 ok 标志准确反映"回复是否真的贴进群"，
+            // 若中途 send 失败也能被标记为 ok:false，前端立即撤占位气泡（否则会永久挂住）。
+            let outcome: { text?: string; error?: string };
+            try {
+              outcome = await this.liveReply(responder, prompt);
+            } catch (err) {
+              // liveReply 理论上不抛（内部已 catch），这里只是防御性兜底。
+              outcome = { error: err instanceof Error ? err.message : String(err) };
+            }
+            if (outcome.text) {
+              try {
+                await this.send({ from: responder, conversationId: groupId, kind: "chat", expect: "none", text: outcome.text });
+                // 成功：meshmsg 已到达前端会自动撤气泡；仍补一条 ok:true 供其它订阅者对齐状态。
+                this.hooks.meshEvent("agent_thinking_end", { at: isoNow(), accountId: responder, ok: true });
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                console.error("[chat] responder send failed:", responder, err);
+                this.hooks.meshEvent("agent_thinking_end", { at: isoNow(), accountId: responder, ok: false });
+                this.pushSystem(`${displayName} 的消息投递异常：${msg}`);
+              }
+              return;
+            }
+            // 失败：撤下思考气泡 + 系统气泡显示异常原因，避免"一闪而过却没内容"的错觉。
+            this.hooks.meshEvent("agent_thinking_end", { at: isoNow(), accountId: responder, ok: false });
+            this.pushSystem(`${displayName} 的模型调用异常：${outcome.error ?? "未知错误"}`);
+          }),
+        );
       }
     } finally {
       this.chatBusy = false;
     }
+  }
+
+  /** 取当前 chatLog 里最后一条 chat 消息的作者；无记录则回退给定 fallback。用作并发轮 anchor。 */
+  private lastChatSpeaker(fallback: string): string {
+    let last = fallback;
+    for (const m of this.chatLog.values()) if (m.kind === "chat") last = m.from;
+    return last;
   }
 
   /** 为某 agent 拼接待 LLM 回复的提示词（人设 + 最近群聊上下文）。 */
@@ -720,35 +771,59 @@ export class MeshController {
   }
 
   /** 用某 agent 的真实 session 生成一句回复（真实 LLM），返回纯文本或 null。 */
-  private async liveReply(responderId: string, prompt: string): Promise<string | null> {
+  /** 用某 agent 的真实 session 生成一句回复（真实 LLM）。成功回 text，失败回 error（供上层贴系统气泡）。 */
+  private async liveReply(responderId: string, prompt: string): Promise<{ text?: string; error?: string }> {
     const ep = this.endpointOfAccount(responderId);
     const session = ep ? (this.sessions.get(ep.id) as LiveReplySession | undefined) : undefined;
-    if (!session) return null;
+    if (!session) {
+      const reason = `未初始化会话（endpoint=${ep?.id ?? "无"}）`;
+      console.warn(`[chat/liveReply] no session for responder=${responderId}`);
+      return { error: reason };
+    }
     // 只在 message_end 且 role=assistant 时取「完整」回复：流式增量事件不带 .message，
     // 早期实现按任意事件覆盖 pending，会把分块残片（如单个「？」）当成回复贴进群。
     let assistantText: string | null = null;
+    let eventCount = 0;
+    let messageEndCount = 0;
     let unsub: () => void = () => {};
     try {
       unsub = session.subscribe((ev) => {
+        eventCount++;
+        if (ev.type === "message_end") messageEndCount++;
         if (ev.type === "message_end" && ev.message?.role === "assistant") {
           const t = contentToText(ev.message.content);
           if (t && t.trim()) assistantText = t.trim();
         }
       });
-    } catch {
+    } catch (err) {
+      console.warn(`[chat/liveReply] subscribe threw for ${responderId}:`, err);
       unsub = () => {};
     }
+    const t0 = Date.now();
     try {
       // 触发一整轮并等待完成：followUp/steer 只入队（空闲 session 不会起轮，
       // waitForIdle 会秒退），prompt() 才真正调用 LLM 并 await 到 assistant 落定。
       await session.prompt(prompt);
       const reply = (assistantText ?? session.getLastAssistantText?.() ?? "").trim();
-      // 只取第一段，避免把长思考/工具调用一并贴出
       const firstPara = reply.split(/\n{2,}/)[0]?.trim() ?? "";
-      return firstPara || null;
+      if (!firstPara) {
+        // prompt() 正常 resolve 但没抓到 assistant 文本 —— 事件流可能压根没走到 message_end，
+        // 或到了但 content 形状不是 {text}。把诊断细节同时打日志和回上层，便于用户看到。
+        const last = session.getLastAssistantText?.();
+        const detail =
+          `空回复（events=${eventCount}, messageEnds=${messageEndCount}, ` +
+          `assistantText=${assistantText ? "有" : "无"}, getLastAssistantText=${last ? "有" : "无"}）`;
+        console.warn(`[chat/liveReply] empty responder=${responderId} ms=${Date.now() - t0} ${detail}`);
+        return { error: detail };
+      }
+      return { text: firstPara };
     } catch (err) {
-      console.error("[chat] liveReply failed for", responderId, err);
-      return null;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[chat/liveReply] threw responder=${responderId} ms=${Date.now() - t0} events=${eventCount} messageEnds=${messageEndCount}`,
+        err,
+      );
+      return { error: msg };
     } finally {
       try {
         unsub();

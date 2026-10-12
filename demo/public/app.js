@@ -67,6 +67,20 @@ function colorFor(id) {
 }
 const initial = (name) => (name || "?").trim().charAt(0).toUpperCase();
 
+// 提取一条消息的定向收件人 accountId 列表（兼容 SSE Envelope.to 与历史 ChatEntry.to）。
+function toTargets(m) {
+  const raw = m?.to;
+  if (!raw) return [];
+  const arr = Array.isArray(raw) ? raw : [raw];
+  return arr.filter((x) => typeof x === "string" && x);
+}
+
+// 把收件人 accountId 解析成展示名。"@all" 是前端为"定向=全体"引入的虚拟目标，
+// 渲染为「所有人」；其他 id 优先花名册 displayName，回退原 id。
+function targetNames(ids) {
+  return ids.map((id) => (id === "@all" ? "所有人" : (rosterById.get(id)?.displayName || id)));
+}
+
 // ── 渲染 ────────────────────────────────────────────────────────────────
 function renderRoster(list) {
   $("#rosterCount").textContent = list.length;
@@ -109,6 +123,9 @@ function appendMessage(m) {
 
   const text = m.text ?? m.payload?.text ?? "";
 
+  // 真实消息到达：撤下该作者的「正在思考中」占位气泡（若存在）。
+  if (m.from) hideThinking(m.from);
+
   // 乐观认领：若这是"我自己刚发出、还在等回显"的那条，改写占位气泡而非新建，避免重复气泡。
   const pendId = findPendingId(m.from, text);
   if (pendId) {
@@ -149,10 +166,23 @@ function buildMsgNode(m, id, isPending) {
           el("span", { class: "nm", text: name }),
           el("span", { class: "time", text: fmtTime(at) }),
           isPending ? el("span", { class: "pend", text: "· 发送中" }) : null),
-        el("div", { class: "bubble", text })));
+        buildBubble(m, text)));
   }
   if (id) node.dataset.mid = id;
   return node;
+}
+
+// 气泡内容：定向消息在最前贴出每个收件人的 @名字 chip，再接正文。
+function buildBubble(m, text) {
+  const names = targetNames(toTargets(m));
+  if (names.length === 0) return el("div", { class: "bubble", text });
+  const kids = [];
+  for (const n of names) {
+    kids.push(el("span", { class: "at-chip", text: "@" + n }));
+    kids.push(document.createTextNode(" "));
+  }
+  kids.push(document.createTextNode(text));
+  return el("div", { class: "bubble has-at" }, ...kids);
 }
 
 const msgNodeById = (id) => {
@@ -169,11 +199,12 @@ function findPendingId(from, text) {
 }
 
 // 乐观发送：立即贴出自己的消息气泡（占位 tmpId），不依赖 SSE/后端往返。
-function appendOptimistic(from, text, tmpId) {
+// to 为定向收件人 accountId 数组（全体发送时省略），用于渲染 @xxx chip。
+function appendOptimistic(from, text, tmpId, to) {
   const box = $("#messages");
   $("#chatEmpty")?.remove();
   pending.set(tmpId, { from, text });
-  box.append(buildMsgNode({ from, text, at: new Date().toISOString(), conversationId: GROUP_ID }, tmpId, true));
+  box.append(buildMsgNode({ from, text, to, at: new Date().toISOString(), conversationId: GROUP_ID }, tmpId, true));
   box.scrollTop = box.scrollHeight;
 }
 
@@ -194,6 +225,39 @@ function settleOptimistic(tmpId, serverId) {
 function rollbackOptimistic(tmpId) {
   pending.delete(tmpId);
   msgNodeById(tmpId)?.remove();
+}
+
+// ── 「正在思考中」占位气泡 ──────────────────────────────────────────────
+// accountId -> 该 agent 当前的 thinking 节点。真实 LLM 往返期间贴出，
+// 结果到达（meshmsg）或 thinking_end 兜底时撤下，避免用户等待误以为未发起。
+const thinkingNodes = new Map();
+
+function showThinking(p) {
+  const accountId = p?.accountId;
+  if (!accountId || thinkingNodes.has(accountId)) return;
+  const box = $("#messages");
+  $("#chatEmpty")?.remove();
+  const name = rosterById.get(accountId)?.displayName || p.displayName || accountId;
+  const node = el("div", { class: "msg thinking", "data-thinking": accountId },
+    el("span", { class: "avatar", style: `background:${colorFor(accountId)}`, text: initial(name) }),
+    el("div", { class: "bw" },
+      el("div", { class: "who" },
+        el("span", { class: "nm", text: name }),
+        el("span", { class: "time", text: fmtTime(new Date()) })),
+      el("div", { class: "bubble" },
+        el("span", { class: "tt", text: "正在思考中" }),
+        el("span", { class: "dots" },
+          el("span", { class: "d", text: "·" }),
+          el("span", { class: "d", text: "·" }),
+          el("span", { class: "d", text: "·" })))));
+  box.append(node);
+  box.scrollTop = box.scrollHeight;
+  thinkingNodes.set(accountId, node);
+}
+
+function hideThinking(accountId) {
+  const node = thinkingNodes.get(accountId);
+  if (node) { node.remove(); thinkingNodes.delete(accountId); }
 }
 
 // ── 数据 ────────────────────────────────────────────────────────────────
@@ -223,17 +287,34 @@ async function doRegister() {
 
 async function doSend() {
   const ta = $("#msgInput");
-  const text = ta.value.trim();
+  let text = ta.value.trim();
   if (!text) return;
   const asId = sendAsVal();
   if (!asId) { toast("还没有可用的 agent，先注册一个", "err"); return; }
   const rounds = parseInt($("#rounds").value, 10) || 0;
-  const to = $("#replyTo")?.value || ""; // "" = 全体（后端：定向时只回 1 条，忽略 rounds）
+
+  // 文本里的 @定向优先于「定向」下拉：
+  //   规则①：`@xxx ` 后面必须紧跟一个空格
+  //   规则②：xxx 必须是群里成员的 displayName，或等于 "所有人"（→ 广播 @all）
+  // 命中后从正文里剥离 "@xxx "（连同那个空格），剩余作为消息内容；
+  // 未命中（token 不在花名册 / 没跟空格）保持原样发送，交由下拉决定定向。
+  const parsed = parseDirectedTarget(text);
+  let to;           // 后端参数：accountId；"" = 全体（沿用旧行为）
+  let chipTargets;  // 前端气泡里 @ chip 展示（复用 @all 虚拟目标）
+  if (parsed) {
+    text = text.replace(parsed.match, "").trim();
+    if (!text) { toast("剥离 @xxx 后正文为空", "err"); return; }
+    if (parsed.kind === "all") { to = ""; chipTargets = ["@all"]; }
+    else { to = parsed.accountId; chipTargets = [parsed.accountId]; }
+  } else {
+    to = $("#replyTo")?.value || "";
+    chipTargets = to ? [to] : ["@all"];
+  }
   ta.value = "";
 
   // 乐观渲染：先本地贴出自己的消息气泡（占位 tmpId），不等 SSE/后端往返。
   const tmpId = "tmp-" + Math.random().toString(36).slice(2);
-  appendOptimistic(asId, text, tmpId);
+  appendOptimistic(asId, text, tmpId, chipTargets);
   try {
     const res = await rpc("postToGroup", { asId, text, rounds, ...(to ? { to } : {}) });
     settleOptimistic(tmpId, res?.messageId); // 升级为正式 id；SSE 回显随后被去重吞掉
@@ -243,12 +324,40 @@ async function doSend() {
   }
 }
 
+// 从消息文本里扫描 `@xxx `（xxx 后必须跟一个空格）。逐个候选校验：
+//   - xxx === "所有人" → 广播，kind:"all"
+//   - xxx 命中花名册 displayName → 定向该成员，kind:"one"
+//   - 都不满足（比如 @Bob 但 Bob 不在群里）继续扫下一个 @token
+// 只返回首个命中；多个 @ 的场景按输入顺序取第一个。
+// regex 每次调用现场构造， lastIndex 不残留。
+function parseDirectedTarget(text) {
+  const re = /@(\S+) /g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const name = m[1];
+    if (name === "所有人") return { kind: "all", match: m[0] };
+    const hit = [...rosterById.values()].find((a) => a.displayName === name);
+    if (hit) return { kind: "one", accountId: hit.id, displayName: hit.displayName, match: m[0] };
+  }
+  return null;
+}
+
 // ── SSE ─────────────────────────────────────────────────────────────────
 function initSse() {
   const es = new EventSource("/api/events");
   es.addEventListener("hello", () => setMode());
   es.addEventListener("meshmsg", (e) => {
     try { appendMessage(JSON.parse(e.data)); } catch {}
+  });
+  // mesh 事件承载 {type, payload}；只关心 agent 思考状态，用于占位气泡。
+  es.addEventListener("mesh", (e) => {
+    let frame;
+    try { frame = JSON.parse(e.data); } catch { return; }
+    const { type, payload } = frame || {};
+    if (type === "agent_thinking") showThinking(payload);
+    // 回复成功时不在此撤下（紧随的 meshmsg 会替换成正式气泡，避免闪烁）；
+    // 仅当无回复（失败/空）才兜底撤下，否则占位气泡会一直滞留。
+    else if (type === "agent_thinking_end") { if (payload?.ok === false) hideThinking(payload?.accountId); }
   });
 }
 
