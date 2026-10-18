@@ -4,7 +4,7 @@
 // - 身份由闭包注入（M6/§10.2）：入参不得出现 from/accountId/owner/fromEndpoint
 // - clientToken 恒取 tool_call id（§10.2）：幂等键防机械重试
 // - 错误结构化：{ error: { code, message, hint? } }，code 取自稳定枚举
-// - 返回体硬截断 8KB，尾部截断保结构（§10.2）；mesh_inbox 只给摘要（§10.4）
+// - 返回体按 toolResultMaxBytes 截断（默认 8KB），尾部收缩且恒产合法 JSON（§10.2）；mesh_inbox 只给摘要（§10.4）
 // - 固定文案（§10.5）：五条措辞逐字保留；checkToolCopy 在注册期静态检查
 // - P5 延期面（forkAt 等）经 toToolError 把 MeshUnsupportedError → 结构化 TOOL_DISABLED
 // ═══════════════════════════════════════════════════════════════════════════
@@ -18,6 +18,7 @@ import type {
   ConversationSummary,
   Envelope,
   InboxView,
+  LogicalClock,
   MeshToolResult,
   MeshToolName,
   MessageId,
@@ -25,7 +26,14 @@ import type {
   ToolDefinition,
   ToolErrorCode,
 } from "./types.js";
-import { MeshRejectError, MeshUnsupportedError } from "./types.js";
+import {
+  DROP_REASONS,
+  MeshRejectError,
+  MeshUnsupportedError,
+  PARK_REASONS,
+  REJECT_CODES,
+  TOOL_ERROR_CODES,
+} from "./types.js";
 
 // ─── 结果构造与 8KB 上限（§10.2）──────────────────────────────────────────
 
@@ -91,40 +99,41 @@ function shrinkOnce(v: unknown): unknown | undefined {
   return undefined;
 }
 
-/** 序列化并保证 ≤ 8KB：尾部截断、保持合法 JSON 结构（§10.2） */
-function capJsonResult(value: unknown): {
+/** 序列化并尽力压到 ≤ maxBytes：尾部收缩、始终产出合法 JSON（§10.2）。
+ *  truncated 只在真正发生收缩 / 兜底替换时置 true（修 I29：旧版在收缩路径误报 false）。
+ *  shrinkOnce 单调收缩，在 ≥1024 预算内必先达标，故理论上不会走到兜底分支；即便走到，
+ *  也绝不做字节级截断（会产出非法 JSON），而是退回带标志的合法 JSON。 */
+function capJsonResult(value: unknown, maxBytes: number): {
   content: string;
   truncated: boolean;
 } {
   let v: unknown = value;
-  for (let i = 0; i < 200; i++) {
+  let truncated = false;
+  for (;;) {
     const s = JSON.stringify(v);
-    if (s === undefined) return { content: "null", truncated: false };
-    if (Buffer.byteLength(s, "utf8") <= TOOL_RESULT_MAX_BYTES) {
-      return { content: s, truncated: false };
+    if (s === undefined) return { content: "null", truncated };
+    if (Buffer.byteLength(s, "utf8") <= maxBytes) {
+      return { content: s, truncated };
     }
     const next = shrinkOnce(v);
     if (next === undefined) {
-      // 再无可收缩字段：字节截断兜底
-      return {
-        content: byteTruncate(s, TOOL_RESULT_MAX_BYTES),
-        truncated: true,
-      };
+      const fallback = JSON.stringify({ truncated: true });
+      return fallback.length <= maxBytes
+        ? { content: fallback, truncated: true }
+        : { content: "null", truncated: true };
     }
     v = next;
+    truncated = true;
   }
-  const s = JSON.stringify(v) ?? "null";
-  return { content: byteTruncate(s, TOOL_RESULT_MAX_BYTES), truncated: true };
 }
 
-function okJson(value: unknown): MeshToolResult {
-  const first = capJsonResult(value);
+function okJson(value: unknown, maxBytes: number = TOOL_RESULT_MAX_BYTES): MeshToolResult {
+  const first = capJsonResult(value, maxBytes);
   if (!first.truncated) return { content: first.content };
   // 截断发生时把 truncated:true 并回结构体再截一次，保证标志可见
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
     const merged = { ...(value as Record<string, unknown>), truncated: true };
-    const second = capJsonResult(merged);
-    return { content: second.content };
+    return { content: capJsonResult(merged, maxBytes).content };
   }
   return { content: first.content };
 }
@@ -228,6 +237,10 @@ export interface BuildToolSetOptions {
   allowDissolve?: boolean;
   /** devMode：注册期对文案做 §10.5 静态检查，失败即抛 */
   devMode?: boolean;
+  /** §20.1⑨：mesh_history 的 ts 回显走逻辑钟 format；缺省恒等（原样） */
+  clock?: LogicalClock;
+  /** §10.2/附录 F：工具结果硬上限（字节）；缺省 8192，宿主按 limits.toolResultMaxBytes 装配 */
+  maxBytes?: number;
 }
 
 export const MESH_TOOL_NAMES: readonly MeshToolName[] = [
@@ -252,13 +265,17 @@ export function buildToolSet(
   only?: string[],
   opts?: BuildToolSetOptions,
 ): ToolDefinition[] {
-  const all = buildAllTools(ctx, opts ?? {});
+  const resolved: BuildToolSetOptions = {
+    ...opts,
+    maxBytes: opts?.maxBytes ?? TOOL_RESULT_MAX_BYTES,
+  };
+  const all = buildAllTools(ctx, resolved);
   let tools = all;
   if (only !== undefined) {
     const want = new Set(only);
     tools = all.filter((t) => want.has(t.name));
   }
-  if (opts?.devMode) {
+  if (resolved.devMode) {
     const violations = checkToolCopy(tools);
     if (violations.length > 0) {
       throw new Error(
@@ -274,26 +291,26 @@ function buildAllTools(
   opts: BuildToolSetOptions,
 ): ToolDefinition[] {
   return [
-    buildMeshSend(ctx),
-    buildMeshAck(ctx),
-    buildMeshLookup(ctx),
-    buildMeshInbox(ctx),
-    buildMeshHistory(ctx),
-    buildMeshConversations(ctx),
-    buildMeshMembers(ctx),
-    buildMeshContacts(ctx),
-    buildMeshCreateConversation(ctx),
+    buildMeshSend(ctx, opts),
+    buildMeshAck(ctx, opts),
+    buildMeshLookup(ctx, opts),
+    buildMeshInbox(ctx, opts),
+    buildMeshHistory(ctx, opts),
+    buildMeshConversations(ctx, opts),
+    buildMeshMembers(ctx, opts),
+    buildMeshContacts(ctx, opts),
+    buildMeshCreateConversation(ctx, opts),
     buildMeshConversationAdmin(ctx, opts),
-    buildMeshClaim(ctx),
-    buildMeshSharedGet(ctx),
-    buildMeshSharedPut(ctx),
-    buildMeshSharedList(ctx),
+    buildMeshClaim(ctx, opts),
+    buildMeshSharedGet(ctx, opts),
+    buildMeshSharedPut(ctx, opts),
+    buildMeshSharedList(ctx, opts),
   ];
 }
 
 // ─── mesh_send ────────────────────────────────────────────────────────────
 
-function buildMeshSend(ctx: ToolContext): ToolDefinition {
+function buildMeshSend(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_send",
     label: "Mesh: send message",
@@ -476,6 +493,7 @@ function buildMeshSend(ctx: ToolContext): ToolDefinition {
           textTruncated
             ? { ...r, notice: `text truncated to ${SEND_TEXT_MAX_BYTES} bytes` }
             : r,
+          opts.maxBytes,
         );
       } catch (e) {
         const mapped = toToolError(e);
@@ -488,7 +506,7 @@ function buildMeshSend(ctx: ToolContext): ToolDefinition {
 
 // ─── mesh_ack ─────────────────────────────────────────────────────────────
 
-function buildMeshAck(ctx: ToolContext): ToolDefinition {
+function buildMeshAck(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_ack",
     label: "Mesh: acknowledge",
@@ -519,7 +537,7 @@ function buildMeshAck(ctx: ToolContext): ToolDefinition {
           ...(params.data === undefined ? {} : { data: params.data }),
           ...(params.error === undefined ? {} : { error: params.error }),
         });
-        return okJson({ ok: true });
+        return okJson({ ok: true }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -531,7 +549,7 @@ function buildMeshAck(ctx: ToolContext): ToolDefinition {
 
 // ─── mesh_lookup ──────────────────────────────────────────────────────────
 
-function buildMeshLookup(ctx: ToolContext): ToolDefinition {
+function buildMeshLookup(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_lookup",
     label: "Mesh: lookup accounts",
@@ -580,7 +598,7 @@ function buildMeshLookup(ctx: ToolContext): ToolDefinition {
             limitInfo.truncated || accounts.length > limitInfo.limit
               ? true
               : undefined,
-        });
+        }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -616,7 +634,7 @@ function inboxEntryOf(
   return entry;
 }
 
-function buildMeshInbox(ctx: ToolContext): ToolDefinition {
+function buildMeshInbox(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_inbox",
     label: "Mesh: inbox",
@@ -655,7 +673,7 @@ function buildMeshInbox(ctx: ToolContext): ToolDefinition {
           awaitingTheirAck: view.awaitingTheirAck,
           truncated:
             limitInfo.truncated || total > sliced.length ? true : undefined,
-        });
+        }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -667,13 +685,14 @@ function buildMeshInbox(ctx: ToolContext): ToolDefinition {
 
 // ─── mesh_history ─────────────────────────────────────────────────────────
 
-function historyItem(e: Envelope): Record<string, unknown> {
+function historyItem(e: Envelope, clock?: LogicalClock): Record<string, unknown> {
+  const ts = e.logicalTs ?? e.routedAt;
   const item: Record<string, unknown> = {
     seq: e.seq,
     from: e.from,
     kind: e.kind,
     expect: e.expect,
-    ts: e.logicalTs ?? e.routedAt,
+    ts: clock?.format?.(ts) ?? ts,
   };
   if (e.payload.text !== undefined) item.text = e.payload.text;
   if (e.payload.data !== undefined) item.data = e.payload.data;
@@ -685,7 +704,10 @@ function historyItem(e: Envelope): Record<string, unknown> {
   return item;
 }
 
-function buildMeshHistory(ctx: ToolContext): ToolDefinition {
+function buildMeshHistory(
+  ctx: ToolContext,
+  opts: BuildToolSetOptions,
+): ToolDefinition {
   return {
     name: "mesh_history",
     label: "Mesh: history",
@@ -723,13 +745,19 @@ function buildMeshHistory(ctx: ToolContext): ToolDefinition {
           limit: limitInfo.limit,
           ...(beforeSeq === undefined ? {} : { beforeSeq }),
         });
+        // I08：工具读史也计入原文预算口径（§10.2「每次截断都计入原文预算的统计口径」）——
+        // 把读回的原文字节量报给 ctx，由装配层落 verbatim_copies 计数器，避免工具读史穿透
+        // 每消息平均原文份数 ≤3 的护栏。
+        let bytes = 0;
+        for (const m of messages) bytes += Buffer.byteLength(m.payload.text ?? "", "utf8");
+        ctx.countVerbatim?.(bytes);
         return okJson({
-          messages: messages.map(historyItem),
+          messages: messages.map((m) => historyItem(m, opts.clock)),
           truncated:
             limitInfo.truncated || messages.length >= limitInfo.limit
               ? true
               : undefined,
-        });
+        }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -741,7 +769,7 @@ function buildMeshHistory(ctx: ToolContext): ToolDefinition {
 
 // ─── mesh_conversations ───────────────────────────────────────────────────
 
-function buildMeshConversations(ctx: ToolContext): ToolDefinition {
+function buildMeshConversations(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_conversations",
     label: "Mesh: conversations",
@@ -776,7 +804,7 @@ function buildMeshConversations(ctx: ToolContext): ToolDefinition {
             : { type: type as ConversationSummary["kind"] }),
           ...(hasUnread === undefined ? {} : { hasUnread }),
         });
-        return okJson({ conversations });
+        return okJson({ conversations }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -788,7 +816,7 @@ function buildMeshConversations(ctx: ToolContext): ToolDefinition {
 
 // ─── mesh_members ─────────────────────────────────────────────────────────
 
-function buildMeshMembers(ctx: ToolContext): ToolDefinition {
+function buildMeshMembers(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_members",
     label: "Mesh: members",
@@ -811,9 +839,9 @@ function buildMeshMembers(ctx: ToolContext): ToolDefinition {
         const convs = await ctx.conversations({});
         const conv = convs.find((c) => c.conversationId === conversationId);
         if (conv !== undefined && conv.kind === "topic") {
-          return okJson({ subscriberCount: members.length, members: [] });
+          return okJson({ subscriberCount: members.length, members: [] }, opts.maxBytes);
         }
-        return okJson({ members });
+        return okJson({ members }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -825,7 +853,7 @@ function buildMeshMembers(ctx: ToolContext): ToolDefinition {
 
 // ─── mesh_contacts ────────────────────────────────────────────────────────
 
-function buildMeshContacts(ctx: ToolContext): ToolDefinition {
+function buildMeshContacts(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_contacts",
     label: "Mesh: contacts",
@@ -846,7 +874,7 @@ function buildMeshContacts(ctx: ToolContext): ToolDefinition {
       const query = asString(params.query);
       try {
         const contacts = await ctx.contacts(query);
-        return okJson({ contacts });
+        return okJson({ contacts }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -858,7 +886,7 @@ function buildMeshContacts(ctx: ToolContext): ToolDefinition {
 
 // ─── mesh_create_conversation ─────────────────────────────────────────────
 
-function buildMeshCreateConversation(ctx: ToolContext): ToolDefinition {
+function buildMeshCreateConversation(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_create_conversation",
     label: "Mesh: create conversation",
@@ -912,7 +940,7 @@ function buildMeshCreateConversation(ctx: ToolContext): ToolDefinition {
             ? {}
             : { config: params.config as Record<string, unknown> }),
         });
-        return okJson({ conversationId: conv.id });
+        return okJson({ conversationId: conv.id }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -1070,7 +1098,7 @@ function buildMeshConversationAdmin(
         });
         if (adminOp !== undefined) {
           await ctx.conversationAdmin(conversationId, adminOp);
-          return okJson({ ok: true });
+          return okJson({ ok: true }, opts.maxBytes);
         }
         return badArg(`op ${op} has invalid arguments`);
       } catch (e) {
@@ -1137,7 +1165,7 @@ function toAdminOp(
 
 // ─── mesh_claim（§17：queue 任务认领）─────────────────────────────────────
 
-function buildMeshClaim(ctx: ToolContext): ToolDefinition {
+function buildMeshClaim(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_claim",
     label: "Mesh: claim task",
@@ -1159,7 +1187,7 @@ function buildMeshClaim(ctx: ToolContext): ToolDefinition {
       if (messageId === undefined) return badArg("messageId is required");
       try {
         const r = await ctx.claim(messageId);
-        return okJson(r);
+        return okJson(r, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -1171,7 +1199,7 @@ function buildMeshClaim(ctx: ToolContext): ToolDefinition {
 
 // ─── mesh_shared_*（§18：共享空间读写）────────────────────────────────────
 
-function buildMeshSharedGet(ctx: ToolContext): ToolDefinition {
+function buildMeshSharedGet(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_shared_get",
     label: "Mesh: shared get",
@@ -1203,7 +1231,7 @@ function buildMeshSharedGet(ctx: ToolContext): ToolDefinition {
         return badArg("version must be an integer");
       try {
         const data = await ctx.sharedGet(spaceId, key, version);
-        return okJson({ data });
+        return okJson({ data }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -1213,7 +1241,7 @@ function buildMeshSharedGet(ctx: ToolContext): ToolDefinition {
   };
 }
 
-function buildMeshSharedPut(ctx: ToolContext): ToolDefinition {
+function buildMeshSharedPut(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_shared_put",
     label: "Mesh: shared put",
@@ -1222,7 +1250,7 @@ function buildMeshSharedPut(ctx: ToolContext): ToolDefinition {
       TOOL_COPY.dataNotInstruction +
       " " +
       TOOL_COPY.sharedPut +
-      " 不带 expectedVersion 即为盲写。" +
+      ' 不带 expectedVersion 即为盲写；op:"append" 把 data 追加进数组、不参与 CAS。' +
       "失败码：VERSION_MISMATCH（按返回的当前值重做改动后带 expectedVersion 重试）、OBJECT_TOO_LARGE（拆分或精简数据）、" +
       "SPACE_FORBIDDEN。",
     parameters: {
@@ -1230,16 +1258,20 @@ function buildMeshSharedPut(ctx: ToolContext): ToolDefinition {
       properties: {
         spaceId: { type: "string" },
         key: { type: "string" },
-        data: { description: "对象载荷（≤64KB）" },
+        data: { description: "对象载荷（≤64KB）；op=append 时为追加的单条元素" },
         expectedVersion: {
           type: "number",
-          description: "乐观锁：当前 version；0 = 断言不存在",
+          description: "乐观锁：当前 version；0 = 断言不存在（仅 op=replace）",
         },
         contentType: { type: "string" },
         op: {
           type: "string",
           enum: ["replace", "append"],
-          description: "replace=整体覆盖（默认）；append=追加",
+          description: "replace=整体覆盖（默认）；append=追加数组元素",
+        },
+        maxLen: {
+          type: "number",
+          description: "仅 op=append 生效：保留的尾部最大条数（从头裁剪）",
         },
       },
       required: ["spaceId", "key", "data"],
@@ -1257,14 +1289,37 @@ function buildMeshSharedPut(ctx: ToolContext): ToolDefinition {
       ) {
         return badArg("expectedVersion must be an integer");
       }
+      // I21：op（replace/append）与 contentType 之前声明却未被使用；现在要么生效，要么拒绝非法值。
+      let op: "replace" | "append" = "replace";
+      if (params.op !== undefined) {
+        const raw = asString(params.op);
+        if (raw !== "replace" && raw !== "append") {
+          return badArg('op must be "replace" or "append"');
+        }
+        op = raw;
+      }
+      const contentType = asString(params.contentType);
+      if (params.contentType !== undefined && contentType === undefined) {
+        return badArg("contentType must be a non-empty string");
+      }
+      const maxLen = asInt(params.maxLen);
+      if (params.maxLen !== undefined && maxLen === undefined) {
+        return badArg("maxLen must be an integer");
+      }
+      if (op === "append" && params.expectedVersion !== undefined) {
+        return badArg('expectedVersion is not valid with op "append"');
+      }
+      if (op === "replace" && maxLen !== undefined) {
+        return badArg('maxLen is only valid with op "append"');
+      }
       try {
-        const r = await ctx.sharedPut(
-          spaceId,
-          key,
-          params.data,
-          expectedVersion,
-        );
-        return okJson({ ok: true, version: r.version });
+        const r = await ctx.sharedPut(spaceId, key, params.data, {
+          op,
+          ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+          ...(contentType !== undefined ? { contentType } : {}),
+          ...(maxLen !== undefined ? { maxLen } : {}),
+        });
+        return okJson({ ok: true, version: r.version }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -1274,22 +1329,25 @@ function buildMeshSharedPut(ctx: ToolContext): ToolDefinition {
   };
 }
 
-function buildMeshSharedList(ctx: ToolContext): ToolDefinition {
+function buildMeshSharedList(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinition {
   return {
     name: "mesh_shared_list",
     label: "Mesh: shared list",
     description:
-      "列出共享空间的键与版本（只读，无副作用，不产生消息）。" +
+      "列出共享空间的键与元信息（只读，无副作用，不产生消息）。" +
       TOOL_COPY.dataNotInstruction +
-      " 变更通知是 best-effort：通知丢了以后追赶只能靠本工具拉取。" +
+      " 变更通知是 best-effort：通知丢了以后追赶只能靠本工具拉取（sinceVersion 增量）或 keyPrefix 全量。" +
       "失败码：SPACE_FORBIDDEN。",
     parameters: {
       type: "object",
       properties: {
         spaceId: { type: "string" },
         keyPrefix: { type: "string" },
-        sinceVersion: { type: "number", description: "只列该版本之后的键" },
-        limit: { type: "number" },
+        sinceVersion: {
+          type: "number",
+          description: "只列 version 大于该值的键（增量追赶游标）",
+        },
+        limit: { type: "number", description: "返回键数上限，默认 20，上限 100" },
       },
       required: ["spaceId"],
     },
@@ -1300,9 +1358,27 @@ function buildMeshSharedList(ctx: ToolContext): ToolDefinition {
       if (params.keyPrefix !== undefined && keyPrefix === undefined) {
         return badArg("keyPrefix must be a non-empty string");
       }
+      const sinceVersion = asInt(params.sinceVersion);
+      if (params.sinceVersion !== undefined && sinceVersion === undefined) {
+        return badArg("sinceVersion must be an integer");
+      }
+      const limitInfo = clampLimit(params.limit);
+      if (params.limit !== undefined && limitInfo === undefined) {
+        return badArg("limit must be a positive integer");
+      }
       try {
-        const objects = await ctx.sharedList(spaceId, keyPrefix);
-        return okJson({ objects });
+        const objects = await ctx.sharedList(spaceId, {
+          ...(keyPrefix !== undefined ? { keyPrefix } : {}),
+          ...(sinceVersion !== undefined ? { sinceVersion } : {}),
+          ...(limitInfo !== undefined ? { limit: limitInfo.limit } : {}),
+        });
+        // I21：limit 生效后，命中上限即告知调用方「可能还有更多」（读 ACL 过滤后的封顶）。
+        const hitsLimit =
+          limitInfo !== undefined && objects.length >= limitInfo.limit;
+        return okJson({
+          objects,
+          truncated: (limitInfo?.truncated ?? false) || hitsLimit ? true : undefined,
+        }, opts.maxBytes);
       } catch (e) {
         const mapped = toToolError(e);
         if (mapped) return mapped;
@@ -1314,46 +1390,14 @@ function buildMeshSharedList(ctx: ToolContext): ToolDefinition {
 
 // ─── §10.5 注册期文案静态检查（devMode 抛错；生产由宿主回退默认文案）────
 
+// §10.5 注册期文案静态检查的码集合。值源 = types.js 的四族 const 数组（W01 冻结），
+// 唯「folded」例外：它是纯内部 drop 原因（foldOverflow），从不作为工具面 reject 码下发，
+// 故不在 §10.5 的错码→文案登记范围内。
 const REGISTERED_CODES: ReadonlySet<string> = new Set<string>([
-  // RejectCode（§7.10）
-  "NOT_A_MEMBER",
-  "NO_SPEAK_CAP",
-  "CANNOT_INITIATE",
-  "TARGETING_NOT_SUPPORTED",
-  "FANOUT_TOO_LARGE",
-  "MENTION_ALL_THROTTLED",
-  "NO_FLOOR",
-  "JOIN_DENIED",
-  "NO_ADMIN_LEFT",
-  "REQUEST_CYCLE",
-  // ParkReason
-  "ENDPOINT_GONE",
-  "LEASE_HELD",
-  "NO_SINK_HANDLER",
-  "SINK_REFUSED",
-  "PORT_TIMEOUT",
-  "NO_SESSION",
-  // DropReason
-  "TTL_EXPIRED",
-  "TRANSPORT_FAILED",
-  "MAX_ATTEMPTS",
-  "ACL_DENIED",
-  "MUTED",
-  "TOMBSTONED",
-  "WAKE_THROTTLED_AND_EXPIRED",
-  // ToolErrorCode（§10.1 末表）
-  "ARG_INVALID",
-  "TOOL_DISABLED",
-  "CAP_REQUIRED",
-  "HISTORY_FORBIDDEN",
-  "NO_SUCH_CORRELATION",
-  "ACK_CLOSED",
-  "CLAIM_TAKEN",
-  "CLAIM_EXPIRED",
-  "NO_SUCH_KEY",
-  "VERSION_MISMATCH",
-  "OBJECT_TOO_LARGE",
-  "SPACE_FORBIDDEN",
+  ...REJECT_CODES,
+  ...PARK_REASONS,
+  ...DROP_REASONS.filter((c) => c !== "folded"),
+  ...TOOL_ERROR_CODES,
 ]);
 
 /** 与 A1/A2 矛盾的越权承诺（§10.5 末条：关键词表比对；勿收会命中否定式的词，如“可撤回”会误伤“不可撤回”） */

@@ -16,11 +16,11 @@
 //    PiPortError{code:"NO_SESSION"}（§7.10 唯一要告警的 park 原因）。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type {
   Account,
   AccountId,
+  DegradeTarget,
   Endpoint,
   EndpointId,
   EndpointState,
@@ -62,6 +62,10 @@ export interface PiStreamPortDeps {
   hasUnconsumed?(endpointId: EndpointId): boolean;
   /** 锁文件目录（<stateDir>/locks/<endpointId>.lock） */
   stateDir: string;
+  /** 与宿主共享的单写者身份（I01）：宿主 isEndpointLocal 用同一 writerId 判定归属 */
+  writerId: string;
+  /** 建流成功后回调（I01）：宿主据此注册 sameHost transport handler（显式/自动 warm 都覆盖） */
+  onWarmed?(endpointId: EndpointId): void;
   /** exclusive 租约 TTL（§8.3 默认 60s；超时强制释放 + 降级事件） */
   exclusiveLeaseTtlMs?: number;
   /** 空闲驱逐（§8.3 默认 10min；0 = 不驱逐） */
@@ -69,6 +73,50 @@ export interface PiStreamPortDeps {
   devMode?: boolean;
   /** exclusive 超时等端口级降级（宿主转 policy_degraded 事件，I21） */
   onDegraded?(info: { reason: "lease_ttl_expired" | "context_hook_unavailable"; endpointId: EndpointId }): void;
+  /** §20.1：SessionFactory 自身的秒级 deadline（不受 policyTimeoutMs 约束）。缺省 30s。 */
+  sessionWarmTimeoutMs?: number;
+  /** sessionFactory 超时/抛错的降级回调（宿主转 policy_degraded，degradedTo="unrecoverable"） */
+  onPolicyDegraded?(info: { slot: "sessionFactory"; reason: "timeout" | "threw"; degradedTo: DegradeTarget }): void;
+  /** I09：P2 注入真实确认——该端点注入体进入某轮最终输入时回调（经 context_with_system 观测）。
+   *  mesh-pi 内部装配通道（非 StreamPort 十方法、非公开 createMesh API，快照不变）。 */
+  onInjectionConfirmed?(endpointId: EndpointId, info: { turnGeneration: number }): void;
+}
+
+/** §20.1 秒级 deadline 默认值（计划 §4.1；不加进 Limits 以免漂移导出类型） */
+const SESSION_WARM_TIMEOUT_MS = 30_000;
+
+/** 工厂 deadline 触发的哨兵错误：与「工厂真实抛错」区分，供降级 reason 判定 */
+class WarmDeadlineError extends Error {
+  constructor() {
+    super("warm deadline exceeded");
+    this.name = "WarmDeadlineError";
+  }
+}
+
+/** 给异步工厂调用套一条 unref deadline（§20.1：sessionFactory 豁免 policyTimeoutMs，须自身秒级） */
+function withWarmDeadline<T>(ms: number, op: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      reject(new WarmDeadlineError());
+    }, ms);
+    timer.unref?.();
+    op().then(
+      (v) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
 }
 
 // ─── pi session 的结构收窄（types.ts 的 SessionFactory.session 是 unknown）──
@@ -77,6 +125,8 @@ interface PiSessionEvent {
   type: string;
   message?: { role?: string };
   entry?: unknown;
+  /** agent_settled 载荷：turn 正常落定 false / 异常中止 true（G04 实测 pi 1.1.0） */
+  aborted?: boolean;
 }
 
 interface PiSessionLike {
@@ -152,6 +202,8 @@ interface StreamRec {
   /** handoff 中的 envelopeId（F3：端口自持在途，不读 SDK 计数） */
   handoff: Set<string>;
   waiters: EntryWaiter[];
+  /** I09：本轮已开始的回合代次（turn_start 自增），注入确认据此归属回合 */
+  turnGeneration: number;
   leaseTimer?: NodeJS.Timeout;
   idleTimer?: NodeJS.Timeout;
   evicting: boolean;
@@ -169,7 +221,6 @@ export class PiStreamPort implements StreamPort {
   private readonly streams = new Map<EndpointId, StreamRec>();
   private readonly entryHandlers = new Set<(e: PortEntryEvent) => void>();
   private readonly turnEndHandlers = new Set<(e: { endpointId: string }) => void>();
-  private readonly writerId = `mesh-${randomUUID()}`;
   private warming = new Map<EndpointId, Promise<void>>();
 
   constructor(deps: PiStreamPortDeps) {
@@ -179,7 +230,15 @@ export class PiStreamPort implements StreamPort {
   // ── ① warm / ② evict ──────────────────────────────────────────────────
 
   async warm(endpointId: string, lease: MeshLease = "exclusive"): Promise<void> {
-    if (this.streams.has(endpointId)) return;
+    const existing = this.streams.get(endpointId);
+    if (existing) {
+      // I16：热流 shared → exclusive 升级（不重建流，只切租约并同步锁文件）
+      if (lease === "exclusive" && existing.lease === "shared" && !existing.evicting) {
+        await existing.lock.setLease("exclusive", this.d.exclusiveLeaseTtlMs ?? 60_000);
+        this.applyLease(existing, "exclusive");
+      }
+      return;
+    }
     // 并发 warm 合并（同一端点只建一条流）
     const pending = this.warming.get(endpointId);
     if (pending) return pending;
@@ -201,7 +260,7 @@ export class PiStreamPort implements StreamPort {
     let lock: EndpointLock;
     try {
       lock = await EndpointLock.acquire(join(d.stateDir, "locks", `${endpointId}.lock`), {
-        writerId: this.writerId,
+        writerId: this.d.writerId,
         lease,
         leaseTtlMs: d.exclusiveLeaseTtlMs ?? 60_000,
       });
@@ -215,22 +274,30 @@ export class PiStreamPort implements StreamPort {
     // §19.4：lock_path 落库＝「这条流归本进程」，是 isEndpointLocal 与 C10 的持久真相。
     d.setEndpointLock(endpointId, lock.lockPath);
 
-    // ② SessionFactory 建/恢复（失败 ⇒ NO_SESSION，§7.10 唯一要告警的）
+    // ② SessionFactory 建/恢复（失败 ⇒ NO_SESSION，§7.10 唯一要告警的）。
+    // 工厂自身秒级 deadline（§20.1）：超时/抛错都 fail-closed 释放锁、置 unavailable、
+    // 发 policy_degraded（unrecoverable），再抛 NO_SESSION。
     const tools = d.buildTools(endpointId);
+    const warmDeadlineMs = d.sessionWarmTimeoutMs ?? SESSION_WARM_TIMEOUT_MS;
     let session: PiSessionLike;
     let piSessionId: string;
     try {
       if (endpoint.piSessionId) {
-        const r = await d.sessionFactory.open({
-          endpoint,
-          account,
-          piSessionId: endpoint.piSessionId,
-          tools,
-        });
+        const existingPiSessionId = endpoint.piSessionId;
+        const r = await withWarmDeadline(warmDeadlineMs, () =>
+          d.sessionFactory.open({
+            endpoint,
+            account,
+            piSessionId: existingPiSessionId,
+            tools,
+          }),
+        );
         session = narrowSession(r.session, endpointId);
-        piSessionId = endpoint.piSessionId;
+        piSessionId = existingPiSessionId;
       } else {
-        const r = await d.sessionFactory.create({ endpoint, account, tools });
+        const r = await withWarmDeadline(warmDeadlineMs, () =>
+          d.sessionFactory.create({ endpoint, account, tools }),
+        );
         session = narrowSession(r.session, endpointId);
         piSessionId = r.piSessionId;
       }
@@ -238,6 +305,14 @@ export class PiStreamPort implements StreamPort {
       await lock.release();
       d.setEndpointLock(endpointId, null);
       d.setEndpointState(endpointId, "unavailable");
+      if (err instanceof WarmDeadlineError) {
+        d.onPolicyDegraded?.({ slot: "sessionFactory", reason: "timeout", degradedTo: "unrecoverable" });
+        throw new PiPortError(
+          "NO_SESSION",
+          `mesh-pi: SessionFactory deadline exceeded for endpoint ${endpointId}`,
+        );
+      }
+      d.onPolicyDegraded?.({ slot: "sessionFactory", reason: "threw", degradedTo: "unrecoverable" });
       if (err instanceof PiPortError) throw err;
       throw new PiPortError(
         "NO_SESSION",
@@ -259,6 +334,7 @@ export class PiStreamPort implements StreamPort {
       entryByEnvelope: new Map(),
       handoff: new Set(),
       waiters: [],
+      turnGeneration: 0,
       evicting: false,
     };
 
@@ -276,6 +352,8 @@ export class PiStreamPort implements StreamPort {
     this.applyLease(rec, lease);
     d.setEndpointState(endpointId, "hot");
     this.resetIdleTimer(rec);
+    // I01：建流成功后通知宿主（显式/自动 warm 都经此），宿主据此注册 sameHost transport handler
+    this.d.onWarmed?.(endpointId);
   }
 
   private applyLease(rec: StreamRec, lease: MeshLease): void {
@@ -289,6 +367,8 @@ export class PiStreamPort implements StreamPort {
       rec.leaseTimer = setTimeout(() => {
         this.d.setEndpointLease(rec.endpointId, "shared", null);
         rec.lease = "shared";
+        // I16：降级后锁文件与内存/DB 租约同步（shared：leaseUntil 清空）
+        void rec.lock.setLease("shared");
         this.d.onDegraded?.({ reason: "lease_ttl_expired", endpointId: rec.endpointId });
       }, ttl);
       rec.leaseTimer.unref?.();
@@ -319,12 +399,16 @@ export class PiStreamPort implements StreamPort {
     const endpoint = d.getEndpoint(endpointId);
     try {
       if (endpoint && d.sessionFactory.dispose) {
-        await d.sessionFactory.dispose({ endpoint, session: rec.session });
+        // dispose 同样套 deadline（§20.1）：卡死的清理不得无限期阻塞驱逐。
+        await withWarmDeadline(
+          d.sessionWarmTimeoutMs ?? SESSION_WARM_TIMEOUT_MS,
+          () => d.sessionFactory.dispose!({ endpoint, session: rec.session }),
+        );
       } else {
         rec.session.dispose();
       }
     } catch {
-      // dispose 失败同样不阻断（§8.3 驱逐是内存管理，不是数据操作）
+      // dispose 失败或超时同样不阻断（§8.3 驱逐是内存管理，不是数据操作）
     }
     await rec.lock.release();
     d.setEndpointLock(endpointId, null);
@@ -447,11 +531,32 @@ export class PiStreamPort implements StreamPort {
         },
       ],
     });
+    // I09：同一扩展再挂 context_with_system 观测器——它在所有 context 处理器跑完、
+    // system 恢复后看到完整 transcript，据此确认「注入体真的进了最终输入」（W01 探针）。
+    // 仅按 customType 定位；找不到（system 恢复改变形态等）则静默，绝不伪造绿灯。
+    const observer = (event: { messages?: unknown[] }) => {
+      const msgs = Array.isArray(event.messages) ? event.messages : [];
+      const seen = msgs.some(
+        (m) =>
+          typeof m === "object" &&
+          m !== null &&
+          (m as { customType?: unknown }).customType === MESH_INBOX_CUSTOM_TYPE,
+      );
+      if (seen) {
+        this.d.onInjectionConfirmed?.(endpointId, {
+          turnGeneration: rec.turnGeneration,
+        });
+      }
+      return undefined;
+    };
     const ext: Record<string, unknown> = {
       path: "pi-agent-mesh:context-injection",
       resolvedPath: "pi-agent-mesh:context-injection",
       hidden: true,
-      handlers: new Map([["context", [handler]]]),
+      handlers: new Map([
+        ["context", [handler]],
+        ["context_with_system", [observer]],
+      ]),
       tools: new Map(),
       messageRenderers: new Map(),
       commands: new Map(),
@@ -525,20 +630,36 @@ export class PiStreamPort implements StreamPort {
 
   private onSessionEvent(rec: StreamRec, ev: PiSessionEvent): void {
     if (this.streams.get(rec.endpointId) !== rec) return; // 已驱逐的流的迟到事件
-    if (ev.type === "message_end" && ev.message?.role === "custom") {
+    if (ev.type === "turn_start") {
+      // I09：回合代次自增（确认点据此绑定「某轮真实 LLM 调用」）
+      rec.turnGeneration += 1;
+    } else if (ev.type === "message_end" && ev.message?.role === "custom") {
       this.syncEntries(rec);
     } else if (ev.type === "turn_end") {
-      // _flushPendingCustomMessages 在 listener 之后执行（pi 内部顺序），微任务后再差分
-      queueMicrotask(() => this.syncEntries(rec));
+      // _flushPendingCustomMessages 在 listener 之后执行（pi 内部顺序）：entry 差分须微任务后
+      // 再做，steer 投递借此 markDelivered。消费归因移到随后的 agent_settled —— 由其 aborted
+      // 决定 partial（§7.9 F2/F5）：正常轮次 agent_settled{aborted:false} → handleTurnEnd 归因
+      // consumed(partial=false)；异常中止 agent_settled{aborted:true} 则留 delivered 交给
+      // reconcile 归因 consumed(partial=true)（types.ts：partial 只由 abort 造成）。G04(b) 实测
+      // abort 时 turn_end 照常成对点亮，但那不表示该轮已正常完成，不能据此按 partial=false 归因。
       this.resetIdleTimer(rec);
-      for (const h of [...this.turnEndHandlers]) {
-        try {
-          h({ endpointId: rec.endpointId });
-        } catch {
-          // 事件处理器抛错不影响投递（§12.5）
+      queueMicrotask(() => this.syncEntries(rec));
+    } else if (ev.type === "agent_settled") {
+      this.resetIdleTimer(rec);
+      queueMicrotask(() => {
+        // 先镜像（markDelivered）再归因（handleTurnEnd 只消费 delivered 行），与 steer 的
+        // turn_end 微任务按 FIFO 顺序先后执行，仍保「归因前已 delivered」。
+        this.syncEntries(rec);
+        if (ev.aborted === true) return; // 异常中止：留 delivered，reconcile 归因 partial=true
+        for (const h of [...this.turnEndHandlers]) {
+          try {
+            h({ endpointId: rec.endpointId });
+          } catch {
+            // 事件处理器抛错不影响投递（§12.5）
+          }
         }
-      }
-    } else if (ev.type === "agent_settled" || ev.type === "entry_appended") {
+      });
+    } else if (ev.type === "entry_appended") {
       queueMicrotask(() => this.syncEntries(rec));
       this.resetIdleTimer(rec);
     }

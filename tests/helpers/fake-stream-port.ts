@@ -37,6 +37,8 @@ export class FakeStreamPort implements StreamPort {
   private busy = new Set<EndpointId>();
   /** 脚本化"某些 entryId 被 clearQueue 干掉了"（I22 用例） */
   readonly vanishedEntries = new Set<string>();
+  /** 脚本化 warm 抛错（D03 用例：拿不到 session → park + 告警） */
+  warmError?: unknown;
   private entryHandlers: Array<(e: PortEntryEvent) => void> = [];
   private turnEndHandlers: Array<(e: { endpointId: EndpointId }) => void> = [];
   private seqCounters = new Map<EndpointId, number>();
@@ -47,6 +49,7 @@ export class FakeStreamPort implements StreamPort {
   }
 
   async warm(endpointId: string, _lease?: MeshLease): Promise<void> {
+    if (this.warmError) throw this.warmError;
     this.warmed.push(endpointId);
     this.states.set(endpointId, "hot");
   }

@@ -289,7 +289,7 @@ describe("SharedSpace: ACL", () => {
       code: "SPACE_FORBIDDEN",
     });
 
-    // 成员可写、可删
+    // 成员可写、可删（k2 由 B 创建，B 即 owner/admin）
     expect((await h.shared.put(space, "k2", "y", { as: "B" })).version).toBe(1);
     await expect(h.shared.del(space, "k2", { as: "C" })).rejects.toMatchObject({
       code: "SPACE_FORBIDDEN",
@@ -342,7 +342,7 @@ describe("SharedSpace: ACL", () => {
       h.shared.put(space, "ro", "by-C", { as: "C" }),
     ).rejects.toMatchObject({ code: "SPACE_FORBIDDEN" });
 
-    // del 也走 write 面（§18）：只读者不能删
+    // del 走 admin 面（§18.6）：只读者不能删
     await expect(h.shared.del(space, "ro", { as: "C" })).rejects.toMatchObject({
       code: "SPACE_FORBIDDEN",
     });
@@ -353,6 +353,12 @@ describe("SharedSpace: ACL", () => {
       acl: { read: [{ kind: "accounts", accounts: ["A", "C"] }], write: [{ kind: "accounts", accounts: ["A", "C"] }], admin: [{ kind: "accounts", accounts: ["A"] }] },
     });
     expect((await h.shared.put(space, "wo", "by-C", { as: "C" })).version).toBe(2);
+
+    // C 有 write 无 admin：可写不可删；del 仍需 admin（A）
+    await expect(h.shared.del(space, "wo", { as: "C" })).rejects.toMatchObject({
+      code: "SPACE_FORBIDDEN",
+    });
+    await h.shared.del(space, "wo", { as: "A" });
     h.store.close();
   });
 });

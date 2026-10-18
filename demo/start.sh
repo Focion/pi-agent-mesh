@@ -72,7 +72,7 @@ if [[ ! -f demo/demo.config.json ]]; then
   if [[ -f demo/demo.config.example.json ]]; then
     cp demo/demo.config.example.json demo/demo.config.json
     echo "[demo] 已从 demo.config.example.json 生成 demo/demo.config.json"
-    echo "[demo] ⚠️  请按需修改 provider / modelId，并确保已配置 LLM 凭据（env 或 ~/.pi/agent/auth.json）。"
+    echo "[demo] ⚠️  请按需修改 llm.model / llm.providers，并配置凭据（llm.apiKey 或 llm.apiKeyEnv，本面板不读 ~/.pi）。"
   else
     echo "[demo] 缺少 demo/demo.config.json 且无 example 可复制。" >&2
     exit 1

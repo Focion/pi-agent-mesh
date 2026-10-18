@@ -1,0 +1,14 @@
+{
+  "b-thirty": {
+    "timeMedianMs": 23909.53554099999,
+    "throughputMedian": 20.912158629873915
+  },
+  "c-queue": {
+    "timeMedianMs": 2605.6900829999977,
+    "throughputMedian": 383.77549445507134
+  },
+  "a-dual": {
+    "timeMedianMs": 269.2502079999995,
+    "throughputMedian": 742.8035115946889
+  }
+}

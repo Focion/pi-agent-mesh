@@ -31,6 +31,7 @@ import type {
   SinkHandler,
 } from "../../src/index.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
+import { assertInvariants } from "../helpers/invariants.js";
 
 /** sessionFactory 是唯一必填槽（§12.1）；e2e 只用 FakeStreamPort，永不被调 */
 const stubSessionFactory: SessionFactory = {
@@ -140,8 +141,7 @@ describe("P0 acceptance (§25.1)", () => {
       expect(port.delivered).toHaveLength(10);
       expect(port.wakeCount()).toBe(10);
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }
@@ -198,8 +198,7 @@ describe("P0 acceptance (§25.1)", () => {
         expect(traces.every((t) => t.state === "consumed")).toBe(true);
       }
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }
@@ -246,8 +245,7 @@ describe("P1 acceptance (§25.2)", () => {
       // FakeStreamPort 侧印证：expect:"none" 广播 → triggerTurn:true = 0（§25.2④同源）
       expect(port.wakeCount()).toBe(0);
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }
@@ -353,8 +351,7 @@ describe("topic subscribe/unsubscribe (§16.3)", () => {
       const conv = inbox.conversations.find((c) => c.conversationId === topic.id);
       expect(conv?.unread).toBe(1);
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }
@@ -379,8 +376,7 @@ describe("topic subscribe/unsubscribe (§16.3)", () => {
 
       expect(await host.observer.trace(r.messageId)).toHaveLength(0);
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }
@@ -473,8 +469,7 @@ describe("shared spaces (§18)", () => {
       const listAfter = await host.shared.list("global", { as: "owner" });
       expect(listAfter.map((m) => m.key)).not.toContain("greeting");
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }
@@ -486,7 +481,7 @@ describe("queue claim/requeue (§17)", () => {
     const { host } = await makeMesh();
     try {
       await makeProducer(host, "producer");
-      await makeWorker(host, "worker");
+      await makeSpeaker(host, "worker");
       const q = await host.createConversation({ type: "queue", creator: "producer", members: ["worker"] });
 
       const r = await host.send({ from: "producer", conversationId: q.id, kind: "task", expect: "none", text: "job" });
@@ -494,19 +489,22 @@ describe("queue claim/requeue (§17)", () => {
       const env = envs.find((e) => e.id === r.messageId)!;
       expect(env.expect).toBe("ack");
 
-      // offline worker 不被唤醒/消费，投递停在 delivered → claim 方可命中（C3）
-      const claim = await host.claim(r.messageId, "worker");
-      expect(claim.ok).toBe(true);
+      // available worker 被唤醒、turn_end 已回吐，但 queue 投递不消费 → 仍 delivered（§17.5）
+      await flush();
       let trace = await host.observer.trace(r.messageId);
       expect(trace).toHaveLength(1);
+      expect(trace[0]!.state).toBe("delivered");
+
+      const claim = await host.claim(r.messageId, "worker");
+      expect(claim.ok).toBe(true);
+      trace = await host.observer.trace(r.messageId);
       expect(trace[0]!.state).toBe("claimed");
 
       await host.ack({ correlationId: env.correlationId!, from: "worker" });
       trace = await host.observer.trace(r.messageId);
       expect(trace[0]!.state).toBe("acked");
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }
@@ -533,8 +531,7 @@ describe("queue claim/requeue (§17)", () => {
       const inbox = await host.observer.inboxOf("w2");
       expect(inbox.conversations.find((c) => c.conversationId === q2.id)?.unread).toBe(1);
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }
@@ -573,8 +570,7 @@ describe("request-response (§14)", () => {
       inbox = await host.observer.inboxOf("responder");
       expect(inbox.awaitingMyAck.some((a) => a.correlationId === correlationId)).toBe(false);
 
-      const report = await host.observer.checkInvariants();
-      expect(report.violations).toEqual([]);
+      await assertInvariants(host);
     } finally {
       await host.close();
     }

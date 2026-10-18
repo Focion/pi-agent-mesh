@@ -1,7 +1,11 @@
 {
-  "provider": "anthropic",
-  "modelId": "claude-sonnet-4-5",
-  "thinkingLevel": "medium",
-  "tools": [],
+  "llm": {
+    "model": "anthropic:claude-sonnet-4-5",
+    "thinkingLevel": "medium",
+    "apiKeyEnv": "ANTHROPIC_API_KEY"
+  },
+  "runtime": {
+    "builtinTools": []
+  },
   "port": 8787
 }

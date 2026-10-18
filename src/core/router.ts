@@ -16,17 +16,19 @@
 // - REQUEST_CYCLE 检测照 §14.5 算法：只遍历 sync=1 开集边 + 自环
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { createHmac } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { RouteInput, Router } from "./contracts.js";
+import { rowToEnvelope, type MessageRow } from "./envelope.js";
 import type { MeshEventBus } from "./events.js";
 import { withPolicyGuard, withPolicyTimeout } from "./policies.js";
 import type { MeshRegistry } from "./registry.js";
+import { computeSealToken, sealFieldsFromDraft } from "./seal.js";
 import type { SqliteStore } from "./store.js";
 import type {
   Account,
   Cap,
   Conversation,
+  ConversationId,
   Envelope,
   EnvelopePayload,
   Limits,
@@ -34,6 +36,7 @@ import type {
   MessageId,
   MessageKind,
   Policies,
+  PolicyDegradeReason,
   PolicySlot,
   DegradeTarget,
 } from "./types.js";
@@ -43,7 +46,6 @@ import {
   idempotencyKey,
   isoFromMs,
   isoNow,
-  jsonParse,
   msFromIso,
   sha256Hex,
   ulid,
@@ -70,24 +72,6 @@ export interface RouterDeps {
   mentionAllCap?: Cap;
 }
 
-interface MessageRow {
-  id: string;
-  conversation_id: string;
-  seq: number;
-  from_account: string;
-  kind: string;
-  expect: string;
-  priority: string | null;
-  to_accounts: string | null;
-  mentions: string | null;
-  reply_to: string | null;
-  correlation_id: string | null;
-  logical_ts: string | null;
-  routed_at: string;
-  payload: string;
-  ext: string | null;
-}
-
 export class MeshRouter implements Router {
   private readonly deps: RouterDeps;
 
@@ -108,7 +92,7 @@ export class MeshRouter implements Router {
     const payload = buildPayload(input);
     const payloadJson = JSON.stringify(payload);
     const payloadBytes = Buffer.byteLength(payloadJson, "utf8");
-    const toNorm = Array.from(new Set(input.to ?? []));
+    let toNorm = Array.from(new Set(input.to ?? []));
     const mentionsRaw = Array.from(new Set(input.mentions ?? []));
     const clientToken =
       input.clientToken ??
@@ -138,12 +122,37 @@ export class MeshRouter implements Router {
     }
 
     // ── 会话解析（§9.1/§9.2：首条消息隐式 ensureDirect）──
+    // N02：若本 route 隐式新建 direct 会话、但后续校验拒绝，回滚该空会话（不留首聊被拒痕迹）
+    let implicitDirectCreated = false;
+    try {
     let conv = d.registry.getConversation(convId);
     if (!conv) {
       if (toNorm.length === 1 && d.registry.getAccount(toNorm[0] ?? "")) {
         const derived = directConversationId(from, toNorm[0] ?? "");
         if (derived === convId) {
+          // §9.1/§6.1：发起直聊先过 canInitiateDirect（fail-closed），拒绝则零落库
+          const fromAcc = d.registry.getAccount(from);
+          const peerAcc = d.registry.getAccount(toNorm[0] ?? "");
+          if (fromAcc && peerAcc) {
+            const mayInitiate = await withPolicyTimeout(
+              this.guardDeps("accessControl", "deny"),
+              () => {
+                const hook = d.policies.accessControl.canInitiateDirect;
+                if (!hook) return true; // 钩子缺失 → 放行（缺省允许发起）
+                return hook(fromAcc, peerAcc);
+              },
+              false,
+              (v) => typeof v === "boolean",
+            );
+            if (!mayInitiate) {
+              throw new MeshRejectError(
+                "CANNOT_INITIATE",
+                "canInitiateDirect denied: " + from + " -> " + toNorm[0],
+              );
+            }
+          }
           conv = await d.registry.ensureDirect(from, toNorm[0] ?? "");
+          implicitDirectCreated = true;
         }
       }
       if (!conv) {
@@ -188,23 +197,45 @@ export class MeshRouter implements Router {
       };
     }
 
-    // ── 应答合法性（§14.1：带合法 correlationId 的应答豁免 initiate）──
+    // ── 应答合法性（§14.1：带合法 correlationId 的应答豁免 initiate；§14.4 late 复信仍合法）──
     let replyOf: {
       correlation_id: string;
       expect: string;
       message_id: string;
+      from_account: string;
+      isLate: boolean;
     } | null = null;
     if (input.correlationId) {
       const pa = d.store.db
         .prepare<
           [string, string],
-          { correlation_id: string; expect: string; message_id: string }
+          {
+            correlation_id: string;
+            expect: string;
+            message_id: string;
+            from_account: string;
+            state: string;
+          }
         >(
-          "SELECT correlation_id, expect, message_id FROM mesh_pending_acks " +
-            "WHERE correlation_id = ? AND to_account = ? AND state = 'open'",
+          "SELECT correlation_id, expect, message_id, from_account, state FROM mesh_pending_acks " +
+            "WHERE correlation_id = ? AND to_account = ? AND state IN ('open','timeout')",
         )
         .get(input.correlationId, from);
-      if (pa) replyOf = pa;
+      if (pa) {
+        replyOf = {
+          correlation_id: pa.correlation_id,
+          expect: pa.expect,
+          message_id: pa.message_id,
+          from_account: pa.from_account,
+          isLate: pa.state === "timeout",
+        };
+      }
+    }
+
+    // §14.1/§14.4：复信默认定向回发起方（ack 入口与 ordinary correlation send 一致）；
+    // 调用方显式指定 to 时尊重，不覆盖。要 target 的会话必已存在，故不影响上方隐式 direct。
+    if (replyOf && toNorm.length === 0) {
+      toNorm = [replyOf.from_account];
     }
 
     // ── ② initiate（轴三；§4.2）──
@@ -240,8 +271,9 @@ export class MeshRouter implements Router {
         );
       }
     }
-    if (conv.kind === "queue") {
-      // §17.6：显式 reply 拒绝；其余值覆写为 ack，不报错
+    if (conv.kind === "queue" && kind !== "system") {
+      // §17.6：显式 reply 拒绝；其余值覆写为 ack，不报错。kind:"system"（死信通知等）豁免——
+      // system 消息不被当作派发单元，走下方定向投递到 to 接收者，不进 claimable 路径。
       if (expect === "reply") {
         throw new MeshRejectError(
           "TARGETING_NOT_SUPPORTED",
@@ -384,7 +416,9 @@ export class MeshRouter implements Router {
       correlationId: effCorrelationId,
       requestType: input.requestType,
       logicalTs: input.logicalTs,
+      late: replyOf?.isLate ? true : undefined,
       payload,
+      ext: input.ext,
     };
 
     // ── ⑤ Floor（group/queue；§13）──
@@ -403,6 +437,7 @@ export class MeshRouter implements Router {
             envelope: draft,
           }),
         candidates, // 降级 = free_for_all（§13.4：宁可吵，不要全场哑掉）
+        (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
       );
       if (!granted.includes(from)) {
         throw new MeshRejectError(
@@ -412,30 +447,36 @@ export class MeshRouter implements Router {
       }
     }
 
-    // ── AccessControl（fail-closed：超时/抛错 → 拒绝，§9.1 闸②/§12.3⑥）──
+    // ── AccessControl（fail-closed：超时/抛错/返回 undefined → 拒绝，§9.1 闸②/§12.3⑥）──
+    // 钩子缺失 = 放行（§22.5：accessControl 缺省 allow）；钩子存在但返回 undefined 是
+    // 非法值（I21/C03）→ isValid 判非法 → deny，绝不把 undefined 当放行。
     if (conv.kind === "topic") {
       const ok = await withPolicyTimeout(
         this.guardDeps("accessControl", "deny"),
-        () =>
-          d.policies.accessControl.canPublish?.({
-            envelope: draft,
-            from: sender,
-            conversation: conv,
-          }) ?? true,
+        () => {
+          const hook = d.policies.accessControl.canPublish;
+          if (!hook) return true;
+          return hook({ envelope: draft, from: sender, conversation: conv });
+        },
         false,
+        (v) => typeof v === "boolean",
       );
       if (!ok) throw new MeshRejectError("NOT_A_MEMBER", "canPublish denied");
     }
     const okSend = await withPolicyTimeout(
       this.guardDeps("accessControl", "deny"),
-      () =>
-        d.policies.accessControl.canSend?.({
+      () => {
+        const hook = d.policies.accessControl.canSend;
+        if (!hook) return true;
+        return hook({
           envelope: draft,
           from: sender,
           conversation: conv,
           membership,
-        }) ?? true,
+        });
+      },
       false,
+      (v) => typeof v === "boolean",
     );
     if (!okSend) throw new MeshRejectError("NOT_A_MEMBER", "canSend denied");
 
@@ -443,14 +484,18 @@ export class MeshRouter implements Router {
     if (mentionsAll) {
       const okMentionAll = await withPolicyTimeout(
         this.guardDeps("accessControl", "deny"),
-        () =>
-          d.policies.accessControl.canMentionAll?.({
+        () => {
+          const hook = d.policies.accessControl.canMentionAll;
+          if (!hook) return true;
+          return hook({
             envelope: draft,
             from: sender,
             conversation: conv,
             membership,
-          }) ?? true,
+          });
+        },
         false,
+        (v) => typeof v === "boolean",
       );
       if (!okMentionAll)
         throw new MeshRejectError(
@@ -488,7 +533,7 @@ export class MeshRouter implements Router {
       out = d.store.tx(() => {
       const seq = d.registry.allocateSeq(convId);
       const seal = d.sealKey
-        ? computeSeal(d.sealKey, draft, seq, payloadJson)
+        ? computeSealToken(d.sealKey, sealFieldsFromDraft(draft, seq, payloadJson))
         : undefined;
       const envelope: Envelope = { ...draft, seq, ...(seal ? { seal } : {}) };
 
@@ -514,7 +559,7 @@ export class MeshRouter implements Router {
           effCorrelationId ?? null,
           replyOf && replyOf.expect === "ack" ? replyOf.message_id : null,
           input.requestType ?? null,
-          0,
+          envelope.late ? 1 : 0,
           input.logicalTs ?? null,
           routedAt,
           payloadJson,
@@ -524,16 +569,18 @@ export class MeshRouter implements Router {
           input.ext === undefined ? null : JSON.stringify(input.ext),
         );
 
-      // FTS（contentless：手工插 rowid + text）
-      const rowid = (
-        d.store.db.prepare("SELECT last_insert_rowid() AS r").get() as {
-          r: number;
-        }
-      ).r;
-      const ftsText = payload.text ?? JSON.stringify(payload);
-      d.store.db
-        .prepare("INSERT INTO mesh_messages_fts (rowid, text) VALUES (?, ?)")
-        .run(rowid, ftsText);
+      // FTS（contentless：手工插 rowid + text）；N04：禁用 FTS 时跳过索引写入。
+      if (d.store.ftsEnabled) {
+        const rowid = (
+          d.store.db.prepare("SELECT last_insert_rowid() AS r").get() as {
+            r: number;
+          }
+        ).r;
+        const ftsText = payload.text ?? JSON.stringify(payload);
+        d.store.db
+          .prepare("INSERT INTO mesh_messages_fts (rowid, text) VALUES (?, ?)")
+          .run(rowid, ftsText);
+      }
 
       // ── delivery 集（group/direct：to ∪ mentions(@all 展开) − sender；无 read cap 无行）──
       // topic：每个 from_seq ≤ seq 的订阅者一行（silent/P3，不唤醒）；queue：单消费者一行。
@@ -566,8 +613,9 @@ export class MeshRouter implements Router {
             )
             .run(payloadBytes, s.accountId, convId);
         }
-      } else if (conv.kind === "queue") {
+      } else if (conv.kind === "queue" && kind !== "system") {
         // §17.1：每条消息 = 一条 delivery，终态 acked；由 least-in-flight 选出单消费者。
+        // kind:"system" 豁免（不进派发），落入下方定向投递分支。
         const queueCandidates = [...memberCaps.keys()].filter((m) => m !== from);
         queueConsumer = selectQueueConsumer(d, convId, queueCandidates);
         if (!queueConsumer) {
@@ -720,6 +768,13 @@ export class MeshRouter implements Router {
           )
           .get(input.replyTo) as MessageRow | undefined;
         if (origRow) tombOriginal = rowToEnvelope(origRow);
+        // I32(a)：pending→dropped 减少未读缓存。tombDropped 每 delivery 一行 account_id，
+        // 去重后按 tombstone 原消息的会话重算（本块在 route 的外层 tx 内）。
+        if (origRow) {
+          for (const aid of new Set(tombDropped.map((t) => t.account_id))) {
+            d.store.recomputeInbox(aid, origRow.conversation_id);
+          }
+        }
       }
 
       // ── 计数器（附录 E；与状态跃迁同事务）──
@@ -764,6 +819,35 @@ export class MeshRouter implements Router {
       seq: out.envelope.seq,
       correlationId: out.envelope.correlationId,
     };
+    } catch (err) {
+      // N02：隐式新建的 direct 会话在受理被拒时回滚（仅当仍无消息；有消息则保留）
+      if (implicitDirectCreated) this.rollbackEmptyDirect(convId);
+      throw err;
+    }
+  }
+
+  /** N02：回滚本 route 隐式新建、且仍无任何消息的空 direct 会话（含成员/inbox/会话行） */
+  private rollbackEmptyDirect(convId: ConversationId): void {
+    const d = this.deps;
+    const n = (
+      d.store.db
+        .prepare<[string], { n: number }>(
+          "SELECT COUNT(*) AS n FROM mesh_messages WHERE conversation_id = ?",
+        )
+        .get(convId) as { n: number }
+    ).n;
+    if (n > 0) return; // 已有消息 → 会话有效，保留
+    d.store.tx(() => {
+      d.store.db
+        .prepare("DELETE FROM mesh_memberships WHERE conversation_id = ?")
+        .run(convId);
+      d.store.db
+        .prepare("DELETE FROM mesh_inboxes WHERE conversation_id = ?")
+        .run(convId);
+      d.store.db
+        .prepare("DELETE FROM mesh_conversations WHERE id = ?")
+        .run(convId);
+    });
   }
 
   private guardDeps(slot: PolicySlot, degradedTo: DegradeTarget) {
@@ -773,7 +857,7 @@ export class MeshRouter implements Router {
       timeoutMs: d.limits.policyTimeoutMs,
       degradedTo,
       onDegraded: (
-        reason: "timeout" | "threw",
+        reason: PolicyDegradeReason,
         s: PolicySlot,
         target: DegradeTarget,
       ) => {
@@ -820,33 +904,6 @@ function buildPayload(input: RouteInput): EnvelopePayload {
   const base = input.payload ? { ...input.payload } : {};
   if (input.text !== undefined) base.text = input.text;
   return base;
-}
-
-/** §22.4：seal 只覆盖消息本身（系统层 + 意图层 + payload/ext 摘要），HMAC-sha256 */
-function computeSeal(
-  key: string,
-  draft: Envelope,
-  seq: number,
-  payloadJson: string,
-): string {
-  const canonical = JSON.stringify({
-    i: draft.id,
-    c: draft.conversationId,
-    s: seq,
-    f: draft.from,
-    t: draft.routedAt,
-    k: draft.kind,
-    e: draft.expect,
-    to: draft.to ?? [],
-    m: draft.mentions ?? [],
-    r: draft.replyTo,
-    ci: draft.correlationId,
-    rt: draft.requestType,
-    lt: draft.logicalTs,
-    pd: sha256Hex(payloadJson),
-    ed: sha256Hex(draft.ext === undefined ? "" : JSON.stringify(draft.ext)),
-  });
-  return createHmac("sha256", key).update(canonical, "utf8").digest("hex");
 }
 
 function lastSpeakersOf(d: RouterDeps, convId: string): string[] {
@@ -945,28 +1002,6 @@ export function detectRequestCycle(
     }
   }
   return { result: "ok" };
-}
-
-function rowToEnvelope(r: MessageRow): Envelope {
-  return {
-    id: r.id,
-    seq: r.seq,
-    from: r.from_account,
-    fromEndpoint: null,
-    routedAt: r.routed_at,
-    idempotencyKey: "",
-    conversationId: r.conversation_id,
-    to: jsonParse<string[]>(r.to_accounts, []),
-    kind: r.kind as MessageKind,
-    expect: r.expect as Envelope["expect"],
-    priority: (r.priority ?? undefined) as Envelope["priority"],
-    mentions: jsonParse<string[]>(r.mentions, []),
-    replyTo: r.reply_to ?? undefined,
-    correlationId: r.correlation_id ?? undefined,
-    logicalTs: r.logical_ts ?? undefined,
-    payload: jsonParse<EnvelopePayload>(r.payload, {}),
-    ext: r.ext === null ? undefined : jsonParse<unknown>(r.ext, undefined),
-  };
 }
 
 export type { Account, Conversation };

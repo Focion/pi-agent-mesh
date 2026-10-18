@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { createMesh } from "../../src/index.js";
 import type { Transport } from "../../src/core/types.js";
+import { assertInvariants } from "../helpers/invariants.js";
 
 const sessionFactory = {
   create: async () => ({ session: {}, piSessionId: "opt-test" }),
@@ -54,6 +55,7 @@ describe("createMesh 选项校验（附录 F 通条③）", () => {
     const host = await createMesh({ ...base, transport: custom });
     expect(subscribed).toBe(false); // 自定义 Transport 的 poller/subscription 由宿主自管
     expect(published.length).toBe(0); // 无 delivery 产生 before warm
+    await assertInvariants(host);
     await host.close();
   });
 });

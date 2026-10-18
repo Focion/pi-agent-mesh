@@ -21,7 +21,8 @@ export interface FauxCore {
 }
 
 type FauxCompat = {
-  fauxAssistantMessage(content: string, opts?: { stopReason?: string }): unknown;
+  fauxAssistantMessage(content: unknown, opts?: { stopReason?: string }): unknown;
+  fauxToolCall(name: string, args: unknown, opts?: { id?: string }): unknown;
 };
 
 export interface PiTestSession {
@@ -127,4 +128,31 @@ export async function waitFor(cond: () => boolean, ms = 10_000): Promise<void> {
 
 export function customEntries(sm: any): any[] {
   return sm.getEntries().filter((e: any) => e.type === "custom_message");
+}
+
+/**
+ * 往 session 的扩展运行器上挂一组扩展钩子（与 stream-port.injectContext 同机制：
+ * 直接 push 带 handlers Map 的扩展对象，emit 时会按扩展数组顺序逐个执行）。
+ * handlers: { [事件名]: [(event) => ...结果] }，多钩子按序入同一 Map。
+ */
+export function installExtensionHooks(
+  session: any,
+  handlers: Record<string, Array<(event: any) => unknown>>,
+  path = "probe:hooks",
+): void {
+  const runner = session.extensionRunner;
+  if (!runner || !Array.isArray(runner.extensions)) {
+    throw new Error("pi 1.1.0 session 未暴露 extensionRunner.extensions，扩展钩子注入面不可用");
+  }
+  runner.extensions.push({
+    path,
+    resolvedPath: path,
+    hidden: true,
+    handlers: new Map(Object.entries(handlers)),
+    tools: new Map(),
+    messageRenderers: new Map(),
+    commands: new Map(),
+    flags: new Map(),
+    shortcuts: new Map(),
+  });
 }

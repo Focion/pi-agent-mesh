@@ -11,7 +11,12 @@
 
 import type Database from "better-sqlite3";
 import { existsSync } from "node:fs";
+import {
+  rowToEnvelope,
+  type MessageRow,
+} from "./envelope.js";
 import type { MeshRegistry } from "./registry.js";
+import { WallClockLogicalClock } from "./policies.js";
 import { REGISTERED_COUNTERS, type SqliteStore } from "./store.js";
 import type {
   Cap,
@@ -20,16 +25,14 @@ import type {
   DeliveryState,
   DeliveryTrace,
   Envelope,
-  EnvelopePayload,
-  ExpectKind,
   InboxState,
   InboxView,
   InvariantReport,
   Limits,
-  MessageKind,
+  LogicalClock,
   MessageId,
+  MessageKind,
   Observer,
-  Priority,
   RecentPreview,
   ReplayResult,
   StreamEntry,
@@ -44,30 +47,9 @@ import {
   truncate,
 } from "./util.js";
 
-// ─── 行类型（mesh_messages / mesh_deliveries 的本地投影）───────────────────
-
-export interface MessageRow {
-  id: string;
-  conversation_id: string;
-  seq: number;
-  from_account: string;
-  from_endpoint: string | null;
-  kind: string;
-  expect: string;
-  priority: string | null;
-  to_accounts: string | null;
-  mentions: string | null;
-  reply_to: string | null;
-  correlation_id: string | null;
-  intent: string | null;
-  logical_ts: string | null;
-  routed_at: string;
-  payload: string;
-  idempotency_key: string;
-  seal: string | null;
-  tombstoned_by: string | null;
-  ext: string | null;
-}
+// 信封物化（§7/§22.1）收敛在 core/envelope.ts（I06）；此处透传以保持冻结出口
+// `rowToEnvelope` / `MessageRow` 的符号位置与名称不变。
+export { rowToEnvelope, type MessageRow };
 
 interface DeliveryRow {
   id: string;
@@ -84,6 +66,9 @@ interface DeliveryRow {
   entry_id: string | null;
   attempts: number;
   claim_until: string | null;
+  claimed_by: string | null;
+  claimed_at: string | null;
+  claim_error: string | null;
   parked_at: string | null;
   queued_at: string | null;
   delivered_at: string | null;
@@ -91,6 +76,7 @@ interface DeliveryRow {
   handoff_at: string | null;
   state_changed_at: string;
   note: string | null;
+  redeliver_reason: string | null;
 }
 
 const DELIVERY_STATES: readonly DeliveryState[] = [
@@ -106,42 +92,6 @@ const DELIVERY_STATES: readonly DeliveryState[] = [
 
 /** C5 口径：哪些状态算「还在收件箱里」 */
 const PENDING_STATES = "('routed','queued','parked','delivered')";
-
-export function rowToEnvelope(r: MessageRow): Envelope {
-  const payload = jsonParse<
-    Partial<EnvelopePayload> & { claim?: { by: string; at: string } }
-  >(r.payload, {});
-  return {
-    id: r.id,
-    seq: r.seq,
-    from: r.from_account,
-    fromEndpoint: r.from_endpoint,
-    routedAt: r.routed_at,
-    idempotencyKey: r.idempotency_key,
-    seal: r.seal ?? undefined,
-    conversationId: r.conversation_id,
-    to:
-      r.to_accounts === null
-        ? undefined
-        : jsonParse<string[]>(r.to_accounts, []),
-    kind: r.kind as MessageKind,
-    expect: r.expect as ExpectKind,
-    priority: (r.priority as Priority) ?? undefined,
-    mentions:
-      r.mentions === null ? undefined : jsonParse<string[]>(r.mentions, []),
-    replyTo: r.reply_to ?? undefined,
-    correlationId: r.correlation_id ?? undefined,
-    requestType: r.intent ?? undefined,
-    logicalTs: r.logical_ts ?? undefined,
-    claim: payload.claim,
-    payload: {
-      text: payload.text,
-      data: payload.data,
-      attachments: payload.attachments,
-    },
-    ext: r.ext === null ? undefined : jsonParse<unknown>(r.ext, undefined),
-  };
-}
 
 /** pending 投递的原文预览（≤3 条，40 字，§10.4） */
 function toPreview(
@@ -171,18 +121,29 @@ export interface ObserverDeps {
   store: SqliteStore;
   registry: MeshRegistry;
   limits: Limits;
+  /** §20.1⑨：会话排序用逻辑钟 compare；缺省墙钟字典序 */
+  clock?: LogicalClock;
+  /** I25（C10）：热端点锁必须由活进程持有——core 零 pi，活 owner 判定由宿主注入。
+   *  缺省退化为「锁文件存在」判定并标注。 */
+  lockLiveness?: (lockPath: string) => Promise<"alive" | "dead" | "unknown">;
 }
 
 export class MeshObserver implements Observer {
   private readonly db: Database.Database;
+  private readonly store: SqliteStore;
   private readonly registry: MeshRegistry;
   private readonly limits: Limits;
+  private readonly clock: LogicalClock;
+  private readonly lockLiveness?: (lockPath: string) => Promise<"alive" | "dead" | "unknown">;
   private ftsAvailable: boolean | null = null;
 
   constructor(deps: ObserverDeps) {
-    this.db = deps.store.db;
+    this.db = deps.store.readonlyDb;
+    this.store = deps.store;
     this.registry = deps.registry;
     this.limits = deps.limits;
+    this.clock = deps.clock ?? new WallClockLogicalClock();
+    this.lockLiveness = deps.lockLiveness;
   }
 
   // ── 内部：参数化只读查询 ──
@@ -252,6 +213,12 @@ export class MeshObserver implements Observer {
     const raw = q.text.trim();
     // trigram 分词器要求查询串 ≥3 字符（§23.4 前提；短词命中无意义）
     if (raw.length < 3) return [];
+    // N04：显式关闭 FTS 时，搜索返回明确的「功能关闭」，而不是静默空结果。
+    if (!this.store.ftsEnabled) {
+      throw new MeshUnsupportedError(
+        "FTS search is disabled via createMesh({ fts: false })",
+      );
+    }
     if (!this.hasFts()) return []; // FTS 表缺失：降级为空结果，不抛（迁移缺失的容错）
     // 引号包裹消解 FTS 语法（防注入）；内部引号双写转义；结尾 * 视为前缀通配
     let wildcard = false;
@@ -304,6 +271,8 @@ export class MeshObserver implements Observer {
         reason: (r.parked_reason ??
           r.drop_reason ??
           null) as DeliveryTrace["reason"],
+        note: r.note,
+        redeliverReason: r.redeliver_reason ?? null,
         attempts: r.attempts,
         woke: r.woke === 1,
         path: (r.path as DeliveryTrace["path"]) ?? null,
@@ -452,15 +421,15 @@ export class MeshObserver implements Observer {
       });
       conversations.push(state);
     }
-    conversations.sort((a, b) =>
-      a.lastAt < b.lastAt
-        ? 1
-        : a.lastAt > b.lastAt
-          ? -1
-          : a.conversationId < b.conversationId
-            ? -1
-            : 1,
-    );
+    conversations.sort((a, b) => {
+      const c = this.clock.compare(a.lastAt, b.lastAt);
+      if (c !== 0) return -c;
+      return a.conversationId < b.conversationId
+        ? -1
+        : a.conversationId > b.conversationId
+          ? 1
+          : 0;
+    });
 
     // 待应答（§14）：两边各一份
     const awaitingMyAck = (
@@ -528,7 +497,7 @@ export class MeshObserver implements Observer {
         "SELECT m.id AS mid, d.claim_until AS until FROM mesh_deliveries d " +
           "JOIN mesh_messages m ON m.id = d.message_id " +
           "WHERE m.conversation_id = ? AND d.state = 'claimed' " +
-          "AND json_extract(m.payload, '$.claim.by') = ?",
+          "AND d.claimed_by = ?",
         [cid, accountId],
       ) as Array<{ mid: string; until: string }>
     ).map((r) => ({ messageId: r.mid, leaseIn: deadlineIn(r.until, nowMs) }));
@@ -578,15 +547,15 @@ export class MeshObserver implements Observer {
     };
     for (const r of rows) push(r, jsonParse<Cap[]>(r["caps"] as string, []));
     for (const r of subs) push(r, []);
-    out.sort((a, b) =>
-      a.lastAt < b.lastAt
-        ? 1
-        : a.lastAt > b.lastAt
-          ? -1
-          : a.conversationId < b.conversationId
-            ? -1
-            : 1,
-    );
+    out.sort((a, b) => {
+      const c = this.clock.compare(a.lastAt, b.lastAt);
+      if (c !== 0) return -c;
+      return a.conversationId < b.conversationId
+        ? -1
+        : a.conversationId > b.conversationId
+          ? 1
+          : 0;
+    });
     return out;
   }
 
@@ -728,7 +697,7 @@ export class MeshObserver implements Observer {
     const checks: Array<{
       id: string;
       assertion: string;
-      run: () => Array<Record<string, unknown>>;
+      run: () => Array<Record<string, unknown>> | Promise<Array<Record<string, unknown>>>;
     }> = [
       {
         // C1（I3）同会话 seq 严格递增无洞无重（seq 从 1 起 ⇒ count = max）
@@ -762,7 +731,7 @@ export class MeshObserver implements Observer {
         run: () =>
           this.rows(
             "SELECT id, state, drop_reason FROM mesh_deliveries WHERE " +
-              "(consumed_at IS NOT NULL AND delivered_at IS NULL) OR " +
+              "(consumed_at IS NOT NULL AND delivered_at IS NULL AND partial = 0) OR " +
               "(delivered_at IS NOT NULL AND queued_at IS NULL) OR " +
               "(state = 'consumed' AND consumed_at IS NULL) OR " +
               "(state = 'delivered' AND delivered_at IS NULL) OR " +
@@ -849,11 +818,11 @@ export class MeshObserver implements Observer {
           ),
       },
       {
-        // C10（I1）锁一致：warming/hot/evicting 必须有 lock_path；hot 的锁文件必须存在
+        // C10（I1/I25）锁一致：warming/hot/evicting 必须有 lock_path；hot 的锁必须由活进程持有
         id: "C10",
         assertion:
-          "hot endpoints hold lock_path whose lock file exists on disk",
-        run: () => {
+          "hot endpoints hold lock_path whose owner is live (pid + start-time)",
+        run: async () => {
           const violations = this.rows(
             "SELECT id, state, lock_path FROM mesh_endpoints " +
               "WHERE state IN ('warming','hot','evicting') AND (lock_path IS NULL OR lock_path = '')",
@@ -863,19 +832,43 @@ export class MeshObserver implements Observer {
           );
           for (const row of hot) {
             const p = row["lock_path"] as string | null;
-            let exists = false;
-            try {
-              exists = p !== null && p !== "" && existsSync(p);
-            } catch {
-              exists = false;
-            }
-            if (!exists) {
+            if (p === null || p === "") {
               violations.push({
                 id: row["id"],
                 state: "hot",
                 lock_path: p,
-                issue: "lock file missing on disk",
+                issue: "lock path empty",
               });
+              continue;
+            }
+            if (this.lockLiveness) {
+              // 只把「明确 dead」判违规；alive 通过，unknown（锁损坏/读不到启动时刻）
+              // 保守不判违规（绝不猜，§19.6），交给宿主 reclaim 时告警。
+              const verdict = await this.lockLiveness(p);
+              if (verdict === "dead") {
+                violations.push({
+                  id: row["id"],
+                  state: "hot",
+                  lock_path: p,
+                  issue: "lock owner not live",
+                });
+              }
+            } else {
+              // 退化判定（无宿主注入）：仅校验文件存在，标注为降级口径。
+              let exists = false;
+              try {
+                exists = existsSync(p);
+              } catch {
+                exists = false;
+              }
+              if (!exists) {
+                violations.push({
+                  id: row["id"],
+                  state: "hot",
+                  lock_path: p,
+                  issue: "lock file missing on disk (degraded: no live-owner probe)",
+                });
+              }
             }
           }
           return violations;
@@ -901,15 +894,16 @@ export class MeshObserver implements Observer {
           ),
       },
       {
-        // C13（§17）claimed 不过期（过期必须被 requeue）
+        // C13（§17）claimed/待领 不过期（过期必须被 requeue）
         id: "C13",
-        assertion: "no expired claimed deliveries",
+        assertion: "no expired claimed or delivered queue deliveries",
         run: () =>
           this.rows(
-            "SELECT d.id, d.claim_until FROM mesh_deliveries d " +
+            "SELECT d.id, d.state, d.claim_until FROM mesh_deliveries d " +
               "JOIN mesh_messages m ON m.id = d.message_id " +
               "JOIN mesh_conversations c ON c.id = m.conversation_id " +
-              "WHERE c.type = 'queue' AND d.state = 'claimed' AND d.claim_until < ?",
+              "WHERE c.type = 'queue' AND d.state IN ('claimed','delivered') " +
+              "AND d.claim_until IS NOT NULL AND d.claim_until < ?",
             [now],
           ),
       },
@@ -955,7 +949,7 @@ export class MeshObserver implements Observer {
 
     const violations: InvariantReport["violations"] = [];
     for (const check of checks) {
-      const rows = check.run();
+      const rows = await check.run();
       if (rows.length > 0) {
         violations.push({
           id: check.id,

@@ -85,12 +85,10 @@ interface MsgSeed {
   intent?: string;
   correlationId?: string;
   ext?: unknown;
-  claim?: { by: string; at: string };
 }
 
 function insMsg(db: Database.Database, o: MsgSeed): number {
   const payload: Record<string, unknown> = { text: o.text ?? "body-" + o.seq };
-  if (o.claim !== undefined) payload.claim = o.claim;
   db.prepare(
     "INSERT INTO mesh_messages (id, conversation_id, seq, from_account, kind, expect, priority, " +
       "to_accounts, mentions, correlation_id, intent, routed_at, payload, idempotency_key, ext) " +
@@ -141,6 +139,7 @@ function insDelivery(
     reason?: string;
     parkedAt?: string;
     claimUntil?: string;
+    claimedBy?: string;
     attempts?: number;
   },
 ): void {
@@ -162,8 +161,8 @@ function insDelivery(
   const isDropped = o.state === "dropped";
   db.prepare(
     "INSERT INTO mesh_deliveries (id, message_id, account_id, endpoint_id, grade, woke, state, " +
-      "parked_reason, drop_reason, attempts, claim_until, parked_at, queued_at, delivered_at, consumed_at, " +
-      "state_changed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      "parked_reason, drop_reason, attempts, claim_until, claimed_by, parked_at, queued_at, delivered_at, consumed_at, " +
+      "state_changed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
   ).run(
     o.id,
     o.msg,
@@ -176,6 +175,7 @@ function insDelivery(
     isDropped ? (o.reason ?? "TTL_EXPIRED") : null,
     o.attempts ?? 0,
     o.claimUntil ?? null,
+    o.claimedBy ?? null,
     isParked ? (o.parkedAt ?? now) : null,
     hasQueued || isDropped ? now : null,
     hasDelivered ? now : null,
@@ -475,7 +475,6 @@ describe("MeshObserver.checkInvariants", () => {
       seq: 1,
       from: "a1",
       text: "job",
-      claim: { by: "a1", at: isoNow() },
     });
     insDelivery(db, {
       id: "d-claim",
@@ -483,6 +482,7 @@ describe("MeshObserver.checkInvariants", () => {
       acct: "a1",
       state: "claimed",
       claimUntil: isoFromMs(Date.now() - 60_000),
+      claimedBy: "a1",
     });
     expect(violationIds(await reportIds())).toContain("C13");
   });
@@ -778,7 +778,6 @@ describe("MeshObserver.inboxOf", () => {
       seq: 2,
       from: "a1",
       text: "job2",
-      claim: { by: "a2", at: isoNow() },
     });
     insDelivery(db, { id: "dq1", msg: "q1", acct: "a2", state: "queued" });
     insDelivery(db, {
@@ -787,6 +786,7 @@ describe("MeshObserver.inboxOf", () => {
       acct: "a2",
       state: "claimed",
       claimUntil: isoFromMs(Date.now() + 300_000),
+      claimedBy: "a2",
     });
     const view = await obs.inboxOf("a2");
     const qc = view.conversations.find((c) => c.conversationId === "qc");

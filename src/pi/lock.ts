@@ -59,6 +59,18 @@ async function procStartedAt(pid: number): Promise<string | undefined> {
   }
 }
 
+/** 把读出的原始 JSON 归一成 LockInfo（沿用 acquire 的宽容取值规则） */
+function normalizeLockInfo(parsed: Partial<LockInfo>): LockInfo {
+  return {
+    writerId: parsed.writerId as string,
+    pid: parsed.pid as number,
+    lease: parsed.lease === "shared" ? "shared" : "exclusive",
+    acquiredAt: typeof parsed.acquiredAt === "string" ? parsed.acquiredAt : "",
+    leaseUntil: typeof parsed.leaseUntil === "string" ? parsed.leaseUntil : null,
+    procStartedAt: typeof parsed.procStartedAt === "string" ? parsed.procStartedAt : "",
+  };
+}
+
 export type LockMode = "single" | "multi";
 
 export class LockHeldError extends Error {
@@ -121,34 +133,51 @@ export class EndpointLock {
     return lock;
   }
 
-  /** 读出当前持锁者信息；锁不存在或内容不可解析 ⇒ undefined */
-  static async readInfo(lockPath: string): Promise<LockInfo | undefined> {
+  /** 锁文件读结果的判别联合（I04：区分缺失 / 损坏 / 不可读 / 正常，绝不把坏文件当「无主」） */
+  static async inspect(
+    lockPath: string,
+  ): Promise<
+    | { status: "missing" }
+    | { status: "corrupted" }
+    | { status: "unreadable"; error: unknown }
+    | { status: "ok"; info: LockInfo }
+  > {
+    let text: string;
     try {
-      const parsed = JSON.parse(await readFile(lockPath, "utf8")) as Partial<LockInfo>;
-      if (typeof parsed.writerId !== "string" || typeof parsed.pid !== "number") return undefined;
-      return {
-        writerId: parsed.writerId,
-        pid: parsed.pid,
-        lease: parsed.lease === "shared" ? "shared" : "exclusive",
-        acquiredAt: typeof parsed.acquiredAt === "string" ? parsed.acquiredAt : "",
-        leaseUntil: typeof parsed.leaseUntil === "string" ? parsed.leaseUntil : null,
-        procStartedAt: typeof parsed.procStartedAt === "string" ? parsed.procStartedAt : "",
-      };
-    } catch {
-      return undefined;
+      text = await readFile(lockPath, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { status: "missing" };
+      return { status: "unreadable", error: err };
     }
+    let parsed: Partial<LockInfo>;
+    try {
+      parsed = JSON.parse(text) as Partial<LockInfo>;
+    } catch {
+      return { status: "corrupted" };
+    }
+    if (typeof parsed.writerId !== "string" || typeof parsed.pid !== "number") {
+      return { status: "corrupted" };
+    }
+    return { status: "ok", info: normalizeLockInfo(parsed) };
+  }
+
+  /** 读出当前持锁者信息；锁不存在或内容不可解析 ⇒ undefined（抢锁 EEXIST 分支沿用此语义） */
+  static async readInfo(lockPath: string): Promise<LockInfo | undefined> {
+    const r = await EndpointLock.inspect(lockPath);
+    return r.status === "ok" ? r.info : undefined;
   }
 
   /**
    * 死写者判定（§27.4 / M-R10）：锁文件的持有者是否「进程真的不存在」。
-   * - "dead"：pid 不存在（kill -0 失败），或其启动时刻与记录不符（pid 已被复用）——允许接管。
+   * - "dead"：锁文件缺失，或 pid 不存在（kill -0 失败），或其启动时刻与记录不符（pid 已被复用）——允许接管。
    * - "alive"：pid 存活且启动时刻吻合——另一活进程持有，拒绝接管。
-   * - "unknown"：读到 pid 存活但取不到启动时刻，无法排除 pid 复用——保守拒绝，绝不猜（M3）。
-   * 锁文件不存在或不可读 ⇒ "dead"（无持有者）。
+   * - "unknown"：锁文件损坏 / 不可读，或读到 pid 存活但取不到启动时刻——两个判据取不齐，保守拒绝，绝不猜（§19.6）。
    */
   static async ownerIsLive(lockPath: string): Promise<"alive" | "dead" | "unknown"> {
-    const info = await EndpointLock.readInfo(lockPath);
-    if (!info) return "dead";
+    const r = await EndpointLock.inspect(lockPath);
+    if (r.status === "missing") return "dead";
+    if (r.status === "corrupted" || r.status === "unreadable") return "unknown";
+    const info = r.info;
     if (!(await pidAlive(info.pid))) return "dead";
     if (!info.procStartedAt) return "unknown"; // 旧锁没有启动时刻，无法比对
     const cur = await procStartedAt(info.pid);
@@ -195,6 +224,14 @@ export class EndpointLock {
   async refresh(leaseTtlMs: number): Promise<void> {
     if (this.released) return;
     if (this.lease === "exclusive") this.leaseUntilMs = Date.now() + leaseTtlMs;
+    await writeFile(this.lockPath, JSON.stringify(this.info(), null, 2)).catch(() => {});
+  }
+
+  /** 改写持有租约（I16：exclusive 升降级后锁文件与内存租约同步；重写 lease / leaseUntil） */
+  async setLease(lease: MeshLease, leaseTtlMs?: number): Promise<void> {
+    if (this.released) return;
+    this.lease = lease;
+    this.leaseUntilMs = lease === "exclusive" ? Date.now() + (leaseTtlMs ?? 60_000) : null;
     await writeFile(this.lockPath, JSON.stringify(this.info(), null, 2)).catch(() => {});
   }
 

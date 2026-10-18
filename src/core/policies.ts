@@ -29,6 +29,7 @@ import type {
   Limits,
   LogicalClock,
   Policies,
+  PolicyDegradeReason,
   PolicySlot,
   PresenceState,
   RetentionPolicy,
@@ -45,7 +46,7 @@ export interface PolicyTimeoutDeps {
   timeoutMs: number;
   degradedTo: DegradeTarget;
   onDegraded: (
-    reason: "timeout" | "threw",
+    reason: PolicyDegradeReason,
     slot: PolicySlot,
     degradedTo: DegradeTarget,
   ) => void;
@@ -53,12 +54,14 @@ export interface PolicyTimeoutDeps {
 
 /**
  * 包装一个策略调用：同步槽直接执行；异步槽与超时竞速。
- * 抛错 / 超时 → 返回 fallback 并回调 onDegraded（由装配层发 policy_degraded 事件 + 计数器）。
+ * 抛错 / 超时 / 返回值非法（`isValid` 判定，I21/C03）→ 返回 fallback 并回调
+ * onDegraded（由装配层发 policy_degraded 事件 + 计数器）。
  */
 export async function withPolicyTimeout<T>(
   deps: PolicyTimeoutDeps,
   fn: () => T | Promise<T>,
   fallback: T,
+  isValid?: (v: T) => boolean,
 ): Promise<T> {
   const timer = new Promise<"timeout">((resolve) => {
     const t = setTimeout(() => resolve("timeout"), deps.timeoutMs);
@@ -76,6 +79,10 @@ export async function withPolicyTimeout<T>(
     deps.onDegraded("threw", deps.slot, deps.degradedTo);
     return fallback;
   }
+  if (isValid !== undefined && !isValid(result)) {
+    deps.onDegraded("illegal", deps.slot, deps.degradedTo);
+    return fallback;
+  }
   return result;
 }
 
@@ -84,13 +91,20 @@ export function withPolicyGuard<T>(
   deps: PolicyTimeoutDeps,
   fn: () => T,
   fallback: T,
+  isValid?: (v: T) => boolean,
 ): T {
+  let result: T;
   try {
-    return fn();
+    result = fn();
   } catch {
     deps.onDegraded("threw", deps.slot, deps.degradedTo);
     return fallback;
   }
+  if (isValid !== undefined && !isValid(result)) {
+    deps.onDegraded("illegal", deps.slot, deps.degradedTo);
+    return fallback;
+  }
+  return result;
 }
 
 // ─── ① DeliveryPolicy：§7.2 档位映射矩阵 ─────────────────────────────────
@@ -229,6 +243,34 @@ export class WallClockLogicalClock implements LogicalClock {
   }
 }
 
+/**
+ * ⑤ 逻辑钟守卫（N05）：同步槽，走 withPolicyGuard（不可超时）。compare 需返回
+ * 有限数、format 需返回字符串，任一抛错/非法 → 降级墙钟（degradedTo="wallclock"）。
+ * clock 缺 format 时按恒等（ts 原样）处理。
+ */
+export function guardClock(
+  deps: PolicyTimeoutDeps,
+  clock: LogicalClock,
+): LogicalClock {
+  const wall = new WallClockLogicalClock();
+  return {
+    compare: (a, b) =>
+      withPolicyGuard(
+        deps,
+        () => clock.compare(a, b),
+        wall.compare(a, b),
+        (v) => typeof v === "number" && Number.isFinite(v),
+      ),
+    format: (ts) =>
+      withPolicyGuard(
+        deps,
+        () => (clock.format ?? ((x: string) => x))(ts),
+        wall.format(ts),
+        (v) => typeof v === "string",
+      ),
+  };
+}
+
 // ─── ⑥ AccessControl：全部放行（caps / Acl 仍由库内建判定生效）─────────
 
 export class AllowAllAccessControl implements AccessControl {
@@ -310,31 +352,38 @@ export class TopologyEndpointSelector implements EndpointSelector {
       case "unified":
         return eps[0]!.id;
       case "pooled": {
+        // I15：只按 pooled 端点分片（eps 里可能混有 unified/perConversation），
+        // 分片基数用 ctx.topology.size（持久化的池大小），不再按 eps.length。
+        const pooledEps = eps.filter((e) => e.topology.kind === "pooled");
+        if (pooledEps.length === 0) return null;
         if (ctx.topology.affinity === "none" || !ctx.topology.affinity) {
           // 取当前 inFlight 最小的一条（§8.1 表）
-          let best = eps[0]!;
-          for (const e of eps) if (e.inFlight < best.inFlight) best = e;
+          let best = pooledEps[0]!;
+          for (const e of pooledEps) if (e.inFlight < best.inFlight) best = e;
           return best.id;
         }
         const anchor =
           ctx.topology.affinity === "sender"
             ? ctx.envelope.from
             : ctx.conversationId;
-        const idx = sha256Hex(anchor).codePointAt(0)! % eps.length;
-        return eps[idx]!.id;
+        // id 有序（registry.endpointsOf ORDER BY id）→ 分片稳定，无需暴露 slot
+        const idx =
+          sha256Hex(anchor).codePointAt(0)! %
+          Math.max(1, Math.min(ctx.topology.size, pooledEps.length));
+        return pooledEps[idx]!.id;
       }
       case "perConversation": {
-        // §8.1：endpointId = hash(accountId, key)。key = 会话（scope="conversation"）或
-        // 用途（scope="purpose" ← requestType）。注册端点带 scope_key（ux_endpoint_percv
-        // 唯一）→ 先精确命中；无命中则在 perConversation 端点里按 hash 稳定选一条兜底。
+        // §8.1：endpointId = 精确命中 account + scope + key（ux_endpoint_percv 唯一）。
+        // C05：无命中 → null（park），取消跨端点 hash 兜底与「回退首条」。
         const scope = ctx.topology.scope ?? "conversation";
         const key = scope === "purpose" ? (ctx.envelope.requestType ?? ctx.envelope.kind) : ctx.conversationId;
-        const percv = eps.filter((e) => e.topology.kind === "perConversation");
-        if (percv.length === 0) return eps[0]!.id; // 账号未按 perConversation 注册 ⇒ 回退首条
-        const exact = percv.find((e) => e.topology.kind === "perConversation" && e.topology.key === key);
-        if (exact) return exact.id;
-        const idx = sha256Hex(`${ctx.accountId}:${key}`).codePointAt(0)! % percv.length;
-        return percv[idx]!.id;
+        const exact = eps.find(
+          (e) =>
+            e.topology.kind === "perConversation" &&
+            e.topology.scope === scope &&
+            e.topology.key === key,
+        );
+        return exact ? exact.id : null;
       }
       default:
         return eps[0]!.id;

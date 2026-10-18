@@ -11,8 +11,9 @@
 //
 // 注意：若宿主自己先静态 import 了 pi，本卫兵来不及生效——集成契约要求
 // mesh-pi 必须先于宿主的 pi import 被加载（或宿主自行设 TERMUX_VERSION）。
-// pi 是 optional peerDependency：类型解析依赖本地安装，运行时缺失时
-// loadPiSdk() 抛出带指引的错误。
+// pi 已是直接依赖（LD3，^1.1.0；覆盖 C07 的 optional peer），随包安装；
+// 但为保住「core-only 用户不加载 pi」的硬门槛，仍须经 loadPiSdk() 惰性加载——
+// 根/core 入口静态 import pi 都属于边界泄漏（离线消费者冒烟会抓住）。
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** pi SDK 的模块面（type-only，编译期擦除，不构成运行时依赖） */
@@ -30,9 +31,10 @@ export async function loadPiSdk(): Promise<PiSdk> {
     cached = (await import("@earendil-works/pi-coding-agent")) as PiSdk;
   } catch (err) {
     throw new Error(
-      "mesh-pi: failed to load optional peer @earendil-works/pi-coding-agent — " +
-        "install it (npm i @earendil-works/pi-coding-agent) or provide your own " +
-        `sessionFactory / StreamPort. Cause: ${err instanceof Error ? err.message : String(err)}`,
+      "mesh-pi: failed to load @earendil-works/pi-coding-agent (direct dependency, " +
+        "loaded lazily) — " +
+        "reinstall with `npm i`, or provide your own sessionFactory / StreamPort. " +
+        `Cause: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
   return cached;

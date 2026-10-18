@@ -113,6 +113,7 @@ beforeEach(async () => {
   degraded = [];
   const factory = await createTestFactory(faux, dir);
   port = new PiStreamPort({
+    writerId: "test-writer",
     sessionFactory: factory,
     getEndpoint: (id) => endpoints.get(id),
     getAccount: (id) => accounts.get(id),
@@ -171,6 +172,7 @@ describe("PiStreamPort: warm 与 .lock 单写者（M3 / §8.4①）", () => {
     // 独立第二个 port（另一进程/实例的模拟）
     const factory2 = await createTestFactory(faux, dir);
     const port2 = new PiStreamPort({
+      writerId: "test-writer-2",
       sessionFactory: factory2,
       getEndpoint: (id) => endpoints.get(id),
       getAccount: (id) => accounts.get(id),
@@ -193,6 +195,7 @@ describe("PiStreamPort: warm 与 .lock 单写者（M3 / §8.4①）", () => {
   it("exclusive 租约有 leaseUntil；TTL 超时强制释放为 shared 并报降级", async () => {
     const ep = addEndpoint();
     const shortTtl = new PiStreamPort({
+      writerId: "test-writer",
       sessionFactory: await createTestFactory(faux, dir),
       getEndpoint: (id) => endpoints.get(id),
       getAccount: (id) => accounts.get(id),
@@ -415,6 +418,7 @@ describe("PiStreamPort: lock_path 归属落库（§19.4 / C10）", () => {
     // 用真实注册表语义的 setEndpointLock：记录到 Map，供断言
     const factory = await createTestFactory(faux, dir);
     const tracking = new PiStreamPort({
+      writerId: "test-writer",
       sessionFactory: factory,
       getEndpoint: (id) => endpoints.get(id),
       getAccount: (id) => accounts.get(id),

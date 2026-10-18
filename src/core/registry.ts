@@ -26,7 +26,7 @@ import type {
   RegisterEndpointInput,
   StreamTopology,
 } from "./types.js";
-import { DEFAULT_LIMITS, type Limits } from "./types.js";
+import { DEFAULT_LIMITS, MeshRejectError, type Limits } from "./types.js";
 import {
   directConversationId,
   isoNow,
@@ -89,6 +89,8 @@ interface EndpointRow {
   scope: string | null;
   scope_key: string | null;
   pool_slot: number | null;
+  pool_size: number | null;
+  pool_affinity: string | null;
   pi_session_id: string | null;
   lease_mode: string;
   lease_until: string | null;
@@ -146,7 +148,13 @@ function rowToEndpoint(r: EndpointRow): Endpoint {
           key: r.scope_key ?? "",
         }
       : r.topology === "pooled"
-        ? { kind: "pooled", size: 1, affinity: "none" }
+        ? {
+            kind: "pooled",
+            // I15：读回持久化的分片基数与亲和（legacy 行 NULL ⇒ size=1/affinity="none"，
+            // 语义等价于迁移前的「单槽位、无亲和」回退，不改变历史行为）。
+            size: r.pool_size ?? 1,
+            affinity: (r.pool_affinity ?? "none") as "none" | "conversation" | "sender",
+          }
         : { kind: "unified" };
   return {
     id: r.id,
@@ -194,7 +202,11 @@ function normalizeConfig(
     maxHistoryOnJoin: c.maxHistoryOnJoin ?? 0,
     openJoin: c.openJoin ?? false,
     groupSizeHardCap: hardCap,
-    claimTtlMs: c.claimTtlMs ?? limits.claimTtlMs,
+    // I30：claimTtlMs 只允许在 [1000, 全局上限] 内收紧/放宽到合理范围
+    claimTtlMs: Math.min(
+      Math.max(c.claimTtlMs ?? limits.claimTtlMs, 1000),
+      limits.claimTtlMs,
+    ),
     mentionAllPerHour: c.mentionAllPerHour ?? 3,
     maxPending: Math.min(c.maxPending ?? limits.maxPending, limits.maxPending),
     maxPendingBytes: Math.min(
@@ -209,10 +221,35 @@ function normalizeConfig(
 export class MeshRegistry implements Registry {
   private readonly db: Database.Database;
   private readonly limits: Limits;
+  /** §15.2：由宿主注入的端点状态聚合（core 零 pi；index.ts 接 StreamPort.status） */
+  private deriveStatus?: (accountId: AccountId) => {
+    busy: boolean;
+    idleMs?: number;
+  };
 
-  constructor(db: Database.Database, limits: Limits = DEFAULT_LIMITS) {
+  constructor(
+    db: Database.Database,
+    limits: Limits = DEFAULT_LIMITS,
+    opts?: {
+      deriveStatus?: (accountId: AccountId) => {
+        busy: boolean;
+        idleMs?: number;
+      };
+    },
+  ) {
     this.db = db;
     this.limits = limits;
+    this.deriveStatus = opts?.deriveStatus;
+  }
+
+  /**
+   * 在场派生的端口状态源（§15.2）。端口在 registry 之后构建，故延后注入；
+   * 注入函数应永不抛错（derivePresence 内部已 try/catch 兜底）。
+   */
+  setDeriveStatus(
+    fn: (accountId: AccountId) => { busy: boolean; idleMs?: number },
+  ): void {
+    this.deriveStatus = fn;
   }
 
   // ── 账号 ──
@@ -275,17 +312,64 @@ export class MeshRegistry implements Registry {
     return accounts;
   }
 
-  /** 有效 presence（presence_until 过期按 offline 解释，§11.1；库不起定时器改写） */
+  /**
+   * 有效 presence（§15.2）：显式（presence_explicit=1 且 until 未过期）→ 宿主值胜出；
+   * 否则按端点状态派生。库不起定时器改写——过期回落由读取方即时评估。
+   */
   effectivePresence(id: AccountId): PresenceState {
     const row = this.db
-      .prepare<[string], { presence: string; presence_until: string | null }>(
-        "SELECT presence, presence_until FROM mesh_accounts WHERE id = ?",
+      .prepare<
+        [string],
+        {
+          presence: string;
+          presence_until: string | null;
+          presence_explicit: number;
+        }
+      >(
+        "SELECT presence, presence_until, presence_explicit FROM mesh_accounts WHERE id = ?",
       )
       .get(id);
     if (!row) return "offline";
-    if (row.presence_until && Date.parse(row.presence_until) < Date.now())
-      return "offline";
-    return row.presence as PresenceState;
+    const expired =
+      row.presence_until !== null && Date.parse(row.presence_until) < Date.now();
+    if (row.presence_explicit === 1 && !expired) {
+      return row.presence as PresenceState;
+    }
+    return this.derivePresence(id);
+  }
+
+  /**
+   * §15.2 派生：仅 stream 参与；任一端点 hot ⇒ 在线族（busy/online/idle），
+   * 全冷/无端点 ⇒ offline；sink/external 无端点默认 online。
+   */
+  private derivePresence(id: AccountId): PresenceState {
+    const account = this.getAccount(id);
+    const hot = this.endpointsOf(id).filter((e) => e.state === "hot");
+    if (hot.length === 0) {
+      // sink/external 无「冷/热」概念，默认 online；stream 全冷 ⇒ offline
+      return account && account.endpointClass !== "stream" ? "online" : "offline";
+    }
+    const st = this.safeDeriveStatus(id);
+    if (st?.busy) return "busy";
+    let idleMs = st?.idleMs;
+    if (idleMs === undefined) {
+      const lastActive = hot.reduce<number>((acc, e) => {
+        const t = e.lastActiveAt ? Date.parse(e.lastActiveAt) : NaN;
+        return Number.isNaN(t) ? acc : Math.max(acc, t);
+      }, 0);
+      idleMs = lastActive === 0 ? 0 : Date.now() - lastActive;
+    }
+    return idleMs >= this.limits.presenceIdleMs ? "idle" : "online";
+  }
+
+  private safeDeriveStatus(id: AccountId):
+    | { busy: boolean; idleMs?: number }
+    | undefined {
+    try {
+      return this.deriveStatus?.(id);
+    } catch {
+      return undefined; // 端口状态读取失败 ⇒ 不参与 busy/idle（回落 last_active_at / online）
+    }
   }
 
   setPresence(
@@ -293,13 +377,25 @@ export class MeshRegistry implements Registry {
     state: PresenceState,
     opts?: { until?: string; reason?: string },
   ): void {
-    const before = this.effectivePresence(id);
     this.db
       .prepare(
-        "UPDATE mesh_accounts SET presence = ?, presence_until = ?, presence_reason = ? WHERE id = ?",
+        "UPDATE mesh_accounts SET presence = ?, presence_until = ?, presence_reason = ?, presence_explicit = 1 WHERE id = ?",
       )
       .run(state, opts?.until ?? null, opts?.reason ?? null, id);
-    return void { before };
+  }
+
+  /** presence 当前是否由宿主显式设定且在有效期内（§15.2 优先级判定辅助） */
+  isExplicitPresence(id: AccountId): boolean {
+    const row = this.db
+      .prepare<
+        [string],
+        { presence_until: string | null; presence_explicit: number }
+      >(
+        "SELECT presence_until, presence_explicit FROM mesh_accounts WHERE id = ?",
+      )
+      .get(id);
+    if (!row || row.presence_explicit !== 1) return false;
+    return row.presence_until === null || Date.parse(row.presence_until) >= Date.now();
   }
 
   upsertContact(
@@ -359,10 +455,15 @@ export class MeshRegistry implements Registry {
   registerEndpoint(e: RegisterEndpointInput): Promise<Endpoint> {
     const id = ulid();
     const t = e.topology;
+    const pooled = t.kind === "pooled";
+    // I15：pooled 的 size/affinity 落列、slot 按同账号已有 pooled 条数自动递增
+    // （标量子查询与 INSERT 同一语句原子执行，无需嵌套事务）；非 pooled 三列全 NULL。
     this.db
       .prepare(
         "INSERT INTO mesh_endpoints (id, account_id, topology, scope, scope_key, pool_slot, " +
-          "pi_session_id, state, last_active_at) VALUES (?,?,?,?,?,?,?,?,?)",
+          "pool_size, pool_affinity, pi_session_id, state, last_active_at) " +
+          "VALUES (?,?,?,?,?, CASE WHEN ? THEN (SELECT COUNT(*) FROM mesh_endpoints " +
+          "WHERE account_id = ? AND topology = 'pooled') ELSE NULL END, ?,?,?,?,?)",
       )
       .run(
         id,
@@ -370,7 +471,10 @@ export class MeshRegistry implements Registry {
         t.kind,
         t.kind === "perConversation" ? (t as { scope: string }).scope : null,
         t.kind === "perConversation" ? (t as { key: string }).key : null,
-        null,
+        pooled ? 1 : 0,
+        e.accountId,
+        pooled ? (t as { size: number }).size : null,
+        pooled ? ((t as { affinity?: string }).affinity ?? "none") : null,
         e.piSessionId ?? null,
         "cold",
         null,
@@ -429,10 +533,11 @@ export class MeshRegistry implements Registry {
       .run(lockPath, id);
   }
 
-  /** pooled 拓扑注册 size 条端点 */
+  /** pooled 拓扑注册 size 条端点（I15：槽 0..size-1 各自落 slot + 共同的 size/affinity） */
   registerPooledEndpoints(
     accountId: AccountId,
     size: number,
+    affinity: "none" | "conversation" | "sender" = "none",
     piSessionIds?: string[],
   ): Promise<Endpoint[]> {
     const out: Endpoint[] = [];
@@ -440,9 +545,10 @@ export class MeshRegistry implements Registry {
       const id = ulid();
       this.db
         .prepare(
-          "INSERT INTO mesh_endpoints (id, account_id, topology, pool_slot, pi_session_id, state) VALUES (?,?,?,?,?,?)",
+          "INSERT INTO mesh_endpoints (id, account_id, topology, pool_slot, pool_size, " +
+            "pool_affinity, pi_session_id, state) VALUES (?,?,?,?,?,?,?,?)",
         )
-        .run(id, accountId, "pooled", i, piSessionIds?.[i] ?? null, "cold");
+        .run(id, accountId, "pooled", i, size, affinity, piSessionIds?.[i] ?? null, "cold");
       out.push(this.getEndpoint(id)!);
     }
     return Promise.resolve(out);
@@ -454,71 +560,79 @@ export class MeshRegistry implements Registry {
     const id = directConversationId(a, b);
     const existing = this.getConversation(id);
     if (existing) return Promise.resolve(existing);
-    const now = isoNow();
-    this.db
-      .prepare(
-        "INSERT OR IGNORE INTO mesh_conversations (id, type, config, next_seq, member_count, created_by, created_at) " +
-          "VALUES (?,?,?,?,?,?,?)",
-      )
-      .run(
-        id,
-        "direct",
-        JSON.stringify({ historyVisibility: "full" }),
-        1,
-        2,
-        a,
-        now,
+    // I18/I30：会话行 + 双方成员 + 两行 inbox 单事务；config 写时钳制（normalizeConfig）
+    const config = jsonText(
+      normalizeConfig("direct", { historyVisibility: "full" }, this.limits),
+    )!;
+    const tx = this.db.transaction(() => {
+      const now = isoNow();
+      this.db
+        .prepare(
+          "INSERT OR IGNORE INTO mesh_conversations (id, type, config, next_seq, member_count, created_by, created_at) " +
+            "VALUES (?,?,?,?,?,?,?)",
+        )
+        .run(id, "direct", config, 1, 2, a, now);
+      const joinedSeq = 0; // direct 双方从 0 起可见（历史全可见，§9.4 config.full）
+      const caps = jsonText(["speak", "read"])!;
+      const ins = this.db.prepare(
+        "INSERT OR IGNORE INTO mesh_memberships (conversation_id, account_id, caps, joined_seq, joined_at) VALUES (?,?,?,?,?)",
       );
-    const joinedSeq = 0; // direct 双方从 0 起可见（历史全可见，§9.4 config.full）
-    const caps = jsonText(["speak", "read"])!;
-    this.db
-      .prepare(
-        "INSERT OR IGNORE INTO mesh_memberships (conversation_id, account_id, caps, joined_seq, joined_at) VALUES (?,?,?,?,?)",
-      )
-      .run(id, a, caps, joinedSeq, now);
-    this.db
-      .prepare(
-        "INSERT OR IGNORE INTO mesh_memberships (conversation_id, account_id, caps, joined_seq, joined_at) VALUES (?,?,?,?,?)",
-      )
-      .run(id, b, caps, joinedSeq, now);
-    // 直接触发 ensureDirect 的场景是普通发送：两行 inbox 预建，避免 fanout 时补建
-    this.ensureInboxRow(a, id);
-    this.ensureInboxRow(b, id);
+      ins.run(id, a, caps, joinedSeq, now);
+      ins.run(id, b, caps, joinedSeq, now);
+      // 直接触发 ensureDirect 的场景是普通发送：两行 inbox 预建，避免 fanout 时补建
+      this.ensureInboxRow(a, id);
+      this.ensureInboxRow(b, id);
+    });
+    tx();
     return Promise.resolve(this.getConversation(id)!);
   }
 
   createConversation(c: CreateConversationInput): Promise<Conversation> {
-    const id = ulid();
-    const now = isoNow();
+    if (!this.getAccount(c.creator)) {
+      throw new MeshRejectError("NOT_A_MEMBER", "unknown creator: " + c.creator);
+    }
     const members =
       c.type === "topic"
         ? []
         : Array.from(new Set([c.creator, ...(c.members ?? [])]));
-    this.db
-      .prepare(
-        "INSERT INTO mesh_conversations (id, type, topic, announcement, config, next_seq, member_count, created_by, created_at, ext) " +
-          "VALUES (?,?,?,?,?,?,?,?,?,?)",
-      )
-      .run(
-        id,
-        c.type,
-        c.topic ?? null,
-        null,
-        jsonText(c.config ?? {}) ?? "{}",
-        1,
-        members.length,
-        c.creator,
-        now,
-        c.ext === undefined ? null : JSON.stringify(c.ext),
-      );
-    if (c.type !== "topic") {
-      const joinedSeq = 0;
-      const stmt = this.db.prepare(
-        "INSERT INTO mesh_memberships (conversation_id, account_id, caps, joined_seq, joined_at) VALUES (?,?,?,?,?)",
-      );
-      const creatorCaps = jsonText([...ALL_CAPS])!;
-      const memberCaps = jsonText(["speak", "read"])!;
-      const tx = this.db.transaction(() => {
+    // I18：groupSizeHardCap 在建群时即生效（超 → 无半结构，一并拒绝）
+    const config = normalizeConfig(c.type, c.config ?? {}, this.limits);
+    if (c.type === "group") {
+      const hardCap = config.groupSizeHardCap ?? this.limits.groupSizeHardCap;
+      if (members.length > hardCap) {
+        throw new MeshRejectError(
+          "FANOUT_TOO_LARGE",
+          "group size " + members.length + " > hard cap " + hardCap,
+        );
+      }
+    }
+    const id = ulid();
+    const tx = this.db.transaction(() => {
+      const now = isoNow();
+      this.db
+        .prepare(
+          "INSERT INTO mesh_conversations (id, type, topic, announcement, config, next_seq, member_count, created_by, created_at, ext) " +
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        )
+        .run(
+          id,
+          c.type,
+          c.topic ?? null,
+          null,
+          jsonText(config) ?? "{}",
+          1,
+          members.length,
+          c.creator,
+          now,
+          c.ext === undefined ? null : JSON.stringify(c.ext),
+        );
+      if (c.type !== "topic") {
+        const joinedSeq = 0;
+        const stmt = this.db.prepare(
+          "INSERT INTO mesh_memberships (conversation_id, account_id, caps, joined_seq, joined_at) VALUES (?,?,?,?,?)",
+        );
+        const creatorCaps = jsonText([...ALL_CAPS])!;
+        const memberCaps = jsonText(["speak", "read"])!;
         for (const m of members) {
           stmt.run(
             id,
@@ -529,9 +643,9 @@ export class MeshRegistry implements Registry {
           );
           this.ensureInboxRow(m, id);
         }
-      });
-      tx();
-    }
+      }
+    });
+    tx();
     return Promise.resolve(this.getConversation(id)!);
   }
 
@@ -561,28 +675,31 @@ export class MeshRegistry implements Registry {
   // ── 成员 ──
 
   addMember(conv: ConversationId, account: AccountId, caps: Cap[]): void {
-    const joinedSeq = this.currentSeq(conv);
-    const existing = this.db
-      .prepare<[string, string], { n: number }>(
-        "SELECT COUNT(*) AS n FROM mesh_memberships WHERE conversation_id = ? AND account_id = ?",
-      )
-      .get(conv, account);
-    if (existing && existing.n > 0) {
-      // 退群后重新加入：更新 joined_seq（§9.4——第二次加入看不到中间那段）
-      this.db
-        .prepare(
-          "UPDATE mesh_memberships SET left_at = NULL, joined_seq = ?, joined_at = ?, caps = ? WHERE conversation_id = ? AND account_id = ?",
+    const tx = this.db.transaction(() => {
+      const joinedSeq = this.currentSeq(conv);
+      const existing = this.db
+        .prepare<[string, string], { n: number }>(
+          "SELECT COUNT(*) AS n FROM mesh_memberships WHERE conversation_id = ? AND account_id = ?",
         )
-        .run(joinedSeq, isoNow(), jsonText(caps)!, conv, account);
-    } else {
-      this.db
-        .prepare(
-          "INSERT INTO mesh_memberships (conversation_id, account_id, caps, joined_seq, joined_at) VALUES (?,?,?,?,?)",
-        )
-        .run(conv, account, jsonText(caps)!, joinedSeq, isoNow());
-    }
-    this.ensureInboxRow(account, conv);
-    this.refreshMemberCount(conv);
+        .get(conv, account);
+      if (existing && existing.n > 0) {
+        // 退群后重新加入：更新 joined_seq（§9.4——第二次加入看不到中间那段）
+        this.db
+          .prepare(
+            "UPDATE mesh_memberships SET left_at = NULL, joined_seq = ?, joined_at = ?, caps = ? WHERE conversation_id = ? AND account_id = ?",
+          )
+          .run(joinedSeq, isoNow(), jsonText(caps)!, conv, account);
+      } else {
+        this.db
+          .prepare(
+            "INSERT INTO mesh_memberships (conversation_id, account_id, caps, joined_seq, joined_at) VALUES (?,?,?,?,?)",
+          )
+          .run(conv, account, jsonText(caps)!, joinedSeq, isoNow());
+      }
+      this.ensureInboxRow(account, conv);
+      this.refreshMemberCount(conv);
+    });
+    tx();
   }
 
   removeMember(conv: ConversationId, account: AccountId): void {
@@ -626,27 +743,17 @@ export class MeshRegistry implements Registry {
     const rows = this.db
       .prepare<
         [string],
-        MembershipRow & { display_name: string; presence: string }
+        MembershipRow & { display_name: string }
       >(
-        "SELECT ms.*, a.display_name, a.presence, a.presence_until FROM mesh_memberships ms " +
+        "SELECT ms.*, a.display_name FROM mesh_memberships ms " +
           "JOIN mesh_accounts a ON a.id = ms.account_id WHERE ms.conversation_id = ? AND ms.left_at IS NULL ORDER BY ms.joined_at",
       )
-      .all(conv) as Array<
-      MembershipRow & {
-        display_name: string;
-        presence: string;
-        presence_until: string | null;
-      }
-    >;
-    const now = Date.now();
+      .all(conv) as Array<MembershipRow & { display_name: string }>;
     return rows.map((r) => ({
       accountId: r.account_id,
       displayName: r.display_name,
       caps: jsonParse<Cap[]>(r.caps, []),
-      presence:
-        r.presence_until && Date.parse(r.presence_until) < now
-          ? ("offline" as const)
-          : (r.presence as MemberRow["presence"]),
+      presence: this.effectivePresence(r.account_id),
     }));
   }
 
@@ -727,10 +834,11 @@ export class MeshRegistry implements Registry {
 
   subscribe(conv: ConversationId, account: AccountId, fromSeq: number): void {
     const now = isoNow();
+    // I13：订阅幂等——重复订阅保留原 from_seq（退订后重订只清除退订标记，不重置起点）
     this.db
       .prepare(
         "INSERT INTO mesh_subscriptions (conversation_id, account_id, from_seq, subscribed_at) VALUES (?,?,?,?) " +
-          "ON CONFLICT(conversation_id, account_id) DO UPDATE SET from_seq = excluded.from_seq, subscribed_at = excluded.subscribed_at, unsubscribed_at = NULL",
+          "ON CONFLICT(conversation_id, account_id) DO UPDATE SET unsubscribed_at = NULL",
       )
       .run(conv, account, fromSeq, now);
     this.ensureInboxRow(account, conv);

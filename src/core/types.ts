@@ -29,7 +29,15 @@ export type ConversationKind = "direct" | "group" | "topic" | "queue"; // 无 sy
 export type ConversationType = ConversationKind; // 同义别名
 export type ConvState = "active" | "archived";
 export type EndpointState = "cold" | "warming" | "hot" | "evicting" | "unavailable";
-export type PresenceState = "available" | "busy" | "dnd" | "away" | "offline";
+// §15：online/idle 为派生态（§15.2）；available/away 为 legacy 别名（H：W16 重命名收敛）
+export type PresenceState =
+  | "available"
+  | "busy"
+  | "dnd"
+  | "away"
+  | "online"
+  | "idle"
+  | "offline";
 export type DeliveryState =
   | "routed"
   | "queued"
@@ -42,50 +50,59 @@ export type DeliveryState =
 export type ContextPath = "P1" | "P2" | "P3"; // §7.6 三条进上下文路径
 
 // 三类原因码（§7.10 权威表的类型化）。三类之间不得复用同一个词。
-export type RejectCode =
-  | "NOT_A_MEMBER"
-  | "NO_SPEAK_CAP"
-  | "CANNOT_INITIATE"
-  | "TARGETING_NOT_SUPPORTED"
-  | "FANOUT_TOO_LARGE"
-  | "MENTION_ALL_THROTTLED"
-  | "NO_FLOOR"
-  | "JOIN_DENIED"
-  | "NO_ADMIN_LEFT"
-  | "REQUEST_CYCLE";
+// W01 冻结：权威源 = 下面的 const 数组，类型与运行时登记表都从它派生，杜绝二次字面量漂移。
+export const REJECT_CODES = [
+  "NOT_A_MEMBER",
+  "NO_SPEAK_CAP",
+  "CANNOT_INITIATE",
+  "TARGETING_NOT_SUPPORTED",
+  "FANOUT_TOO_LARGE",
+  "MENTION_ALL_THROTTLED",
+  "NO_FLOOR",
+  "JOIN_DENIED",
+  "NO_ADMIN_LEFT",
+  "REQUEST_CYCLE",
+] as const;
+export type RejectCode = (typeof REJECT_CODES)[number];
 
-export type ParkReason =
-  | "ENDPOINT_GONE"
-  | "LEASE_HELD"
-  | "NO_SINK_HANDLER"
-  | "SINK_REFUSED"
-  | "PORT_TIMEOUT"
-  | "NO_SESSION"; // 唯一要告警的一个
+export const PARK_REASONS = [
+  "ENDPOINT_GONE",
+  "LEASE_HELD",
+  "NO_SINK_HANDLER",
+  "SINK_REFUSED",
+  "PORT_TIMEOUT",
+  "NO_SESSION", // 唯一要告警的一个
+] as const;
+export type ParkReason = (typeof PARK_REASONS)[number];
 
-export type DropReason =
-  | "folded" // 不计失败率（§7.5）
-  | "TTL_EXPIRED"
-  | "TRANSPORT_FAILED"
-  | "MAX_ATTEMPTS"
-  | "ACL_DENIED"
-  | "MUTED"
-  | "TOMBSTONED"
-  | "WAKE_THROTTLED_AND_EXPIRED";
+export const DROP_REASONS = [
+  "folded", // 不计失败率（§7.5）
+  "TTL_EXPIRED",
+  "TRANSPORT_FAILED",
+  "MAX_ATTEMPTS",
+  "ACL_DENIED",
+  "MUTED",
+  "TOMBSTONED",
+  "WAKE_THROTTLED_AND_EXPIRED",
+] as const;
+export type DropReason = (typeof DROP_REASONS)[number];
 
 // 工具层错误码（§10.1 末表；与上面三类互不复用）
-export type ToolErrorCode =
-  | "ARG_INVALID"
-  | "TOOL_DISABLED"
-  | "CAP_REQUIRED"
-  | "HISTORY_FORBIDDEN"
-  | "NO_SUCH_CORRELATION"
-  | "ACK_CLOSED"
-  | "CLAIM_TAKEN"
-  | "CLAIM_EXPIRED"
-  | "NO_SUCH_KEY"
-  | "VERSION_MISMATCH"
-  | "OBJECT_TOO_LARGE"
-  | "SPACE_FORBIDDEN";
+export const TOOL_ERROR_CODES = [
+  "ARG_INVALID",
+  "TOOL_DISABLED",
+  "CAP_REQUIRED",
+  "HISTORY_FORBIDDEN",
+  "NO_SUCH_CORRELATION",
+  "ACK_CLOSED",
+  "CLAIM_TAKEN",
+  "CLAIM_EXPIRED",
+  "NO_SUCH_KEY",
+  "VERSION_MISMATCH",
+  "OBJECT_TOO_LARGE",
+  "SPACE_FORBIDDEN",
+] as const;
+export type ToolErrorCode = (typeof TOOL_ERROR_CODES)[number];
 
 /** MeshRejectError 可携带的码 = 纯 reject 码 ∪ 工具层错误码（host 面与工具面同源） */
 export type MeshErrorCode = RejectCode | ToolErrorCode;
@@ -132,6 +149,7 @@ export interface Envelope<E = unknown> {
   correlationId?: CorrelationId;
   requestType?: string; // 库不解释
   logicalTs?: string; // 不透明；排序一律用 seq（Q10）
+  late?: boolean; // §14.4：超时后到达复信打 late，只定向回发起方
   claim?: { by: AccountId; at: string }; // 仅 queue（§17）
 
   // ── 载荷 ──
@@ -276,6 +294,10 @@ export interface DeliveryTrace {
   grade: Grade | null;
   partial: boolean; // consumed(partial)：只由 abort 造成
   reason: RejectCode | ParkReason | DropReason | null;
+  /** I28：定档/不唤醒/降档留痕（backpressure_downgrade / wake_throttled / sink_backoff / muted / dnd / offline / activation）。 */
+  note: string | null;
+  /** I28：重投触发原因（entry_vanished / handoff_timeout / claim_timeout / 原 parked_reason；未重投为 null）。 */
+  redeliverReason: string | null;
   attempts: number;
   woke: boolean;
   path: ContextPath | null;
@@ -329,6 +351,7 @@ export interface AckResult {
   data?: unknown;
   error?: unknown;
   timedOut?: boolean;
+  abandoned?: boolean; // §14.4：会话解散/账号注销 → 静默终态
 }
 
 export interface SinkHandler {
@@ -345,6 +368,10 @@ export interface PendingDelivery {
   grade: Grade;
   accountId: AccountId;
   endpointId: EndpointId | null;
+  /** §7.6 三条进上下文路径：接收侧据此还原投递形态（P1 全文 / P3 只记账）。 */
+  path?: ContextPath;
+  /** §7.3 定稿的唤醒判定：跨主接收侧据此设置 triggerTurn（P1 才醒）。 */
+  woke?: boolean;
 }
 
 export type DeliveryHandler = (d: PendingDelivery) => void | Promise<void>;
@@ -357,7 +384,7 @@ export interface AclRule {
   tag?: string;
 }
 
-/** §18 三向 ACL：read（get/list）、write（put/del/append）、admin（改 ACL/管理）各自裁决 */
+/** §18 三向 ACL：read（get/list）、write（put/append）、admin（改 ACL/del 打墓碑，§18.6）各自裁决 */
 export interface Acl {
   read: AclRule[];
   write: AclRule[];
@@ -368,6 +395,7 @@ export interface SharedObjectMeta {
   key: string;
   version: number;
   ownerId: AccountId;
+  updatedBy: AccountId; // §18.4：当前版本的最后写入者（list 元信息依据）
   acl: Acl;
   size: number;
   contentType?: string;
@@ -497,6 +525,10 @@ export interface AccessControl {
   }): boolean | Promise<boolean>;
   canInitiateDirect?(from: Account, to: Account): boolean | Promise<boolean>;
   canJoin?(conv: Conversation, account: Account): boolean | Promise<boolean>;
+  canSubscribe?(ctx: {
+    conversation: Conversation;
+    account: Account;
+  }): boolean | Promise<boolean>;
   resolveCustomTag?(tag: string, ctx: AclCtx): boolean | Promise<boolean>;
 }
 
@@ -563,6 +595,13 @@ export type PolicySlot = keyof Policies;
 export type RequiredPolicySlot = "sessionFactory";
 export type OptionalPolicySlot = Exclude<PolicySlot, RequiredPolicySlot>;
 
+/**
+ * 策略槽降级原因（I21）。`illegal` 是本实现对 §22.1 的显式扩展：槽返回了
+ * 类型非法 / undefined 等「不是抛错但也不可用」的值（如 accessControl 返回
+ * undefined），不再当作正常结果流出，而是按逐槽回退值降级并同样计数告警。
+ */
+export type PolicyDegradeReason = "timeout" | "threw" | "illegal";
+
 export type DegradeTarget =
   | "silent_no_wake"
   | "cursor_only"
@@ -604,6 +643,10 @@ export interface Limits {
   maxAttempts: number; // 3
   policyTimeoutMs: number; // 50（九槽统一超时，I21）
   handoffTimeoutMs: number; // 30000
+  sweepIntervalMs: number; // 30000（周期清扫间隔；0 = 不启动定时器）
+  sinkBackoffBaseMs: number; // 1000（sink 拒收退避起始间隔）
+  sinkBackoffMaxMs: number; // 30000（sink 退避间隔上限，§21.2 指数退避有上限）
+  outboxDoneRetentionMs: number; // 86400000（outbox done 行保留窗口；0 = 不清理）
   toolResultMaxBytes: number; // 8192
   sharedObjectMaxBytes: number; // 65536
   sharedVersionsKept: number; // 10
@@ -633,6 +676,10 @@ export const DEFAULT_LIMITS: Limits = {
   maxAttempts: 3,
   policyTimeoutMs: 50,
   handoffTimeoutMs: 30000,
+  sweepIntervalMs: 30000,
+  sinkBackoffBaseMs: 1000,
+  sinkBackoffMaxMs: 30000,
+  outboxDoneRetentionMs: 86400000,
   toolResultMaxBytes: 65536 / 8,
   sharedObjectMaxBytes: 65536,
   sharedVersionsKept: 10
@@ -670,9 +717,16 @@ export interface MeshEvents {
   conversation_changed: { conversationId: ConversationId; change: ConversationChange };
   membership_caps_changed: { conversationId: ConversationId; accountId: AccountId; caps: Cap[] };
   shared_object_changed: { spaceId: SpaceId; key: string; version: number; by: AccountId };
-  presence_changed: { accountId: AccountId; from: PresenceState; to: PresenceState };
+  presence_changed: {
+    accountId: AccountId;
+    from: PresenceState;
+    to: PresenceState;
+    source: "host" | "derived"; // §15.4：显式 setPresence 为 host，过期回落/端点派生为 derived
+    until?: string;
+    reason?: string;
+  };
   endpoint_state_changed: { endpointId: EndpointId; from: EndpointState; to: EndpointState };
-  policy_degraded: { slot: PolicySlot; reason: "timeout" | "threw"; degradedTo: DegradeTarget };
+  policy_degraded: { slot: PolicySlot; reason: PolicyDegradeReason; degradedTo: DegradeTarget };
   invariant_violated: { code: string; detail: unknown };
 }
 
@@ -702,7 +756,7 @@ export type MeshEvent = MeshEventMeta &
     | { type: "shared_object_changed"; spaceId: SpaceId; key: string; version: number; by: AccountId }
     | { type: "presence_changed"; accountId: AccountId; from: PresenceState; to: PresenceState }
     | { type: "endpoint_state_changed"; endpointId: EndpointId; from: EndpointState; to: EndpointState }
-    | { type: "policy_degraded"; slot: PolicySlot; reason: "timeout" | "threw"; degradedTo: DegradeTarget }
+    | { type: "policy_degraded"; slot: PolicySlot; reason: PolicyDegradeReason; degradedTo: DegradeTarget }
     | { type: "invariant_violated"; code: string; detail: unknown }
   );
 
@@ -722,6 +776,7 @@ export interface PortStatus {
   state: EndpointState;
   busy: boolean;
   inFlight: number; // 端口自己的 handoff 计数（§7.8；非 SDK 的 pendingMessageCount，F3）
+  idleMs?: number; // §15.2 派生 idle 的时长锚点（端口/会话级；缺省回落到端点 last_active_at）
 }
 
 /**
@@ -758,6 +813,8 @@ export interface Transport {
   subscribe(endpointId: EndpointId, h: DeliveryHandler): Unsubscribe;
   ack(deliveryId: string, state: DeliveryState): Promise<void>;
   readonly kind: "inProcess" | "sameHost" | (string & {});
+  /** C02（§12.1）关闭合同：有轮询/定时器/资源的实现必须停掉；无资源者可不实现。 */
+  stop?(): void | Promise<void>;
 }
 
 // ─── ⑩ Observer（§12.4：全库唯一保证只读的读入口）────────────────────────
@@ -841,7 +898,7 @@ export interface MeshHost {
     m: SendInput & { from: string; expect: "ack" | "reply" },
     opts?: { await?: boolean }
   ): Promise<{ correlationId: string } | AckResult>;
-  ack(r: { correlationId: string; from: string; data?: unknown; error?: unknown }): Promise<void>;
+  ack(r: { correlationId: string; from: string; endpointId?: EndpointId; data?: unknown; error?: unknown }): Promise<void>;
   claim(messageId: string, by: string): Promise<{ ok: boolean; leaseUntil?: string }>;
   requeue(messageId: string, targetConv: string): Promise<void>;
 
@@ -861,7 +918,7 @@ export interface MeshHost {
     ): Promise<{ version: number }>;
     append(spaceId: string, key: string, item: unknown, opts: { as: string; maxLen?: number }): Promise<{ version: number }>;
     del(spaceId: string, key: string, opts: { as: string }): Promise<void>;
-    list(spaceId: string, opts: { as: string; keyPrefix?: string }): Promise<SharedObjectMeta[]>;
+    list(spaceId: string, opts: { as: string; keyPrefix?: string; sinceVersion?: number; limit?: number }): Promise<SharedObjectMeta[]>;
   };
 
   // ── 流控制 ──
@@ -893,6 +950,16 @@ export interface MeshOptions {
   limits?: Partial<Limits>;
   devMode?: boolean;
   /**
+   * N04：是否启用 FTS 全文搜索索引（默认 `true`）。设为 `false` 时删除
+   * contentless FTS 表、跳过索引写入，`observer.search` 返回明确的「功能关闭」。
+   */
+  fts?: boolean;
+  /**
+   * I34：`<dbPath>-wal` 文件超过此字节数（默认 8 MiB）即告警并 TRUNCATE 检查点，
+   * 同时停发直至 WAL 收缩（§8 G02 存储故障执行链）。
+   */
+  walMaxBytes?: number;
+  /**
    * §6.1/F.2：放行 `mentions: ["@all"]` 的能力位（默认 `"speak"`，须为 §4.4
    * 七能力位之一；收紧如 `"setCaps"` 可让全员唤醒只归管理员）。
    */
@@ -908,6 +975,13 @@ export interface MeshOptions {
    * 无法判定时保持拒绝、绝不猜（M3）。默认 false（崩溃后由运维人工清理）。
    */
   recoverDeadEndpoints?: boolean;
+  /**
+   * §22.4：提供即启用消息 seal（HMAC-sha256）。`key` 由宿主给出、仅内存持有、
+   * 不落库 / 不进日志 / 不进事件 / 不进 LLM 配置指纹；库绝不自行生成密钥。
+   * 缺省关闭（不签、不验，历史行的 seal 列恒 NULL）。启用后验签失败的投递
+   * 会被拒绝并触发 `invariant_violated`（code="seal_mismatch"），原消息保留。
+   */
+  seal?: { key: string };
 }
 
 export declare function createMesh(options: MeshOptions): Promise<MeshHost>;

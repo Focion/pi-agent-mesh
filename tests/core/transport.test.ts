@@ -312,3 +312,48 @@ describe("SameHostTransport", () => {
     tdb.close();
   });
 });
+describe("SameHostTransport keyset pagination (#I03)", () => {
+  it(">50 foreign ready entries do not starve local claim", async () => {
+    const tdb = openTestDb();
+    const t = new SameHostTransport(tdb.db, "w1", { pollIntervalMs: 100 });
+
+    // 50 条他进程条目（delivery_id 以 '0-f-' 起头，字典序在前）无 handler；
+    // 5 条本进程条目（'1-l-'）在后。旧实现 ORDER BY LIMIT 50 只看前 50 → 本地饿死。
+    for (let i = 0; i < 50; i++) {
+      await t.publish(mkDelivery(`0-f-${i}`, `ep-foreign-${i}`, "X"));
+    }
+    const claimed: string[] = [];
+    t.subscribe("ep-a", async (pd) => {
+      claimed.push(pd.deliveryId);
+    });
+    for (let i = 0; i < 5; i++) {
+      await t.publish(mkDelivery(`1-l-${i}`, "ep-a", "A"));
+    }
+
+    const result = await t.pollOnce();
+    // keyset 分页遍历全部 ready 行：5 条本地全部被认领，不被前 50 条他进程积压遮蔽
+    expect(result.claimed).toBe(5);
+    expect(claimed.sort()).toEqual(["1-l-0", "1-l-1", "1-l-2", "1-l-3", "1-l-4"]);
+    tdb.close();
+  });
+
+  it("single-cycle budget (maxClaimsPerCycle) still caps claims per poll", async () => {
+    const tdb = openTestDb();
+    const t = new SameHostTransport(tdb.db, "w1", {
+      pollIntervalMs: 100,
+      maxClaimsPerCycle: 2,
+    });
+    const claimed: string[] = [];
+    t.subscribe("ep-a", async (pd) => {
+      claimed.push(pd.deliveryId);
+    });
+    for (let i = 0; i < 5; i++) {
+      await t.publish(mkDelivery(`1-l-${i}`, "ep-a", "A"));
+    }
+
+    const result = await t.pollOnce();
+    expect(result.claimed).toBe(2); // 预算只够认领前 2 条，剩余留给后续轮次
+    expect(claimed.sort()).toEqual(["1-l-0", "1-l-1"]);
+    tdb.close();
+  });
+});

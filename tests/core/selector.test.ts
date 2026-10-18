@@ -41,17 +41,29 @@ describe("TopologyEndpointSelector: perConversation（§8.1 hash(accountId,key)�
     expect(r).toBe("ep-c2");
   });
 
-  it("无精确命中时按 hash(accountId:key) 稳定选一条（确定性、仍落在 perConversation 池内）", () => {
+  it("无精确命中 ⇒ null（park），不做 hash 兜底（C05）", () => {
     const s = new TopologyEndpointSelector({ endpointsOf: () => PERCV });
-    const pick = (cid: string) =>
+    expect(
       s.select({
         accountId: "a",
-        conversationId: cid,
-        envelope: env(cid),
-        topology: { kind: "perConversation", scope: "conversation", key: cid },
-      });
-    expect(pick("conv-unknown")).toBe(pick("conv-unknown")); // 同 key 恒同端点
-    expect(PERCV.map((e) => e.id)).toContain(pick("conv-unknown"));
+        conversationId: "conv-unknown",
+        envelope: env("conv-unknown"),
+        topology: { kind: "perConversation", scope: "conversation", key: "conv-unknown" },
+      }),
+    ).toBeNull();
+  });
+
+  it("精确匹配区分 scope：key 相同但 scope 不同 ⇒ null", () => {
+    const s = new TopologyEndpointSelector({ endpointsOf: () => PERCV });
+    // PERCV 中只有 conversation 作用域的 conv-2；以 purpose 作用域请求 conv-2 不得命中
+    expect(
+      s.select({
+        accountId: "a",
+        conversationId: "conv-2",
+        envelope: env("conv-2"),
+        topology: { kind: "perConversation", scope: "purpose", key: "conv-2" },
+      }),
+    ).toBeNull();
   });
 
   it("purpose 作用域以 requestType 为 key", () => {
@@ -69,7 +81,7 @@ describe("TopologyEndpointSelector: perConversation（§8.1 hash(accountId,key)�
     expect(r).toBe("ep-summarize");
   });
 
-  it("账号无 perConversation 端点 ⇒ 回退首条（不破坏 P1 单端点）", () => {
+  it("账号无 perConversation 端点 ⇒ null（park），不回落 unified 首条（C05）", () => {
     const s = new TopologyEndpointSelector({
       endpointsOf: () => [{ id: "ep-u", inFlight: 0, topology: { kind: "unified" } }],
     });
@@ -80,7 +92,7 @@ describe("TopologyEndpointSelector: perConversation（§8.1 hash(accountId,key)�
         envelope: env("c"),
         topology: { kind: "perConversation", scope: "conversation", key: "c" },
       }),
-    ).toBe("ep-u");
+    ).toBeNull();
   });
 
   it("空端点 ⇒ null（parked）", () => {

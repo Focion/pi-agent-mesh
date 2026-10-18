@@ -50,6 +50,11 @@ export class InProcessTransport implements Transport {
     /* no-op：InProcessTransport 的 ack 语义由 Mailbox 的直接 setState 承担 */
   }
 
+  /** C02（§12.1）关闭合同：InProcess 无定时器/资源，no-op。 */
+  stop(): void {
+    /* no-op */
+  }
+
   // ── 测试观测 ──
   stats(): { published: number; failures: number } {
     return { published: this.published, failures: this.failures };
@@ -72,6 +77,8 @@ export interface SameHostTransportOpts {
   claimTtlMs?: number;
   /** 最大尝试次数，默认 3 */
   maxAttempts?: number;
+  /** 单轮认领预算（条），默认 50；keyset 分页遍历全部 ready 行，不因前 N 条他进程积压饥饿 */
+  maxClaimsPerCycle?: number;
 }
 
 export class SameHostTransport implements Transport {
@@ -81,6 +88,7 @@ export class SameHostTransport implements Transport {
   private readonly pollIntervalMs: number;
   private readonly claimTtlMs: number;
   private readonly maxAttempts: number;
+  private readonly maxClaimsPerCycle: number;
   private readonly writerId: string;
 
   private handlers = new Map<EndpointId, DeliveryHandler>();
@@ -96,6 +104,7 @@ export class SameHostTransport implements Transport {
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
     this.claimTtlMs = opts.claimTtlMs ?? 300_000;
     this.maxAttempts = opts.maxAttempts ?? 3;
+    this.maxClaimsPerCycle = opts.maxClaimsPerCycle ?? 50;
   }
 
   // ── Transport 契约 ──────────────────────────────────────────────────────
@@ -175,43 +184,49 @@ export class SameHostTransport implements Transport {
       )
       .run(this.maxAttempts);
 
-    // ③ 认领并投递（只认领本进程有 handler 的端点条目，不对其他进程的条目做无用认领）
-    const rows = this.db
-      .prepare<
-        [],
-        {
-          delivery_id: string;
-          target_endpoint: string;
-          payload: string;
-          attempts: number;
-        }
-      >(
-        "SELECT delivery_id, target_endpoint, payload, attempts FROM mesh_outbox " +
-          "WHERE state = 'ready' ORDER BY delivery_id LIMIT 50",
-      )
-      .all();
+    // ③ 认领并投递（只认领本进程有 handler 的端点条目，不对其他进程的条目做无用认领）。
+    // I03 不饥饿：用 keyset 分页遍历全部 ready 行——前 N 条属他进程的积压不再遮蔽
+    // 本进程可认领的后继条目；单轮以 maxClaimsPerCycle 为预算界，避免一轮做太多。
+    const claimStmt = this.db.prepare(
+      "UPDATE mesh_outbox SET state = 'claimed', claimed_by = ?, claimed_at = ?, attempts = attempts + 1 " +
+        "WHERE delivery_id = ? AND state = 'ready'",
+    );
+    const pageStmt = this.db.prepare<[string], {
+      delivery_id: string;
+      target_endpoint: string;
+      payload: string;
+    }>(
+      "SELECT delivery_id, target_endpoint, payload FROM mesh_outbox " +
+        "WHERE state = 'ready' AND delivery_id > ? ORDER BY delivery_id LIMIT 50",
+    );
     let claimed = 0;
-    for (const row of rows) {
-      // 预解析 payload 取其 endpointId；无 handler ⇒ 跳过（留给对端 poller）
-      const pd = JSON.parse(row.payload) as PendingDelivery;
-      const handler = this.handlers.get(pd.endpointId ?? "");
-      if (!handler) continue;
-
-      // CAS 认领
-      const result = this.db
-        .prepare(
-          "UPDATE mesh_outbox SET state = 'claimed', claimed_by = ?, claimed_at = ?, attempts = attempts + 1 " +
-            "WHERE delivery_id = ? AND state = 'ready'",
-        )
-        .run(this.writerId, now, row.delivery_id);
-      if (result.changes === 0) continue;
-      claimed++;
-
-      try {
-        await handler(pd);
-      } catch {
-        // handler 抛错 → 行回 ready 让后续回收处理（不在此自改状态避免竞态）
+    let cursor = "";
+    for (;;) {
+      const rows = pageStmt.all(cursor);
+      if (rows.length === 0) break;
+      cursor = rows[rows.length - 1]!.delivery_id;
+      for (const row of rows) {
+        if (claimed >= this.maxClaimsPerCycle) break;
+        // 预解析 payload 取其 endpointId；无本地 handler ⇒ 跳过（留给对端 poller）
+        let pd: PendingDelivery;
+        try {
+          pd = JSON.parse(row.payload) as PendingDelivery;
+        } catch {
+          continue; // 损坏 payload 不认领，避免死循环；留待运维排查
+        }
+        const handler = this.handlers.get(pd.endpointId ?? "");
+        if (!handler) continue;
+        // CAS 认领
+        const result = claimStmt.run(this.writerId, now, row.delivery_id);
+        if (result.changes === 0) continue;
+        claimed++;
+        try {
+          await handler(pd);
+        } catch {
+          // handler 抛错 → 行回 ready 让后续回收处理（不在此自改状态避免竞态）
+        }
       }
+      if (claimed >= this.maxClaimsPerCycle) break;
     }
     return { claimed, reclaimed: reclam.changes, failed: failed.changes };
   }

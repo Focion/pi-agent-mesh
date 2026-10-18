@@ -171,8 +171,15 @@ interface Recorded {
   created: Array<Record<string, unknown>>;
   claims: string[];
   sharedGets: Array<[string, string, number | undefined]>;
-  sharedPuts: Array<[string, string, unknown, number | undefined]>;
-  sharedLists: Array<[string, string | undefined]>;
+  sharedPuts: Array<
+    [string, string, unknown, {
+      expectedVersion?: number;
+      contentType?: string;
+      op?: "replace" | "append";
+      maxLen?: number;
+    } | undefined]
+  >;
+  sharedLists: Array<[string, { keyPrefix?: string; sinceVersion?: number; limit?: number } | undefined]>;
   historyCalls: Array<{
     conversationId: string;
     beforeSeq?: number;
@@ -183,6 +190,7 @@ interface Recorded {
   membersCalls: string[];
   lookups: Array<{ query?: string; capabilities?: string[]; limit?: number }>;
   contactsQueries: Array<string | undefined>;
+  verbatimBytes: number[];
 }
 
 interface StubOptions {
@@ -192,6 +200,14 @@ interface StubOptions {
   history?: Envelope[];
   accounts?: Account[];
   sendThrows?: (input: SendInput & { clientToken: string }) => Error;
+  /** 设值后 sharedPut/sharedList 走成功路径（否则抛 MeshUnsupportedError，见 deferred tests） */
+  sharedPutResult?: { version: number };
+  sharedListResult?: Array<{
+    key: string;
+    version: number;
+    updatedBy: string;
+    updatedAt: string;
+  }>;
 }
 
 function makeCtx(o: StubOptions = {}): { ctx: ToolContext; rec: Recorded } {
@@ -210,6 +226,7 @@ function makeCtx(o: StubOptions = {}): { ctx: ToolContext; rec: Recorded } {
     membersCalls: [],
     lookups: [],
     contactsQueries: [],
+    verbatimBytes: [],
   };
   const conversations = o.conversations ?? [CONV_ADMIN_HOLDER, CONV_TOPIC];
   const members =
@@ -287,13 +304,18 @@ function makeCtx(o: StubOptions = {}): { ctx: ToolContext; rec: Recorded } {
       rec.sharedGets.push([spaceId, key, version]);
       throw new MeshUnsupportedError("shared spaces (P4)");
     },
-    async sharedPut(spaceId, key, data, expectedVersion) {
-      rec.sharedPuts.push([spaceId, key, data, expectedVersion]);
+    async sharedPut(spaceId, key, data, opts) {
+      rec.sharedPuts.push([spaceId, key, data, opts]);
+      if (o.sharedPutResult) return o.sharedPutResult;
       throw new MeshUnsupportedError("shared spaces (P4)");
     },
-    async sharedList(spaceId, keyPrefix) {
-      rec.sharedLists.push([spaceId, keyPrefix]);
+    async sharedList(spaceId, opts) {
+      rec.sharedLists.push([spaceId, opts]);
+      if (o.sharedListResult) return o.sharedListResult;
       throw new MeshUnsupportedError("shared spaces (P4)");
+    },
+    countVerbatim(bytes: number) {
+      rec.verbatimBytes.push(bytes);
     },
   };
   return { ctx, rec };
@@ -608,6 +630,15 @@ describe("read-only tools", () => {
       kind: "chat",
       text: "seven",
     });
+  });
+
+  it("mesh_history counts read verbatim bytes via countVerbatim (I08, §10.2)", async () => {
+    const { ctx, rec } = makeCtx();
+    await run(byName(buildToolSet(ctx), "mesh_history"), "tc", {
+      conversationId: "c_group",
+    });
+    // 默认夹具 3 条原文："seven"(5) + "eight"(5) + "nine"(4) = 14 字节
+    expect(rec.verbatimBytes).toEqual([14]);
   });
 
   it("mesh_history clamps limit to 100 and marks truncated", async () => {
@@ -942,6 +973,176 @@ describe("deferred tools (P3/P4)", () => {
       keyPrefix: "k/",
     });
     expect(list.error).toMatchObject({ code: "TOOL_DISABLED" });
+  });
+});
+
+// ─── I21：shared put/list 声明参数生效或拒绝 ────────────────────────────────
+
+describe("shared put/list intent (I21)", () => {
+  it("mesh_shared_put dispatches op/contentType/maxLen/expectedVersion into ctx opts", async () => {
+    const { ctx, rec } = makeCtx({ sharedPutResult: { version: 2 } });
+    const tools = buildToolSet(ctx);
+    const put = byName(tools, "mesh_shared_put");
+
+    // append：maxLen 生效
+    const append = await run(put, "tc", {
+      spaceId: "conv:c1",
+      key: "k",
+      data: { v: 1 },
+      op: "append",
+      maxLen: 5,
+    });
+    expect(append).toEqual({ ok: true, version: 2 });
+    expect(rec.sharedPuts[0]).toEqual([
+      "conv:c1",
+      "k",
+      { v: 1 },
+      { op: "append", maxLen: 5 },
+    ]);
+
+    // replace（缺省 op）+ expectedVersion + contentType
+    await run(put, "tc", {
+      spaceId: "conv:c1",
+      key: "k",
+      data: "text",
+      expectedVersion: 1,
+      contentType: "text/plain",
+    });
+    expect(rec.sharedPuts[1]).toEqual([
+      "conv:c1",
+      "k",
+      "text",
+      { op: "replace", expectedVersion: 1, contentType: "text/plain" },
+    ]);
+  });
+
+  it("mesh_shared_put rejects invalid op and cross-field combos (effect-or-reject)", async () => {
+    const { ctx, rec } = makeCtx({ sharedPutResult: { version: 1 } });
+    const tools = buildToolSet(ctx);
+    const put = byName(tools, "mesh_shared_put");
+    const cases: Array<Record<string, unknown>> = [
+      { op: "merge" }, // 非法 op
+      { op: "append", expectedVersion: 2 }, // append 不参与 CAS
+      { maxLen: 3 }, // maxLen 仅 append 有效（缺省 op=replace）
+      { expectedVersion: 1.5 }, // 非整数
+      { maxLen: -1 },
+      { contentType: "" }, // 空串非法
+    ];
+    for (const over of cases) {
+      const body = await run(put, "tc", {
+        spaceId: "s",
+        key: "k",
+        data: 1,
+        ...over,
+      });
+      expect(body.error).toMatchObject({ code: "ARG_INVALID" });
+    }
+    // 全部在参数校验阶段被拒，ctx.sharedPut 从未被调用
+    expect(rec.sharedPuts).toEqual([]);
+  });
+
+  it("mesh_shared_list passes sinceVersion/limit/keyPrefix and marks truncated on hitting limit", async () => {
+    const rows = [
+      { key: "a", version: 3, updatedBy: "acct_x", updatedAt: NOW },
+      { key: "b", version: 4, updatedBy: "acct_x", updatedAt: NOW },
+    ];
+    const { ctx, rec } = makeCtx({ sharedListResult: rows });
+    const tools = buildToolSet(ctx);
+    const body = await run(byName(tools, "mesh_shared_list"), "tc", {
+      spaceId: "global",
+      keyPrefix: "k/",
+      sinceVersion: 2,
+      limit: 2,
+    });
+    // 返回条数到达 limit 上限 ⇒ 标记 truncated（读 ACL 过滤后的封顶）
+    expect(body.truncated).toBe(true);
+    expect(body.objects).toEqual(rows);
+    expect(rec.sharedLists[0]).toEqual([
+      "global",
+      { keyPrefix: "k/", sinceVersion: 2, limit: 2 },
+    ]);
+  });
+
+  it("mesh_shared_list rejects non-integer sinceVersion and non-positive limit", async () => {
+    const { ctx, rec } = makeCtx({ sharedListResult: [] });
+    const tools = buildToolSet(ctx);
+    const list = byName(tools, "mesh_shared_list");
+    expect(
+      (await run(list, "tc", { spaceId: "s", sinceVersion: "x" })).error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    expect(
+      (await run(list, "tc", { spaceId: "s", limit: 0 })).error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    expect(
+      (await run(list, "tc", { spaceId: "s", limit: -1 })).error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    expect(rec.sharedLists).toEqual([]);
+  });
+
+  it("mesh_shared_list omits truncated when under limit", async () => {
+    const { ctx } = makeCtx({
+      sharedListResult: [
+        { key: "a", version: 3, updatedBy: "acct_x", updatedAt: NOW },
+      ],
+    });
+    const tools = buildToolSet(ctx);
+    const body = await run(byName(tools, "mesh_shared_list"), "tc", {
+      spaceId: "global",
+      limit: 2,
+    });
+    expect(body.truncated).toBeUndefined();
+    expect(body.objects).toHaveLength(1);
+  });
+});
+
+// ─── I29：任何预算下返回合法 JSON + 准确 truncated ─────────────────────────
+
+describe("tool result budget (I29)", () => {
+  it("small budget still returns valid JSON with accurate truncated flag", async () => {
+    const { ctx } = makeCtx();
+    const tools = buildToolSet(ctx, undefined, { maxBytes: 64 });
+    const raw = await byName(tools, "mesh_lookup").execute(
+      "tc",
+      { query: "a" },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const text =
+      typeof raw.content === "string" ? raw.content : raw.content[0]!.text;
+    // 预算 64 字节：ACCOUNTS（3 账号）必然超出 → 收缩但仍 ≤64 且可被 JSON.parse
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(64);
+    expect(() => JSON.parse(text)).not.toThrow();
+    const body = parseToolContent(raw);
+    expect(body.truncated).toBe(true);
+    expect(Array.isArray(body.accounts)).toBe(true);
+  });
+
+  it("tiny budget degrades to a legal JSON fallback (never byte-truncated)", async () => {
+    const { ctx } = makeCtx();
+    const tools = buildToolSet(ctx, undefined, { maxBytes: 8 });
+    const raw = await byName(tools, "mesh_lookup").execute(
+      "tc",
+      { query: "a" },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const text =
+      typeof raw.content === "string" ? raw.content : raw.content[0]!.text;
+    // 预算小于 {"truncated":true}（18 字节）时退化为 "null"，仍是合法 JSON、绝不字节截断
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(8);
+    expect(() => JSON.parse(text)).not.toThrow();
+  });
+
+  it("maxBytes wiring: undersized result stays untruncated at any budget", async () => {
+    const { ctx } = makeCtx({ accounts: [ACCOUNTS[0]!] });
+    const tools = buildToolSet(ctx, undefined, { maxBytes: 8192 });
+    const body = await run(byName(tools, "mesh_lookup"), "tc", {
+      query: "alice",
+    });
+    expect(body.truncated).toBeUndefined();
+    expect((body.accounts as unknown[]).length).toBe(1);
   });
 });
 

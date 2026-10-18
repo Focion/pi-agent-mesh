@@ -5,7 +5,7 @@ status: active
 owner: unassigned
 tags: [spec, multi-agent, messaging, pi-sdk, sqlite]
 related:
-  - notes/plan/2026-09-07-p0-p1-rollout.md
+  - notes/plan/2026-10-12-consolidated-open-work-plan.md
 ---
 
 # Pi Agent Mesh
@@ -647,7 +647,7 @@ Observer    → Store（只读）
 | 6 | **Message** | 不可变信封 + 载荷。`kind: chat \| task \| event \| system \| tombstone`（五值，§5.3）；请求-应答由 `expect` + `correlationId` 表达而非独立 kind | `CustomMessage` / `CustomMessageEntry` |
 | 7 | **Inbox** | 每个 `(account, conversation)` 的游标 + 待处理队列 + 溢出摘要 | `triggerTurn: false` 累积 |
 | 8 | **Receipt** | 投递状态机的每次跃迁记录 | `entry_appended` → `delivered`，随后的 `turn_end` → `consumed`；`sink` / `external` 由宿主调 `markConsumed` 推进 |
-| 9 | **Presence** | `available \| busy \| dnd \| away \| offline` + `until` + 不透明 `reason`（§15） | `stream` 端点由 `isIdle` / `isStreaming` 派生；`sink` / `external` 只能由宿主 `setPresence` 显式设置 |
+| 9 | **Presence** | `available \| busy \| dnd \| away \| online \| idle \| offline` + `until` + 不透明 `reason`（§15） | `stream` 端点由流冷热 + `isIdle` 派生 `online` / `busy` / `idle` / `offline`；`available` / `away` 为 legacy 别名；`sink` / `external` 只能由宿主 `setPresence` 显式设置 |
 | 10 | **SharedObject** | 带 ACL 与版本号的键值对象，挂在 Conversation 或全局（§18） | — |
 
 **对象层的非目标**（复述，防止被要求补上）：
@@ -1041,7 +1041,7 @@ wake = (correlationId && iAmAwaitingIt)      // ① 我在等的应答回来了
 | 规则 | 内容 | 理由 |
 |---|---|---|
 | **A1** | `Membership.caps` 不含 `speak` 的成员**永不唤醒**，策略返回 `true` 也降级为 `false` | "只读成员"的定义就是不产生 LLM 成本 |
-| **A2** | `presence ∈ {dnd, offline}` 时不唤醒；`priority = urgent` 是**默认开启**的例外；消息照常入 Inbox | 对接宿主的作息语义，但库只认自己的五态 |
+| **A2** | `presence ∈ {dnd, offline}` 时不唤醒；`priority = urgent` 是**默认开启**的例外；消息照常入 Inbox | 对接宿主的作息语义，但库只认自己的七值枚举（含派生态与 legacy 别名） |
 | **A2'** | `endpointClass ∈ {sink, external}` 的账号**不参与唤醒判定**：投递即算送达，由宿主的 UI / HTTP 层决定怎么提醒 | 它们背后没有 LLM |
 | **A3** | 唤醒有速率上限：同一 Account 单位时间唤醒次数超限则强制降为 `silent` 并计 `wake_throttled` | 防止策略 bug 或 Agent 互相请求造成唤醒风暴 |
 
@@ -1670,7 +1670,7 @@ A(hot) ──mesh_send──▶ Router
 
 ```ts
 interface ConversationConfig {                 // 四种会话形态共用同一个配置对象
-  historyVisibility: "none" | "sinceJoin" | "all";  // 默认 "sinceJoin"
+  historyVisibility: "none" | "since_join" | "full";  // 默认 "since_join"
   maxHistoryOnJoin: number;                    // 默认 0：入会话时不注入任何历史
   openJoin?: boolean;                          // 默认 false（§9.3）
   groupSizeHardCap?: number;                   // 只允许 ≤ 全局值；topic 不适用（§9.6）
@@ -1682,20 +1682,20 @@ interface ConversationConfig {                 // 四种会话形态共用同一
 | 档 | 新成员**查得到**的消息 | 加入时**注入上下文**的消息 |
 |---|---|---|
 | `none` | 无 | 无 |
-| `sinceJoin`（默认） | `seq > joinedSeq` 的消息 | 无 |
-| `all` | 全部历史 | 最多 `maxHistoryOnJoin` 条 |
+| `since_join`（默认） | `seq > joinedSeq` 的消息 | 无 |
+| `full` | 全部历史 | 最多 `maxHistoryOnJoin` 条 |
 
-**默认值 `sinceJoin` 是从 §6.2 的等式推出来的，不是一个社交习惯的移植。** 推导只有三步：
+**默认值 `since_join` 是从 §6.2 的等式推出来的，不是一个社交习惯的移植。** 推导只有三步：
 
 1. **投递集 ≡ 未读集 ≡ `to ∪ mentions`**（A4 / §6.2）。一个成员在某条消息上的可见性，物理载体就是 `mesh_deliveries` 里属于他的那一行。
 2. 一个成员加入之前的消息，其投递集是当时的成员集合——**里面没有他**，因此不存在属于他的 delivery 行。
-3. 于是"加入前的消息对他不可见"不是一条额外规定，而是**默认状态**：库不需要做任何事就得到这个结果。反过来，`all` 才是需要**显式放宽**的那一档——它让 `mesh_history` 查询绕过 `joinedSeq` 过滤，读取本不属于该成员投递集的消息。
+3. 于是"加入前的消息对他不可见"不是一条额外规定，而是**默认状态**：库不需要做任何事就得到这个结果。反过来，`full` 才是需要**显式放宽**的那一档——它让 `mesh_history` 查询绕过 `joinedSeq` 过滤，读取本不属于该成员投递集的消息。
 
-这个方向很重要：**默认不可见是零成本的，可见是要额外授权的。** 若默认是 `all`，那么每次 `addMember` 都等于一次批量历史授权，而调用方通常并没有意识到自己在做这件事。
+这个方向很重要：**默认不可见是零成本的，可见是要额外授权的。** 若默认是 `full`，那么每次 `addMember` 都等于一次批量历史授权，而调用方通常并没有意识到自己在做这件事。
 
 **分界点是 `joinedSeq`**，记在 `Membership` 上（§4.4）。退出后再次加入会**更新** `joinedSeq`，因此第二次加入看不到中间那一段——这同样是上面推导的直接结果：那一段消息的投递集里没有他。上层应用若需要保留原分界，**必须**在 `setCaps` 层面做"停止投递但不移除成员"（去掉 `read`），而不是让成员退出再加回来。
 
-**即使 `historyVisibility = "all"`，默认也不注入历史**（`maxHistoryOnJoin = 0`）。三条理由：
+**即使 `historyVisibility = "full"`，默认也不注入历史**（`maxHistoryOnJoin = 0`）。三条理由：
 
 - 加入瞬间灌几百条消息进上下文，一次压缩就全部作废，成本白付；
 - 注入的历史与自己产出的内容在上下文里形态相同，接收方会误以为自己"经历过"这些；
@@ -2979,10 +2979,10 @@ interface MeshEvents {
   conversation_changed:    { conversationId: string; change: ConversationChange };
   membership_caps_changed: { conversationId: string; accountId: string; caps: Cap[] };
   shared_object_changed:   { spaceId: string; key: string; version: number; by: string };
-  presence_changed:        { accountId: string; from: PresenceState; to: PresenceState };
+  presence_changed:        { accountId: string; from: PresenceState; to: PresenceState; source: "host" | "derived"; until?: string; reason?: string };
   endpoint_state_changed:  { endpointId: string; from: EndpointState; to: EndpointState };
-  policy_degraded:         { slot: keyof Policies; reason: "timeout" | "threw";
-                             degradedTo: string };
+  policy_degraded:         { slot: keyof Policies; reason: "timeout" | "threw" | "illegal";
+                             degradedTo: DegradeTarget };
   invariant_violated:      { code: string; detail: unknown };
 }
 ```
@@ -3056,7 +3056,7 @@ type ConvState     = "active" | "archived"; // 由 archived_at 派生；dissolve
               // **没有 muted 态**：静音是 Membership 级的（mutedUntil），不是会话级
 type EndpointState = "cold" | "warming" | "hot" | "evicting" | "unavailable";   // §8.3
               // unavailable ⇒ 投给它的 delivery 转 parked(ENDPOINT_GONE)（§7.9）
-type PresenceState = "available" | "busy" | "dnd" | "away" | "offline";        // §15
+type PresenceState = "available" | "busy" | "dnd" | "away" | "online" | "idle" | "offline";        // §15
               // dnd / offline 默认不唤醒（§7.3 规则 A2）
 
 type DeliveryState = "routed" | "queued" | "delivered" | "consumed"
@@ -3328,13 +3328,13 @@ type MeshEvent = MeshEventMeta & (
   | { type: "presence_changed";  accountId: AccountId;
       from: PresenceState; to: PresenceState }
   | { type: "endpoint_state_changed"; from: EndpointState; to: EndpointState }
-  | { type: "policy_degraded";  slot: PolicySlot; reason: "timeout" | "threw";
+  | { type: "policy_degraded";  slot: PolicySlot; reason: "timeout" | "threw" | "illegal";
       degradedTo: DegradeTarget }
   | { type: "invariant_violated"; code: string; detail: unknown }
 );
 ```
 
-**三处最该盯住的取值集合**：`EndpointState` 的五态、`PresenceState` 的五态、三个原因码集合。这三处一旦各处自己编一套，症状是指标对不上而不是程序崩溃——`devMode` 下库对 `drop_reason` 与 `parked_reason` 按 §7.10 校验，是为了把这类漂移提前变成异常（附录 D）。
+**三处最该盯住的取值集合**：`EndpointState` 的五态、`PresenceState` 的七值、三个原因码集合。这三处一旦各处自己编一套，症状是指标对不上而不是程序崩溃——`devMode` 下库对 `drop_reason` 与 `parked_reason` 按 §7.10 校验，是为了把这类漂移提前变成异常（附录 D）。
 
 ### 12.7 最小示例
 
@@ -3804,6 +3804,8 @@ function detectCycle(from: AccountId, to: AccountId): "ok" | "cycle" | "depth" {
 
 Presence 是一个账号"当前有多大意愿被打断"的声明。库只认五个状态，**语义映射属于宿主**：
 
+> 类型面上 `PresenceState` 为**七值**（§12.6）：下表五个状态之外，另有 `available` / `away` 两个 **legacy 别名**——仅对宿主显式 `setPresence` 向后兼容保留、不参与自动派生（§15.2 只派生 `online` / `busy` / `idle` / `offline`）。
+
 | 状态 | 库的机械行为 | 宿主可能映射到的语义（举例，库不关心） |
 |---|---|---|
 | `online` | 正常投递、正常参与唤醒判定 | 在线、可用、值守中 |
@@ -3898,7 +3900,7 @@ Presence 有且只有两个来源：
 | 描述什么 | **意愿**：这个账号当前有多大意愿被打断 | **物理状态**：这一路流现在处于流状态机的哪一格 |
 | 取值 | `online` / `busy` / `idle` / `dnd` / `offline` | `cold` / `warming` / `hot` / `evicting` / `unavailable`（§8.2） |
 | 谁改变它 | 库派生 **或** 宿主 `setPresence` | 只有库（warm / evict / 故障） |
-| 载荷要点 | `accountId`、`from`、`to`、`source: "derived" \| "host"`、`until?`、`reason?` | `endpointId`、`from`、`to`、`reason`（如 `idle_evict` / `lock_lost` / `warm_failed`） |
+| 载荷要点 | `accountId`、`from`、`to`、`source: "derived" \| "host"`、`until?`、`reason?` | `endpointId`、`from`、`to` |
 | 典型消费者 | UI 的在线状态、宿主的调度决策 | 运维面板、`parked(ENDPOINT_GONE)` 的排障、容量统计 |
 | 与唤醒的关系 | **直接相关**（A2） | **间接**：它只改变投递需不需要先 warm，不改变要不要唤醒 |
 
@@ -7340,13 +7342,13 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `message_consumed` | 该 endpoint 的 `turn_end`，且该轮期间此 delivery 已 `delivered` | `envelope`、`endpointId`、`accountId`、`partial`、`entryId?` | **必须**（宿主下游写入的唯一时机点） | §7.9 |
 | `message_parked` | 投递落 `parked`（端口不可用，非终态，等重投） | `envelope`、`endpointId`、`reason`（附录 D 表 2） | 应当（积压可见性；`NO_SESSION` 必须告警） | §7.9 · §7.10 |
 | `message_dropped` | 投递进终态，不会再送 | `envelope`、`endpointId`、`reason`（附录 D 表 3，含 `folded`） | **必须**（失败率的来源；统计时**必须**排除 `folded`） | §7.9 · §7.10 |
-| `message_acked` | `expect:"ack"` 的显式确认到达 | `envelope`、`endpointId`、`ok`、`detail?` | 应当（用了请求-应答就必须订） | §14 |
-| `inbox_overflowed` | 未读超过溢出阈值、发生机械折叠 | `accountId`、`conversationId`、`count`、`foldedRange`、`endpointId?` | 应当（折叠是信息损失，需要看频率） | §7.5 |
+| `message_acked` | `expect:"ack"` 的显式确认到达 | `correlationId`、`endpointId`、`ok`、`detail?` | 应当（用了请求-应答就必须订） | §14 |
+| `inbox_overflowed` | 未读超过溢出阈值、发生机械折叠 | `accountId`、`conversationId`、`foldedCount`、`foldedRange`、`endpointId?` | 应当（折叠是信息损失，需要看频率） | §7.5 |
 | `conversation_changed` | 建群 / 入群 / 退群 / 改公告 / 订阅变更 | `conversationId`、`change`、`endpointId?`（操作方） | 可选（审计需要则订） | §9 · §16 |
 | `membership_caps_changed` | `caps` 位被修改（含 `setCaps` 的子集校验通过后） | `conversationId`、`accountId`、`caps`、`endpointId?`（操作方） | 应当（权限变更必须留痕，对应 `C15`） | §4.4 · §9 |
 | `shared_object_changed` | 共享对象写入成功、版本号前移 | `spaceId`、`key`、`version`、`by`、`endpointId?` | 可选（共享空间是"有权限即可信"模型，溯源靠版本历史） | §18 |
 | `endpoint_state_changed` | 流状态机跃迁：`cold`/`warming`/`hot`/`evicting`/`unavailable` | `endpointId`、`from`、`to` | 应当（热流数 = 容量与成本的直接指标） | §8.3 |
-| `presence_changed` | Presence 计算结果发生变化 | `accountId`、`from`、`to`、`endpointId?` | 可选（Presence 是派生量，可从 `endpoint_state_changed` 重建） | §15 |
+| `presence_changed` | Presence 计算结果发生变化 | `accountId`、`from`、`to`、`source`（`"derived"` / `"host"`）、`until?`、`reason?`、`endpointId?` | 可选（Presence 是派生量，可从 `endpoint_state_changed` 重建） | §15 |
 | `request_timeout` | 请求到 `deadline` 仍未应答 | `correlationId`、`from`、`to`、`intent?`、`endpointId?` | **必须**（对端不可靠的第一信号，且会拖住发送方逻辑） | §14 |
 | `policy_degraded` | 九个插槽任一超时或抛错，库改用内建默认值继续 | `slot`、`reason`、`degradedTo`、`endpointId?` | **必须**（I21；不订就会以为自己的策略在生效） | §20 |
 | `invariant_violated` | 不变量断言失败（`devMode` 与生产都会发） | `code`、`detail`、`endpointId?` | **必须**（唯一表示"库的假设已被推翻"的信号） | §22 · §23.4 |
@@ -7927,7 +7929,7 @@ CREATE TABLE mesh_counters (                    -- name 的取值集合见附录
 | `ConversationType` | 会话形态四值：`direct` `group` `topic` `queue`（**无 `system`**） | §12.6 / §4.3 |
 | `ConvState` | 会话状态两值：`active` `archived`。**没有 muted 态**，静音是 Membership 级的 | §12.6 |
 | `EndpointState` | 流状态五值：`cold` `warming` `hot` `evicting` `unavailable` | §12.6 / §8.3 |
-| `PresenceState` | 在线状态五值：`available` `busy` `dnd` `away` `offline` | §12.6 / §15 |
+| `PresenceState` | 在线状态七值：`available` `busy` `dnd` `away` `online` `idle` `offline`（`online` / `idle` 派生、`available` / `away` legacy 别名） | §12.6 / §15 |
 | `DeliveryState` | 投递状态八值，含 `parked` 与 queue 的 `claimed` / `acked` | §12.6 / §7.9 |
 | `ParkReason` | `parked` 原因码六值（非终态） | §12.6 / §7.10 |
 | `DropReason` | `dropped` 原因码八值（终态，含不计失败率的 `folded`） | §12.6 / §7.10 |
@@ -7936,7 +7938,7 @@ CREATE TABLE mesh_counters (                    -- name 的取值集合见附录
 | `MeshLease` | 库自持租约两值：`shared` `exclusive`（**不是** pi 的 `SessionLeaseMode`） | §8.2 |
 | `MeshToolName` | Agent 侧 14 个工具名的联合类型，一个不多一个不少 | §12.6 / §10.1 |
 
-三个枚举尤其值得盯：`EndpointState` 的五态、`PresenceState` 的五态、三个原因码集合。实现时各处自己编一套是最常见的漂移来源，也是 `devMode` 要按附录 D / 附录 E 校验取值的原因。
+三个枚举尤其值得盯：`EndpointState` 的五态、`PresenceState` 的七值、三个原因码集合。实现时各处自己编一套是最常见的漂移来源，也是 `devMode` 要按附录 D / 附录 E 校验取值的原因。
 
 ### H.2 实体与只读投影
 

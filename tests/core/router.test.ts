@@ -37,7 +37,12 @@ interface Harness {
 }
 
 function makeHarness(
-  opts: { limits?: Partial<Limits>; sealKey?: string; mentionAllCap?: Cap } = {},
+  opts: {
+    limits?: Partial<Limits>;
+    sealKey?: string;
+    mentionAllCap?: Cap;
+    onRouted?: (envelope: Envelope) => Promise<void>;
+  } = {},
 ): Harness {
   const tdb = openTestDb();
   const limits: Limits = { ...DEFAULT_LIMITS, ...opts.limits };
@@ -73,9 +78,11 @@ function makeHarness(
     policies,
     limits,
     devMode: true,
-    onRouted: async (e) => {
-      routed.push(e);
-    },
+    onRouted:
+      opts.onRouted ??
+      (async (e) => {
+        routed.push(e);
+      }),
     isAwaiting: () => false,
     sealKey: opts.sealKey,
     mentionAllCap: opts.mentionAllCap,
@@ -1119,5 +1126,240 @@ describe("router: fts, seal, counters", () => {
       .get(r2.messageId);
     expect(m2?.seal).toBeNull();
     h2.store.close();
+  });
+});
+
+// ─── 分支覆盖补全（router.ts §5.4–§17 未覆盖分支的定点用例）─────────────────
+
+describe("router: branch coverage", () => {
+  it("defaults kind to chat and expect to none when omitted", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "B");
+    const conv = await h.registry.ensureDirect("A", "B");
+    const input = {
+      from: "A",
+      conversationId: conv.id,
+      text: "defaults",
+      clientToken: ulid(),
+    } as unknown as RouteInput;
+    const r = await h.router.route(input);
+    const m = h.db
+      .prepare<[string], { kind: string; expect: string }>(
+        "SELECT kind, expect FROM mesh_messages WHERE id = ?",
+      )
+      .get(r.messageId);
+    expect(m).toMatchObject({ kind: "chat", expect: "none" });
+    h.store.close();
+  });
+
+  it("rejects an unregistered sender before membership resolution", async () => {
+    const h = makeHarness();
+    const convId = await group3(h);
+    await expect(
+      h.router.route(msg("ghost", convId)),
+    ).rejects.toMatchObject({ code: "NOT_A_MEMBER" });
+    h.store.close();
+  });
+
+  it("direct derivation guard coalesces a nullish single to target to ''", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "B");
+    const convId = directConversationId("A", "B"); // 尚未 ensureDirect
+    // toNorm[0] 为 null ⇒ getAccount(toNorm[0] ?? "") 走 ?? 回退（getAccount("") 为 undefined）
+    await expect(
+      h.router.route(msg("A", convId, { to: [null as unknown as string] })),
+    ).rejects.toMatchObject({ code: "NOT_A_MEMBER" });
+    h.store.close();
+  });
+
+  it("topic mention of a non-subscriber warns with 'subscribers' (§5.4③)", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "B");
+    const topic = await h.registry.createConversation({
+      type: "topic",
+      creator: "A",
+    });
+    h.registry.subscribe(topic.id, "B", 0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const r = await h.router.route(
+      msg("A", topic.id, { kind: "event", mentions: ["ghost"] }),
+    );
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("subscribers"));
+    warn.mockRestore();
+    expect(r.seq).toBe(1);
+    h.store.close();
+  });
+
+  it("expect:ack with a nullish single to target rejects targeting", async () => {
+    const h = makeHarness();
+    const convId = await group3(h);
+    await expect(
+      h.router.route(
+        msg("A", convId, { expect: "ack", to: [null as unknown as string] }),
+      ),
+    ).rejects.toMatchObject({ code: "TARGETING_NOT_SUPPORTED" });
+    h.store.close();
+  });
+
+  it("expect:ack in a direct conversation with the peer left rejects targeting", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "B");
+    const conv = await h.registry.ensureDirect("A", "B");
+    h.registry.removeMember(conv.id, "B");
+    await expect(
+      h.router.route(msg("A", conv.id, { expect: "ack" })),
+    ).rejects.toMatchObject({ code: "TARGETING_NOT_SUPPORTED" });
+    h.store.close();
+  });
+
+  it("topic publish with an absent canPublish hook defaults to allow", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    const topic = await h.registry.createConversation({
+      type: "topic",
+      creator: "A",
+    });
+    h.policies.accessControl = {
+      ...h.policies.accessControl,
+      canPublish: undefined,
+    };
+    const r = await h.router.route(
+      msg("A", topic.id, { kind: "event", text: "x" }),
+    );
+    expect(r.seq).toBe(1);
+    h.store.close();
+  });
+
+  it("topic fanout sorts subscribers and skips those with fromSeq > seq", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "zebra");
+    await addAcc(h, "alpha");
+    await addAcc(h, "beta");
+    const topic = await h.registry.createConversation({
+      type: "topic",
+      creator: "A",
+    });
+    h.registry.subscribe(topic.id, "zebra", 0); // 降序输入触发比较器 return 1
+    h.registry.subscribe(topic.id, "alpha", 0);
+    h.registry.subscribe(topic.id, "beta", 100); // fromSeq > seq → 跳过
+    const r = await h.router.route(
+      msg("A", topic.id, { kind: "event", text: "x" }),
+    );
+    const ids = deliveriesOf(h, r.messageId)
+      .map((x) => String(x.account_id))
+      .sort();
+    expect(ids).toEqual(["alpha", "zebra"]);
+    h.store.close();
+  });
+
+  it("queue with only its creator (no worker) rejects FANOUT_TOO_LARGE", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    const q = await h.registry.createConversation({
+      type: "queue",
+      creator: "A",
+    });
+    await expect(
+      h.router.route(msg("A", q.id, { kind: "task", text: "job" })),
+    ).rejects.toMatchObject({ code: "FANOUT_TOO_LARGE" });
+    h.store.close();
+  });
+
+  it("queue routes successive tasks to the least-in-flight consumer (§17.1)", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "B");
+    await addAcc(h, "C");
+    const q = await h.registry.createConversation({
+      type: "queue",
+      creator: "A",
+      members: ["B", "C"],
+    });
+    const r1 = await h.router.route(
+      msg("A", q.id, { kind: "task", text: "job1" }),
+    );
+    const r2 = await h.router.route(
+      msg("A", q.id, { kind: "task", text: "job2" }),
+    );
+    const d1 = deliveriesOf(h, r1.messageId)[0];
+    const d2 = deliveriesOf(h, r2.messageId)[0];
+    expect(d1?.account_id).toBe("B");
+    expect(d2?.account_id).toBe("C");
+    h.store.close();
+  });
+
+  it("blocking request exceeding requestChainMaxDepth rejects as depth", async () => {
+    const h = makeHarness({ limits: { requestChainMaxDepth: 1 } });
+    const convId = await group3(h);
+    await expect(
+      h.router.route(
+        msg("A", convId, { expect: "ack", to: ["B"], blocking: true }),
+      ),
+    ).rejects.toMatchObject({ code: "REQUEST_CYCLE" });
+    h.store.close();
+  });
+
+  it("implicitly-created direct conversation survives an onRouted failure (message already routed)", async () => {
+    const h = makeHarness({
+      onRouted: async () => {
+        throw new Error("fanout boom");
+      },
+    });
+    await addAcc(h, "A");
+    await addAcc(h, "B");
+    const convId = directConversationId("A", "B");
+    await expect(
+      h.router.route(msg("A", convId, { to: ["B"] })),
+    ).rejects.toThrow("fanout boom");
+    // N02：会话已有消息 ⇒ 回滚被跳过，会话与消息均保留
+    expect(h.registry.getConversation(convId)).toBeDefined();
+    const n = h.db
+      .prepare("SELECT COUNT(*) AS n FROM mesh_messages WHERE conversation_id = ?")
+      .get(convId) as { n: number };
+    expect(n.n).toBe(1);
+    h.store.close();
+  });
+
+  it("rolls back an implicitly-created direct conversation when no message was written (n == 0)", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A", { initiate: [] }); // 不能发起 ⇒ ensureDirect 后 initiate 校验拒绝
+    await addAcc(h, "B");
+    const convId = directConversationId("A", "B");
+    await expect(
+      h.router.route(msg("A", convId, { to: ["B"] })),
+    ).rejects.toMatchObject({ code: "CANNOT_INITIATE" });
+    // N02：n == 0 ⇒ 空 direct 会话（含成员/inbox/会话行）被回滚删除
+    expect(h.registry.getConversation(convId)).toBeUndefined();
+    h.store.close();
+  });
+
+  it("covers the topic sort comparator's else arm via DB/JS collation divergence", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    // listSubscribers 按 PK（UTF-8 字节序）升序返回，而 JS `<` 按 UTF-16 码元比较。
+    // 选两个相反的账号 ID，使序返回 [s1, s2] 但 (s1 < s2) 为 false ⇒ 比较器 return 1。
+    const s1 = ""; // U+E000：UTF-8 EE 80 80（UTF-16 0xE000，JS 中大于 s2）
+    const s2 = "\u{10000}"; // U+10000：UTF-8 F0 90 80 80（UTF-16 0xD800 起，JS 中较小）
+    await addAcc(h, s1);
+    await addAcc(h, s2);
+    const topic = await h.registry.createConversation({
+      type: "topic",
+      creator: "A",
+    });
+    h.registry.subscribe(topic.id, s1, 0);
+    h.registry.subscribe(topic.id, s2, 0);
+    const r = await h.router.route(
+      msg("A", topic.id, { kind: "event", text: "x" }),
+    );
+    const ids = deliveriesOf(h, r.messageId)
+      .map((x) => String(x.account_id))
+      .sort();
+    expect(ids).toEqual([s1, s2].sort());
+    h.store.close();
   });
 });

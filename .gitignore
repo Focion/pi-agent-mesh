@@ -16,3 +16,6 @@ demo/demo.config.json
 dist-tarball/
 # 本地 agent 工具记忆目录（非项目代码）
 .workbuddy/
+# W15 门产物（覆盖报告、gap 台账结果）
+coverage/
+reports/

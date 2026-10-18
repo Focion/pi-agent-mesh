@@ -6,14 +6,16 @@
 //   node scripts/pack.mjs [--skip-tests] [--skip-verify] [--out <dir>]
 //
 // 步骤：
-//   1. Node 版本守卫（>=20；完整 pi 测试套件需要 >=22.19）
-//   2. tsc --noEmit + check:imports（G1–G4 门禁）
+//   1. Node 版本守卫（>=22.19；完整 pi 测试套件与依赖矩阵见 C07）
+//   2. tsc --noEmit + check:imports（G1–G4 门禁）+ gen-snapshots --check（API/DDL 基线）
 //   3. vitest（除非 --skip-tests）
 //   4. `npm pack --json`（package.json 的 prepack 钩子已跑 `npm run build`）
 //   5. 校验 tarball 文件名单
-//   6. 离线消费者冒烟（除非 --skip-verify）：解包到临时 node_modules，只软链
-//      better-sqlite3（模拟消费者只装了 dependencies），import/require 根入口与
-//      core 子入口，确认无「静态 pi 依赖泄漏」且 ESM/CJS 双条件都能用。
+//   6. 离线消费者冒烟（除非 --skip-verify）：解包到临时 node_modules，先只软链
+//      better-sqlite3（core-only 路径，pi 未安装也须能 import），import/require
+//      根入口与 core 子入口，确认无「静态 pi 依赖泄漏」且 ESM/CJS 双条件都能用；
+//      再补软链 pi/@types，用仓库 tsc 编译 .mts/.cts 消费用例（C08：根与 core 的
+//      .d.ts/.d.cts 声明都能被 ESM 与 CJS 消费者解析）。
 //
 // 产物落在 dist-tarball/（已 gitignore），不会 publish 到任何 registry。
 // ═══════════════════════════════════════════════════════════════════════════
@@ -32,6 +34,8 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { validateTypesConsumers } from "./lib/consume.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PKG = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
@@ -81,12 +85,9 @@ function requireRun(cmd, argv, label) {
 {
   const [maj, min] = process.versions.node.split(".").map(Number);
   const full = process.versions.node;
-  if (maj < 20) fail(`Node 版本要求 >=20（engines），当前 ${full}。`);
-  const warnPi = maj < 22 || (maj === 22 && min < 19);
+  const below = maj < 22 || (maj === 22 && min < 19);
+  if (below) fail(`Node 版本要求 >=22.19.0（C07 engines），当前 ${full}。`);
   process.stdout.write(`[pack] node ${full} · 包 ${PKG.name}@${PKG.version}\n`);
-  if (warnPi) {
-    process.stdout.write(`       提示：完整测试会加载 pi（需 >=22.19）；可用 --skip-tests 跳过。\n`);
-  }
 }
 
 // ── 2. 源码门禁 ────────────────────────────────────────────────────────────
@@ -94,6 +95,7 @@ function requireRun(cmd, argv, label) {
 step("类型检查 + 边界门禁");
 requireRun(npm, ["run", "typecheck"], "tsc --noEmit");
 requireRun(npm, ["run", "check:imports"], "check:imports（G1–G4）");
+requireRun(process.execPath, ["scripts/gen-snapshots.mjs", "--check"], "gen-snapshots --check（API/DDL 基线）");
 
 // ── 3. 测试 ─────────────────────────────────────────────────────────────────
 
@@ -139,9 +141,11 @@ const REQUIRED = [
   "dist/index.js",
   "dist/index.cjs",
   "dist/index.d.ts",
+  "dist/index.d.cts",
   "dist/core/index.js",
   "dist/core/index.cjs",
   "dist/core/index.d.ts",
+  "dist/core/index.d.cts",
   "migrations/000_init.sql",
 ];
 for (const p of REQUIRED) {
@@ -158,7 +162,7 @@ ok(`含 ${REQUIRED.length} 个关键文件，无 src/demo/tests/docs/node_module
 if (SKIP_VERIFY) {
   ok("已跳过消费者冒烟（--skip-verify）");
 } else {
-  step("离线消费者冒烟（仅 better-sqlite3，模拟外部 install 后 import）");
+  step("离线消费者冒烟（core-only：仅 better-sqlite3，pi 未安装也须能 import）");
   const tmp = mkdtempSync(join(tmpdir(), "mesh-pack-"));
   try {
     const nm = join(tmp, "node_modules");
@@ -168,8 +172,9 @@ if (SKIP_VERIFY) {
     const tarRes = run("tar", ["-xzf", tarball, "-C", pkgDir, "--strip-components=1"]);
     if (tarRes.status !== 0) fail(`解包失败：${tarRes.stderr || tarRes.stdout}`);
 
-    // 模拟消费者「只装了 dependencies」：软链 better-sqlite3 进临时 node_modules。
-    // 关键断言：root/core 入口不静态 import pi（pi 是可选的动态加载 peer）。
+    // core-only 路径：只软链 better-sqlite3，不软链 pi。pi 现在在 dependencies 里
+    // （LD3），但仍经 loadPiSdk() 惰性加载——若 root/core 入口静态 import pi，
+    // 这里 import 就会因模块缺失而抛错，故该冒烟等价于「pi 未静态加载」断言。
     const bsqlRoot = join(ROOT, "node_modules", "better-sqlite3");
     if (!existsSync(bsqlRoot)) fail("仓库 node_modules/better-sqlite3 缺失——先 npm install。");
     symlinkSync(bsqlRoot, join(nm, "better-sqlite3"), "dir");
@@ -211,6 +216,11 @@ console.log("CJS ok: require 双入口均可用");
     const cjsRes = run(process.execPath, ["consumer.cjs"], { cwd: tmp });
     if (cjsRes.status !== 0) fail(`CJS 消费者失败：\n${cjsRes.stderr || cjsRes.stdout}`);
     ok(cjsRes.stdout.trim());
+
+    // C08：类型面消费（抽到 scripts/lib/consume.mjs）：用仓库 tsc 编译 .mts/.cts，
+    // 确认根与 core 入口的声明（含 .d.cts）在两个模块系统下都可解析。
+    step("类型面消费（.mts/.cts → dist/*.d.ts & *.d.cts）");
+    validateTypesConsumers({ tmp, nm, run, ok, fail });
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -220,5 +230,5 @@ console.log("CJS ok: require 双入口均可用");
 
 process.stdout.write(`\n✅ 打包完成：${tarball}\n`);
 process.stdout.write(`   外部安装：npm i ${tarball}\n`);
-process.stdout.write(`   使用 pi 流（warm/nudge/stream）需另装可选 peer：npm i @earendil-works/pi-coding-agent\n`);
+process.stdout.write(`   使用 pi 流（warm/nudge/stream）：pi 已是直接依赖，随包安装、惰性加载\n`);
 process.stdout.write(`   未上传到任何 registry（npm pack 本地产物）。\n`);

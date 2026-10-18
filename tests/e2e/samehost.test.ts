@@ -18,6 +18,7 @@ import { createMesh } from "../../src/index.js";
 import type { MeshHost, SessionFactory } from "../../src/index.js";
 import { EndpointLock } from "../../src/index.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
+import { assertInvariants } from "../helpers/invariants.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -106,7 +107,8 @@ describe("sameHost two-process delivery (§19.3)", () => {
       from: "A",
       conversationId: conv.id,
       kind: "chat",
-      expect: "none",
+      expect: "ack", // 使 B 进入原文预算内（P1 全文），真正的跨进程全文投递路径
+      to: ["B"],
       text: "跨进程测试消息",
     });
     await flush();
@@ -142,8 +144,8 @@ describe("sameHost two-process delivery (§19.3)", () => {
     expect(mine.every((o) => o.state === "done")).toBe(true);
 
     // ── ⑦ 不变式验证 ──
-    expect(await ctxA.host.observer.checkInvariants().then((r) => r.violations)).toEqual([]);
-    expect(await ctxB.host.observer.checkInvariants().then((r) => r.violations)).toEqual([]);
+    await assertInvariants(ctxA.host);
+    await assertInvariants(ctxB.host);
 
     await ctxA.host.close();
     await ctxB.host.close();
@@ -183,7 +185,8 @@ describe("sameHost two-process delivery (§19.3)", () => {
       from: "A",
       conversationId: conv.id,
       kind: "chat",
-      expect: "none",
+      expect: "ack", // 使 B 进入原文预算内（P1 全文），真正的跨进程全文投递路径
+      to: ["B"],
       text: "幂等测试",
     });
 
@@ -198,8 +201,8 @@ describe("sameHost two-process delivery (§19.3)", () => {
     expect(matches.length).toBeGreaterThanOrEqual(1);
 
     // 不变式仍绿
-    expect(await ctxA.host.observer.checkInvariants().then((r) => r.violations)).toEqual([]);
-    expect(await ctxB.host.observer.checkInvariants().then((r) => r.violations)).toEqual([]);
+    await assertInvariants(ctxA.host);
+    await assertInvariants(ctxB.host);
 
     await ctxA.host.close();
     await ctxB.host.close();

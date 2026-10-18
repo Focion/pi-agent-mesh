@@ -12,7 +12,7 @@
 
 ## 项目与目录
 
-`@pi/agent-mesh` 是基于 pi SDK 的多持久 Agent 消息传递与共享状态层。使用 TypeScript、better-sqlite3、Vitest 与 tsup；发布 ESM、CJS 和类型声明，pi SDK 为 optional peer。
+`@pi/agent-mesh` 是基于 pi SDK 的多持久 Agent 消息传递与共享状态层。使用 TypeScript、better-sqlite3、Vitest 与 tsup；发布 ESM、CJS 和类型声明；pi SDK（`@earendil-works/pi-coding-agent` `^1.1.0`）为直接依赖、惰性加载（core-only 使用者不加载 pi）。
 
 | 路径 | 职责 |
 | --- | --- |
@@ -27,7 +27,7 @@
 
 ## 环境与常用命令
 
-使用 npm 与现有 `package-lock.json`。包本身声明 Node.js ≥20，但锁定的 pi SDK 开发依赖要求 Node.js ≥22.19.0；完整开发、测试和 demo 环境按后者准备。better-sqlite3 含原生模块，依赖安装失败时先检查 Node 版本及本机编译环境。
+使用 npm 与现有 `package-lock.json`。包声明 Node.js ≥22.19.0（engines），完整开发、测试和 demo 环境按此准备。better-sqlite3 含原生模块，依赖安装失败时先检查 Node 版本及本机编译环境。
 
 在仓库根目录执行：
 
@@ -49,7 +49,7 @@ npm test -- tests/core/store.test.ts  # 单文件验证示例
 - **维持分层**：`src/core/` 不得依赖 pi SDK；`src/pi/` 只能引用 core 的 `types`、`util`、`contracts`，不要跨层导入具体实现。跨层装配放在 `src/index.ts`。
 - **遵守源码门禁**：`scripts/check-imports.mjs` 扫描 `src/`，禁止 `sendUserMessage(...)`、`.clearQueue(...)`、`forkFrom(...)`、`.prompt(...)` 调用形态及指定业务词；文本扫描也会匹配注释。具体词表以脚本为准，不靠放宽门禁绕过限制。契约测试对禁用 API 的探测不应误当成库内实现示范。
 - **保持宿主无关**：模型、工具与业务语义由宿主提供；`sessionFactory` 是必填策略。业务扩展通过 `ext` 透传，不把业务概念塞进 core。
-- **保持类型与包边界**：使用严格 TypeScript、NodeNext 和 `.js` 相对导入，类型使用 `import type`。修改公共 API 时同步检查类型、导出入口、测试、示例与规范；保留 optional peer 的隔离，不让 core 使用者被迫加载 pi SDK。
+- **保持类型与包边界**：使用严格 TypeScript、NodeNext 和 `.js` 相对导入，类型使用 `import type`。修改公共 API 时同步检查类型、导出入口、测试、示例与规范；保留惰性加载的隔离，不让 core 使用者被迫加载 pi SDK。
 - **保持事务原子性**：消息序号分配、消息/FTS/delivery 写入及相关状态更新须保持既有事务边界；`Store.tx` 不支持嵌套。恢复逻辑可以重算派生缓存，不可重算权威字段 `cursor_seq`、`folded_to_seq`。schema 变更同时考虑迁移、恢复和兼容性。
 - **保持投递语义**：P1 流投递中，`deliver` 返回不代表已投递；`delivered` 依据条目镜像确认，`consumed` 按 turn_end 归因。P2 注入、P3 note 与 sink 路径遵循各自的确认规则，不要混用。不要把 SDK 队列深度当作背压依据，也不要跳过幂等与重试测试。
 - **保持单写者与身份边界**：端点始终遵守单写者锁，`shared` 租约不表示允许并发写者。工具身份由闭包绑定，幂等 token 使用 tool-call ID；不要信任调用参数自报身份。消息渲染保留包裹与转义。

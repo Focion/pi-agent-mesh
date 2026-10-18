@@ -1,9 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // mesh 面板 · 运行时控制器（全真实装配，实时 LLM）。
 //
+// ── 启动顺序 ──────────────────────────────────────────────────────────────
 // 一行 import 组装真实 MeshHost：createMesh 不填 streamPort/transport，由库自动
-// 装配真实 PiStreamPort + InProcessTransport；createPiSessionFactory 注入真实
-// Model（config 层已 fail-fast 校验）。无 faux、无 FakeStreamPort、无离线模拟。
+// 装配真实 PiStreamPort + InProcessTransport；sessionFactory 走 Mesh 统一 LLM 配置
+// 的缺省装配（createAssembledSessionFactory，完全隔离），注入由 config 层已
+// fail-fast 校验的 llm/runtime。无 faux、无 FakeStreamPort、无离线模拟。
 //
 // 每个 agent 端点都跑一个真实 pi AgentSession（sessionFactory 捕获留存），
 // 群聊「接龙」由控制器显式驱动：发消息后，群里其它 agent 各自用真实 session
@@ -15,7 +17,7 @@
 //  - 用 endpoint_state_changed / presence_changed 事件维持最新投影。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { createMesh, createPiSessionFactory } from "../../dist/index.js";
+import { createAssembledSessionFactory, createMesh } from "../../dist/index.js";
 import type {
   Account,
   Cap,
@@ -31,6 +33,7 @@ import type {
   StreamTopology,
   Unsubscribe,
 } from "../../dist/core/index.js";
+import type { ResolvedLlm } from "../../dist/index.js";
 import type { DemoConfig } from "./config.ts";
 
 const isoNow = () => new Date().toISOString();
@@ -66,7 +69,7 @@ export interface ChatEntry {
 
 export class MeshController {
   readonly config: DemoConfig;
-  private readonly model: unknown;
+  private readonly resolvedLlm: ResolvedLlm;
   private readonly hooks: ControllerHooks;
 
   host!: MeshHost;
@@ -87,20 +90,22 @@ export class MeshController {
   private chatLog = new Map<string, ChatEntry>();
   private chatBusy = false;
 
-  constructor(config: DemoConfig, model: unknown, hooks: ControllerHooks) {
+  constructor(config: DemoConfig, resolvedLlm: ResolvedLlm, hooks: ControllerHooks) {
     this.config = config;
-    this.model = model;
+    this.resolvedLlm = resolvedLlm;
     this.hooks = hooks;
   }
 
   // ── 装配（§12.1）─────────────────────────────────────────────────────────
   async init(): Promise<void> {
-    const base = createPiSessionFactory({
+    // 本面板需要拿到每个端点的真实 pi AgentSession（群聊接龙由控制器显式驱动
+    // session.prompt 生成回复），故走高级路径：用缺省装配的工厂（完全隔离 LD2）
+    // 包一层捕获 piSessionId 与 session 对象，再经 policies.sessionFactory 交给
+    // createMesh。不直接走 createMesh({ llm, runtime })——那会隐藏 session 内部。
+    const base = await createAssembledSessionFactory({
       stateDir: this.config.stateDir,
-      ...(this.config.agentDir ? { agentDir: this.config.agentDir } : {}),
-      model: this.model,
-      thinkingLevel: this.config.thinkingLevel,
-      ...(this.config.tools.length > 0 ? { tools: this.config.tools } : {}),
+      llm: this.resolvedLlm,
+      runtime: this.config.runtime,
     });
     // 包一层捕获 piSessionId 与真实 session 对象（接龙回复要用）。
     const controller = this;
@@ -897,7 +902,7 @@ function contentToText(content: unknown): string {
 }
 
 /**
- * demo 群聊接龙用到的 pi AgentSession 结构子集（真机由 createPiSessionFactory 产出）。
+ * demo 群聊接龙用到的 pi AgentSession 结构子集（真机由 createAssembledSessionFactory 产出）。
  * 事件与方法的形状对齐 pi-coding-agent/dist/core/agent-session：仅 message_end 事件
  * 携带完整的 event.message；waitForIdle/getLastAssistantText 是取整轮回复的稳定原语。
  */

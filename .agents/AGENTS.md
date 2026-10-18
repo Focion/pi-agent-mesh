@@ -5,7 +5,7 @@
 ## 项目上下文
 
 - 项目简介：`@pi/agent-mesh` —— 构建在 pi SDK 之上的多持久 Agent 消息传递与共享状态层（v0.1.0，规范面 v1.0.0 已定稿）。
-- 技术栈：TypeScript（ESM + CJS 双产物，tsup 构建）、Node ≥ 20、better-sqlite3 存储、vitest 测试；pi SDK（`@earendil-works/pi-coding-agent` ≥ 0.84.4）为 optional peer。
+- 技术栈：TypeScript（ESM + CJS 双产物，tsup 构建）、Node ≥ 22.19.0、better-sqlite3 存储、vitest 测试；pi SDK（`@earendil-works/pi-coding-agent` `^1.1.0`）为直接依赖、惰性加载。
 - 入口与关键模块：
   - `src/index.ts` —— 包根装配入口（`createMesh` / `MeshHost`），唯一构造函数，可同时 import core 与 pi。
   - `src/core/**` —— mesh-core：类型契约、存储、路由、投递、工具面、策略、渲染、观测。**零 pi 依赖**（CI 门禁 G1）。
@@ -48,7 +48,7 @@
 | 文档 | 说明 |
 | --- | --- |
 | [`notes/tech/2026-09-07-pi-agent-mesh-spec.md`](notes/tech/2026-09-07-pi-agent-mesh-spec.md) | **权威规范 v1.0.0**：平台基线、架构、投递语义、存储 schema、API、不变量、决策记录与风险登记。代码里的 `§x.y` 引用都指向它。 |
-| [`notes/plan/2026-09-07-p0-p1-rollout.md`](notes/plan/2026-09-07-p0-p1-rollout.md) | 落地实施计划：本轮交付 P0 全量 + P1 核心，含阶段泳道、文件清单与验收项；P2–P5 的延后范围见 §1。 |
+| [`notes/plan/2026-10-12-consolidated-open-work-plan.md`](notes/plan/2026-10-12-consolidated-open-work-plan.md) | **唯一有效的未完成事项计划**：0.1.0 本地稳定版（C01–C10 合同、69 项审计登记、W00–W16 工作包、G01–G09 门槛）与 Mesh 统一 LLM 配置。已完成的早期计划和 review 见 `notes/archive/`。 |
 
 规范体量很大（8000+ 行），按需读章节而不是整篇：查投递行为看 §7，查表结构看 §11，查对外 API 看 §12，查不变量看 §22.1。
 

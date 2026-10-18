@@ -176,20 +176,28 @@ export interface Mailbox {
   beforeClearQueue(endpointId: EndpointId): Promise<void>;
   /** sink/external 的消费确认（无 turn_end，§12.2 ④） */
   markConsumed(deliveryId: DeliveryId): Promise<void>;
+  /** §8.4 崩溃恢复：delivered P1 非 queue 行按 entry_id 对真实 session 双向核对——
+   *  在 → consumed(partial)；不在 → queued 重投；拿不到 session → park + 告警（§23.6）。
+   *  幂等：门控 state IN ('delivered','parked')（parked 行下次 warm 成功重验），反复调用结果一致。
+   *  启动 ③ / sweep / warm 三处触发。 */
+  reconcileDelivered(): Promise<void>;
   inboxOf(accountId: AccountId): InboxView;
   /** P2 注入体（context 钩子每次 LLM 调用前重算，不落盘） */
   inboxInjection(endpointId: EndpointId): string | null;
-  /** §7.6：P2 注入完成即 delivered（无 entry_id；turn_end 再 consumed） */
-  markInjectedDelivered(endpointId: EndpointId): void;
+  /** §7.6：P2 按「实际进入某轮最终输入」确认——该端点注入体被 context_with_system 观测后，
+   *  把该端点全部 path='P2' 且 queued 的行推为 delivered（无 entry_id；turn_end 再 consumed）。 */
+  confirmInjection(endpointId: EndpointId): void;
   /** 背压自持计数：该端点 queued+delivered 行数（F3） */
   inFlightCount(endpointId: EndpointId): number;
 
   // ── queue（§17）：claim / ack / 租约回收 ──
-  /** delivered → claimed，写入 claim_until 与 payload.claim（被他人持有 → CLAIM_TAKEN；自己的已过期 → CLAIM_EXPIRED） */
+  /** delivered → claimed，claim 归属写入 delivery 列 claimed_by/claimed_at（正文 payload 不变，A1）；
+   *  非该消息消费者 claim → CLAIM_TAKEN；自己已过期 → CLAIM_EXPIRED；他人过期 → 回收后重新认领。 */
   claim(messageId: MessageId, by: AccountId): Promise<{ ok: boolean; leaseUntil?: string }>;
-  /** queue 确认或拒绝：成功 claimed → acked；error → nack（claimed → queued / MAX_ATTEMPTS → dropped） */
+  /** queue 确认或拒绝：成功 claimed → acked（同事务闭合 pending_acks.answered + 前移 cursorSeq）；
+   *  error → nack（claimed → queued / MAX_ATTEMPTS → dropped + dead-letter）。 */
   ackQueue(messageId: MessageId, by: AccountId, error?: unknown): Promise<void>;
-  /** sweep ⑤：回收过期的 claimed / delivered-claimable 租约（满足 C13） */
+  /** sweep ⑤：回收过期的待领（delivered）/ 持有（claimed）两窗口租约（满足 C13） */
   reclaimExpiredClaims(nowMs?: number): Promise<void>;
 }
 
@@ -211,7 +219,7 @@ export interface SharedSpace {
     opts: { as: AccountId; maxLen?: number },
   ): Promise<{ version: number }>;
   del(spaceId: SpaceId, key: string, opts: { as: AccountId }): Promise<void>;
-  list(spaceId: SpaceId, opts: { as: AccountId; keyPrefix?: string }): Promise<SharedObjectMeta[]>;
+  list(spaceId: SpaceId, opts: { as: AccountId; keyPrefix?: string; sinceVersion?: number; limit?: number }): Promise<SharedObjectMeta[]>;
 }
 
 // ─── ToolContext（§10.2：工具执行上下文，身份由闭包注入，M6）─────────────
@@ -243,8 +251,20 @@ export interface ToolContext {
   ack(r: { correlationId: string; data?: unknown; error?: unknown }): Promise<void>;
   claim(messageId: string): Promise<{ ok: boolean; leaseUntil?: string }>;
   sharedGet(spaceId: string, key: string, version?: number): Promise<unknown>;
-  sharedPut(spaceId: string, key: string, data: unknown, expectedVersion?: number): Promise<{ version: number }>;
-  sharedList(spaceId: string, keyPrefix?: string): Promise<Array<{ key: string; version: number }>>;
+  /** I21：op/contentType/maxLen 要么生效要么拒绝；replace（缺省）走 CAS，append 走追加（maxLen 裁剪）。 */
+  sharedPut(
+    spaceId: string,
+    key: string,
+    data: unknown,
+    opts?: { expectedVersion?: number; contentType?: string; op?: "replace" | "append"; maxLen?: number },
+  ): Promise<{ version: number }>;
+  /** I21：sinceVersion 只列该版本之后的键；limit 封顶（读 ACL 过滤后）。返回只含元信息。 */
+  sharedList(
+    spaceId: string,
+    opts?: { keyPrefix?: string; sinceVersion?: number; limit?: number },
+  ): Promise<Array<{ key: string; version: number; updatedBy: AccountId; updatedAt: string }>>;
+  /** I08：工具读史计量——mesh_history 返回的原文份数计入原文预算统计口径（§10.2）。 */
+  countVerbatim?(bytes: number): void;
 }
 
 // ─── 组装件（index.ts 装配用）────────────────────────────────────────────

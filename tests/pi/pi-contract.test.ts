@@ -41,10 +41,14 @@ describe("pi contract CT-F1: 入队式追加（不带 triggerTurn）永不触发
   });
 });
 
-describe("pi contract CT-F2: 轮次结束/安定事件无可用载荷", () => {
+describe("pi contract CT-F2: 轮次结束/安定事件无消息归因载荷", () => {
   // 保护：§7.9 consumed 靠 entry_appended + turn_end 归因（F2）。
   // 变红意味着：可以简化归因——但在本测试变绿前不得简化。
-  it("agent_settled 除 type 外无任何字段，无法据它归因『哪条消息被消费』", async () => {
+  //
+  // 0.85.1 → 1.1.0 复核（2026-10-13）：agent_settled 从「仅 type」变为
+  // 「type + aborted:boolean」。aborted 只说明本轮是否被中止，不指向任何
+  // message/entry，仍无法据它归因『哪条消息被消费』，故 F2 结论不变。
+  it("agent_settled 只有 type + aborted，无法据它归因『哪条消息被消费』", async () => {
     const compat = await loadFauxCompat();
     t = await createPiTestSession([compat.fauxAssistantMessage("ok")]);
     await t.session.sendCustomMessage(
@@ -54,7 +58,8 @@ describe("pi contract CT-F2: 轮次结束/安定事件无可用载荷", () => {
     const settled = t.events.filter((e) => e.type === "agent_settled");
     expect(settled.length).toBeGreaterThan(0);
     for (const s of settled) {
-      expect(Object.keys(s)).toEqual(["type"]);
+      expect(Object.keys(s).sort()).toEqual(["aborted", "type"]);
+      expect(typeof (s as { aborted?: unknown }).aborted).toBe("boolean");
     }
   });
 });

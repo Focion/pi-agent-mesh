@@ -14,9 +14,9 @@
 | **request-response** — request/ack + 超时/迟到/环检测 (§14) | ✅ 全量 |
 | **queue** — claim/requeue + attempts/maxAttempts/sweep (§17) | ✅ 全量 |
 | **共享空间** — get/put/append/del/list + CAS + ACL (§18) | ✅ 全量 |
-| **observer.replay** — 零 LLM 回放转写 | ✅ 全量 |
+| **observer.replay** — 基础转写（非历史精确重建） | ✅ 全量 |
 | **observer.forkAt** — P5 deferred | ⏳ MeshUnsupportedError |
-| **多进程 Transport** — P5 deferred | ⏳ 不做 |
+| **多进程 Transport** — sameHost 同机多进程（§19） | ✅ 全量（跨机 Transport 不在范围） |
 
 ## 安装与起步
 
@@ -32,7 +32,7 @@ import { createMesh } from "@pi/agent-mesh";
 
 const host = await createMesh({
   dbPath: "./mesh.db",
-  policies: { sessionFactory }, // sessionFactory 是唯一必填槽（§12.1）
+  policies: { sessionFactory }, // 未配 llm 时 sessionFactory 仍是必填槽（§12.1）
 });
 
 const alice = await host.registerAccount({
@@ -45,18 +45,23 @@ const { messageId } = await host.send({
 });
 ```
 
-### 接真实 pi SDK
+### 接真实 pi SDK（Mesh 统一 LLM 配置）
 
-把 `sessionFactory` 换成 `createPiSessionFactory`，endpointClass 用 `"stream"`，warm 端点即可：
+只要给 `llm`（与可选的 `runtime`）配置，库就在内部完成**完全隔离**的 pi 装配（不读 `~/.pi`，不启用内建工具），endpointClass 用 `"stream"`，warm 端点即可：
 
 ```ts
-import { createMesh, createPiSessionFactory } from "@pi/agent-mesh";
+import { createMesh } from "@pi/agent-mesh";
 
 const host = await createMesh({
   dbPath: "./mesh.db",
-  policies: {
-    sessionFactory: createPiSessionFactory({ stateDir: "./.pi-state", model }),
+  llm: {
+    model: "anthropic:claude-sonnet-4-5",
+    apiKeyEnv: "ANTHROPIC_API_KEY", // 生产首选；测试链路可用 apiKey
+    // 自定义 OpenAI 兼容端点（可选）：
+    // providers: { my: { baseUrl: "https://x.example.com/v1", apiKeyEnv: "MY_LLM_KEY" } },
+    //   model: "my:gpt-4-mini",
   },
+  runtime: { builtinTools: [] }, // [] = 全禁内建工具；mesh 工具恒保留
 });
 
 const alice = await host.registerAccount({
@@ -66,6 +71,8 @@ const ep = await host.registerEndpoint({ accountId: "alice", topology: { kind: "
 await host.warm(ep.id, "shared"); // 真实 LLM 冷起
 ```
 
+需要拿到 session 内部（自行驱动 LLM 轮）的宿主可走高级路径：`policies.sessionFactory: await createAssembledSessionFactory({ stateDir, llm, runtime })`（`llm`/`runtime` 与上面同 schema）。
+
 ## 完整 API 面
 
 ### 账号与会话
@@ -73,7 +80,7 @@ await host.warm(ep.id, "shared"); // 真实 LLM 冷起
 - `registerAccount(opts)` → `Account`
 - `registerEndpoint({ accountId, topology })` → `Endpoint`
 - `registerSinkHandler(accountId, handler)` → `Unsubscribe`
-- `setPresence(accountId, state, opts?)` — available/busy/dnd/away/offline
+- `setPresence(accountId, state, opts?)` — available/busy/dnd/away/online/idle/offline（`online`/`idle` 为 stream 派生态，`available`/`away` 为 legacy 别名）
 - `lookup({ query?, capabilities?, limit? })` → `Account[]`
 - `upsertContact(ownerId, peerId, opts?)`
 
@@ -126,7 +133,7 @@ ACL：默认 `global`/`acct:` 仅 owner 可读写，`conv:` 会话成员可读�
 - `host.observer.inboxOf(accountId)` — 收件箱快照
 - `host.observer.counters(names?, since?)` — 计数器
 - `host.observer.checkInvariants()` — C1–C16 不变量自检（含 C13 claimed 不过期）
-- `host.observer.replay(endpointId, { untilSeq? })` — 零 LLM 回放转写
+- `host.observer.replay(endpointId, { untilSeq? })` — 基础转写（非历史精确重建）
 - `host.observer.streamEntries(piSessionId, { sinceSeq? })` — 读取原始流条目
 
 ### 事件
@@ -142,7 +149,7 @@ policy_degraded    invariant_violated
 
 ## Demo 面板
 
-全真实装配的面板（真实 PiStreamPort + 真实 LLM），本地 SSE + 静态页，支持所有能力的界面测试。
+全真实装配的**群聊面板**（真实 PiStreamPort + 真实 LLM 接力回复），本地 SSE + 静态页。首启预置 Alice / Bob / Carol 三个 agent，可再注册自定义 agent（名字 + 人设）；发一条消息后，群里其余 agent 各自用真实 LLM 接力回复。支持 @定向（点名单个成员）与 1–3 轮并发接龙，模型异常以系统气泡回显。面板聚焦「多 agent 群聊」这一条用户路径，不覆盖 forkAt / 多进程 / request-应答等全部能力面。
 
 ```bash
 npm run demo:start        # 启动 → http://localhost:8787
@@ -150,42 +157,52 @@ npm run demo:start        # 启动 → http://localhost:8787
 
 ### 配置
 
-环境变量 `PI_API_KEY` 或 `demo/demo.config.example.json` → `demo/demo.config.json`：
+`demo/demo.config.json`（首次运行由 `demo.config.example.json` 复制）直接内嵌 Mesh 的 `llm` / `runtime` 配置：
 
 ```json
 {
-  "dbPath": "demo/.data/mesh.db",
-  "stateDir": "demo/.data/pi-state",
-  "thinkingLevel": "minimal",
-  "tools": [],
+  "llm": {
+    "model": "anthropic:claude-sonnet-4-5",
+    "thinkingLevel": "medium",
+    "apiKeyEnv": "ANTHROPIC_API_KEY"
+  },
+  "runtime": {
+    "builtinTools": []
+  },
   "port": 8787
 }
 ```
 
-模型凭据写在 `demo/models.json`（见 `demo/models.json.example`）。
+自定义 OpenAI 兼容端点写在 `llm.providers`（本面板不读 `~/.pi` 的 models.json / auth.json）：
 
-### Tab 说明
+```json
+{
+  "llm": {
+    "model": "my:gpt-4-mini",
+    "providers": {
+      "my": { "baseUrl": "https://your-host.example.com/v1", "apiKeyEnv": "MY_LLM_KEY" }
+    }
+  }
+}
+```
 
-| Tab | 功能 |
+凭据可由 `llm.apiKey`（仅测试链路）或 `llm.apiKeyEnv`（生产首选，指向环境变量名）提供；无凭据 / 坏模型会 fail-fast 退出。
+
+### 面板功能（群聊）
+
+| 区域 | 功能 |
 | --- | --- |
-| 状态/事件 | 运行配置 + 实时事件流（15 个 MeshEvent + sink_received） |
-| 账号与端点 | registerAccount / registerEndpoint / presence / contact / lookup |
-| 会话与成员 | createConversation / ensureDirect / 九群操作 + subscribe/unsubscribe |
-| 发送 | send 组合器（kind/expect/priority/to/mentions） |
-| Sink | sink 模式切换（accept/refuse/auto-consume）+ sink_received 事件 |
-| 流控制/Agent | warm/evict/nudge/injectContext/toolSet/streamEntries |
-| Observer/Trace | trace/messages/search/inboxOf/counters/checkInvariants |
-| 验收 P0/P1 | 一键场景 + 实时验收比值 |
-| Topic | subscribe/unsubscribe + publish + inboxOf |
-| 请求-应答 | request（非阻塞/阻塞）+ ack + trace |
-| Queue | claim + ack/nack + requeue + trace |
-| 共享空间 | get/put/append/del/list + CAS |
-| Replay | observer.replay + streamEntries + forkAt（unsupported） |
+| 注册 Agent | 名字 + 人设（可选）注册 stream agent，即时入群并 warm |
+| 群成员 | 花名册实时列表（含 3 个 seed：Alice / Bob / Carol） |
+| 群聊消息流 | 首屏历史 + SSE 实时去重推送；系统气泡（入群 / 异常）居中显示 |
+| 发消息 | 以任意成员身份发；`自动接力 1–3 轮`（其余成员并发回复）或关 |
+| @定向 | 点名单个成员（`@名字` 或「定向」下拉）仅该成员回 1 条；否则全体广播 |
+| 模型异常回显 | agent 回复失败 / 超时以系统气泡回显原因，思考气泡撤回 |
 
 ## 测试
 
 ```bash
-npm test                 # vitest，209 tests（11 个测试文件）
+npm test                 # vitest，622 tests（70 文件）+ 4 bench
 npm run typecheck        # tsc --noEmit，0 errors
 node scripts/check-imports.mjs  # mesh-core 零 pi import（G1–G4）
 npm run build            # tsup：esm + cjs + dts
@@ -194,17 +211,13 @@ npm run build            # tsup：esm + cjs + dts
 ### 测试文件
 
 ```
-tests/core/mailbox.test.ts    — 投递状态机、claim/ack/超时/sweep
-tests/core/observer.test.ts   — trace/inboxOf/counters/checkInvariants/replay
-tests/core/policies.test.ts   — 策略槽
-tests/core/router.test.ts     — 路由、环检测、topic fanout、queue consumer
-tests/core/shared.test.ts     — 共享空间 get/put/append/del/list + CAS + ACL
-tests/core/store.test.ts      — SQLite store
-tests/core/tools.test.ts      — 工具定义与执行
-tests/pi/stream-port.test.ts  — StreamPort 契约
-tests/e2e/acceptance.test.ts  — P1/P0 + topic/request-reply/queue/shared 端到端
-tests/e2e/options.test.ts     — createMesh options
-tests/helpers/                — FakeStreamPort 等
+tests/core/     36 文件 — 存储/迁移/恢复、投递状态机、路由、邮箱、策略、共享空间、
+                         工具、渲染、观测、envelope/health/seal/transport 等单测
+tests/pi/       15 文件 — StreamPort 契约、pi SDK 适配、LLM 配置解析、session 工厂
+                         （真实 SDK + faux provider）
+tests/e2e/      19 文件 — P0/P1、topic、request-应答、queue、共享空间、sameHost §19 端到端
+tests/bench/     4 文件 — 基准（bench），不参与门禁
+tests/helpers/          — 公共辅助（FakeStreamPort、gap-ledger、disposition、invariants…）
 ```
 
 ## 工程结构
@@ -212,20 +225,24 @@ tests/helpers/                — FakeStreamPort 等
 ```
 src/index.ts            mesh 包根装配：createMesh + MeshHost
 src/core/               mesh-core：store/router/mailbox/observer/policies/tools/
-                          shared/contracts（零 pi import）
+                          shared/contracts/envelope/health/seal/transport（零 pi import）
 src/pi/                 mesh-pi：PiStreamPort / SessionFactory / EndpointLock
-migrations/             SQLite 迁移（000_init.sql，17 表）
-demo/                   面板（node:http + SSE + 静态页）
+migrations/             SQLite 迁移（000_init.sql + 001–004）
+demo/                   群聊面板（node:http + SSE + 静态页）
   src/runtime.ts        控制器（MeshHost 全委托）
   src/rpc.ts            RPC 命令表
   src/server.ts         HTTP 服务
   src/sse.ts            SSE 事件推送
+  src/config.ts         demo 配置（llm/runtime/port，从 example 复制）
   public/               前端（vanilla JS，零依赖）
-scripts/                check-imports.mjs / pack.mjs / start-demo.sh
-tests/                  单测 + 契约 + e2e
+examples/               quickstart.ts（带断言的最小闭环示例）
+scripts/                check-imports.mjs / pack.mjs / verify-local.mjs /
+                          verify-package.mjs / bench.mjs / gen-gap-ledger.mjs /
+                          gen-snapshots.mjs / coverage-gate.mjs / start-demo.sh
+tests/                  单测（core/pi）+ 契约 + e2e + bench
 ```
 
-`mesh-pi` 是可选 peerDep（`@earendil-works/pi-coding-agent`），`tsup` 双入口 `index` + `core/index`，mesh-core 可单独 tree-shake。
+`pi`（`@earendil-works/pi-coding-agent`）是**直接依赖**，但经 `src/pi/pi-sdk.ts` 惰性加载；`tsup` 双入口 `index` + `core/index`，mesh-core 可单独 tree-shake 且零 pi 依赖。
 
 ## 核心概念
 
@@ -236,3 +253,15 @@ tests/                  单测 + 契约 + e2e
 - **topic 静默投递**：每个订阅者生成一条 delivery（P3 路径），不唤醒。
 - **queue 竞争消费**：单消费者由 `selectQueueConsumer`（least-in-flight + lex sort）选出，`sync=0` 不阻塞；`claim` 后可在 `leaseUntil` 内 `ack`（成功 → acked）或 `error`（nack → 回队，attempts++）。
 - **request-response 环检测**：插入 `sync=1` pending_ack 前跑 `detectRequestCycle`，命中 → `REQUEST_CYCLE`；超时 → `request_timeout` + system 通知 + 释放租约。
+
+## 支持矩阵
+
+| 维度 | 声明 | 验证口径 |
+| --- | --- | --- |
+| Node.js | `>=22.19.0`（engines 下限） | 本机验证于 Node 24.19.0 |
+| 模块系统 | ESM + CJS 双产物（`index` / `core/index` + `.d.ts` / `.d.cts`） | `npm run verify:package`（G08 消费者矩阵） |
+| pi SDK | `@earendil-works/pi-coding-agent@^1.1.0` 直接依赖，`loadPiSdk()` 惰性加载 | core-only 冒烟不加载 pi（G08 无 pi 腿） |
+| 存储 | better-sqlite3 `^13`（SQLite，原生模块） | 真实文件 DB 创建/重开/迁移（G08 B 腿） |
+| 多进程 | sameHost 同机多进程（§19） | `tests/e2e/samehost.test.ts` 等 e2e |
+
+> 跨机 Transport 与 `observer.forkAt` 不在 v0.1.0 范围；真实 LLM 仅在 demo / 示例中按 `llm` 配置接入，测试与非交互命令行不消耗真实模型或凭据。

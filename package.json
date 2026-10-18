@@ -8,7 +8,7 @@
   "types": "./dist/index.d.ts",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "exports": {
     ".": {
@@ -36,24 +36,19 @@
     "demo": "node demo/src/server.ts",
     "demo:start": "bash scripts/start-demo.sh",
     "pack": "node scripts/pack.mjs",
+    "verify:local": "node scripts/verify-local.mjs",
+    "verify:package": "node scripts/verify-package.mjs",
     "prepack": "npm run build"
   },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "^1.1.0",
     "better-sqlite3": "^13.0.3"
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.84.4"
-  },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    }
-  },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "^1.1.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^3.2.7",
     "tsup": "^8.4.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

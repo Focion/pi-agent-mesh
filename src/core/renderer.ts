@@ -16,6 +16,7 @@ import type {
   Envelope,
   InboxState,
   InboxView,
+  LogicalClock,
   RecentPreview,
   Renderer,
 } from "./types.js";
@@ -62,7 +63,14 @@ export function renderAttachmentRefs(env: Envelope): string {
 export function verifyWrapped(text: string): { ok: boolean; fixed: string } {
   const opens = (text.match(/<<<MSG[ >]/g) ?? []).length;
   const closes = text.split(MSG_CLOSE).length - 1;
-  if (opens === 1 && closes === 1 && text.trimEnd().endsWith(MSG_CLOSE)) {
+  // I35：脱前导空白后必须以 <<<MSG 开头——前置裸文本不能靠「恰好一个开/闭标记」漏过。
+  const startsClean = text.trimStart().startsWith(MSG_OPEN);
+  if (
+    startsClean &&
+    opens === 1 &&
+    closes === 1 &&
+    text.trimEnd().endsWith(MSG_CLOSE)
+  ) {
     // 检查包裹体内是否残留未转义定界符（开标记之后、END 之前）
     const bodyStart =
       text.indexOf(">>>\n") >= 0 ? text.indexOf(">>>\n") + 4 : 0;
@@ -79,6 +87,17 @@ export function verifyWrapped(text: string): { ok: boolean; fixed: string } {
 }
 
 export class DefaultRenderer implements Renderer {
+  private readonly clock?: LogicalClock;
+
+  constructor(clock?: LogicalClock) {
+    this.clock = clock;
+  }
+
+  /** ts 显示走逻辑钟 format（N05 §20.1⑨）；无 clock/format 时恒等（原样） */
+  private formatTs(ts: string): string {
+    return this.clock?.format?.(ts) ?? ts;
+  }
+
   renderMessage(
     env: Envelope,
     ctx: { recipient: { endpointClass: string }; senderName: string },
@@ -115,7 +134,7 @@ export class DefaultRenderer implements Renderer {
       ["name", ctx.senderName],
       ["kind", env.kind],
       ["mentions", env.mentions?.length ? env.mentions.join(",") : undefined],
-      ["ts", env.logicalTs ?? env.routedAt],
+      ["ts", this.formatTs(env.logicalTs ?? env.routedAt)],
       ["reply_to", env.replyTo],
       ["correlation", env.correlationId],
     ]);

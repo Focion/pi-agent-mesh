@@ -18,17 +18,18 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadAndValidateDemo, ConfigError, DEMO_VERSION } from "./config.ts";
+import { MeshConfigError } from "../../dist/index.js";
 import { MeshController, type ControllerHooks } from "./runtime.ts";
 import { dispatch } from "./rpc.ts";
 import { SseHub } from "./sse.ts";
 
-// ── 配置 + 装配（无密钥在此抛 ConfigError）───────────────────────────────────
+// ── 配置 + 装配（无密钥在此抛 ConfigError / MeshConfigError）────────────────
 
 let resolved;
 try {
   resolved = loadAndValidateDemo();
 } catch (err) {
-  if (err instanceof ConfigError) {
+  if (err instanceof ConfigError || err instanceof MeshConfigError) {
     process.stderr.write(`\n${err.message}\n\n`);
     process.stderr.write(`[mesh-demo] 无密钥不跑：本面板 100% 真实，不提供 faux/假模型兜底。\n`);
     process.exit(1);
@@ -36,7 +37,7 @@ try {
   throw err;
 }
 
-const { config, model, credential } = resolved;
+const { config, resolvedLlm, credentialSource, fingerprint } = resolved;
 const PUBLIC_DIR = fileURLToPath(new URL("../public/", import.meta.url));
 const sse = new SseHub();
 
@@ -46,8 +47,19 @@ const hooks: ControllerHooks = {
   meshMessage: (env) => sse.publish("meshmsg", env),
 };
 
-const controller = new MeshController(config, model, hooks);
-await controller.init();
+const controller = new MeshController(config, resolvedLlm, hooks);
+try {
+  await controller.init();
+} catch (err) {
+  // 模型/Provider 解析（rt.getModel + registerProvider）在装配工厂时 fail-fast；
+  // 缺凭据已在 loadAndValidateDemo 拦截，这里拦截「模型不存在 / Provider 坏」。
+  if (err instanceof MeshConfigError) {
+    process.stderr.write(`\n${err.message}\n\n`);
+    process.stderr.write(`[mesh-demo] 启动失败：LLM 配置无效（模型/Provider 无法解析），已退出。\n`);
+    process.exit(1);
+  }
+  throw err;
+}
 
 // ── 静态文件名 → Content-Type ────────────────────────────────────────────────
 
@@ -126,7 +138,7 @@ const server = createServer(async (req, res) => {
       if (req.method !== "GET") return json(res, 405, { error: { name: "Method", message: "GET only" } });
       const unsubscribe = sse.subscribe(res);
       req.on("close", unsubscribe);
-      sse.publish("hello", { demo: "mesh-panel", version: DEMO_VERSION, credential: credential.source });
+      sse.publish("hello", { demo: "mesh-panel", version: DEMO_VERSION, credential: credentialSource });
       return;
     }
 
@@ -139,16 +151,16 @@ const server = createServer(async (req, res) => {
           demo: "mesh-panel",
           version: DEMO_VERSION,
           config: {
-            provider: config.provider,
-            modelId: config.modelId,
-            thinkingLevel: config.thinkingLevel,
-            tools: config.tools,
+            provider: resolvedLlm.providerId,
+            modelId: resolvedLlm.modelId,
+            thinkingLevel: resolvedLlm.thinkingLevel ?? "(default)",
+            tools: config.runtime.builtinTools ?? [],
             dbPath: config.dbPath,
             stateDir: config.stateDir,
-            agentDir: config.agentDir ?? "(pi default ~/.pi/agent)",
             port: config.port,
+            fingerprint,
           },
-          credentialSource: credential.source,
+          credentialSource,
         },
       });
     }
@@ -181,8 +193,8 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 server.listen(config.port, () => {
   process.stdout.write(
     `[mesh-demo] 面板已就绪 → http://localhost:${config.port}\n` +
-      `            model  = ${config.provider}/${config.modelId} · thinking=${config.thinkingLevel}\n` +
-      `            凭据    = ${credential.source}\n` +
+      `            model  = ${resolvedLlm.providerId}/${resolvedLlm.modelId} · thinking=${resolvedLlm.thinkingLevel ?? "default"}\n` +
+      `            凭据    = ${credentialSource}\n` +
       `            db     = ${config.dbPath}\n` +
       `            事件流  = /api/events（15 个 MeshEvent + delivery/meshmsg/tick 每秒）\n`,
   );
