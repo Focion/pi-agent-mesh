@@ -1,11 +1,14 @@
 ---
-title: Pi Agent Mesh 规范 v1.0.0
+title: Pi Agent Mesh 规范 v1.0.1
 date: 2026-09-07
 status: active
 owner: unassigned
 tags: [spec, multi-agent, messaging, pi-sdk, sqlite]
 related:
-  - notes/plan/2026-10-12-consolidated-open-work-plan.md
+  - notes/archive/2026-10-12-consolidated-open-work-plan.md
+  - notes/plan/2026-10-19-post-0.1.0-open-items-plan.md
+  - notes/archive/2026-10-13-mesh-llm-config-design.md
+  - notes/archive/2026-10-13-pi-1.1.0-probe-findings.md
 ---
 
 # Pi Agent Mesh
@@ -15,10 +18,10 @@ related:
 | 项 | 值 |
 |---|---|
 | 方案名 | **Pi Agent Mesh** |
-| 版本 | **1.0.0** |
+| 版本 | **1.0.1**（1.0.0 定稿 + 按 v0.1.0 实现回填，变更见附录 L.4） |
 | 状态 | 定稿（可发布）。核心功能面已冻结，扩展功能面按 §28.4 的 1.x 计划演进 |
 | 包名 | `@pi/agent-mesh`，内含两个模块 `mesh-core` / `mesh-pi` |
-| 依赖 | pi SDK（`@earendil-works/pi-coding-agent` ≥ 0.84.4）、SQLite（better-sqlite3 或等价） |
+| 依赖 | pi SDK（`@earendil-works/pi-coding-agent` `^1.1.0`，v0.1.0 起为直接依赖、惰性加载——见 §28.5/§29.2）、SQLite（better-sqlite3 或等价） |
 | 语言 | TypeScript（ESM + CJS 双产物） |
 | 适用读者 | ① 要在 pi SDK 上搭多 Agent 系统的宿主开发者；② 本库的实现者与评审者；③ 运维与 SRE |
 
@@ -289,7 +292,7 @@ pi SDK 提供的是"一个能力很强的单 Agent"。要把它变成"一群能�
 
 ## 2 平台基线：pi SDK 能力面
 
-本章是全方案的事实底座。每一条都对应一个已读到的签名或源码位置，不是推测；探针版本 `@earendil-works/pi-coding-agent@0.84.4`。
+本章是全方案的事实底座。每一条都对应一个已读到的签名或源码位置，不是推测；首次核实的探针版本是 `@earendil-works/pi-coding-agent@0.84.4`，**当前实现基线是 `1.1.0`**（v0.1.0 随 LD3 升级并重新核实，差异见 §2.3 末与 §28.5）。
 **这些是实现细节而非文档承诺**——pi 升一个小版本就可能变，所以 §23.5 有一层专门的「pi 契约测试」把它们锁住。
 
 ### 2.1 可用与不可用原语
@@ -458,6 +461,20 @@ const inContext = new Set(ctx.sessionManager.buildContextEntries().map(e => e.id
 
 > **为什么这一节要进正式文档：** 这五条不是文档承诺，是实现细节。pi 升一个小版本就可能变。§23.5 的 pi 契约测试的职责因此不是"验证库对"，而是**在 pi 变了的那一刻立刻红一次**，避免库沿着一个已经失效的假设继续跑。每条契约测试的注释必须写明它保护的是哪条设计决定。这层测试要在 P0 第一周就跑起来（M-R30）。
 
+**1.1.0 基线复核（v0.1.0 实现，按 §28.5 第④步登记）。** 从 0.84.4/0.85.1 升到 1.1.0 后逐条重跑契约测试，五条 F 全部仍然成立，只有一处载荷扩字段：
+
+| 变化 | 版本 | 新语义 | 结论 |
+|---|---|---|---|
+| `agent_settled` 增 `aborted: boolean` | 1.1.0 | 载荷从 `{ type }` 变为 `{ type, aborted }` | **F2 不变**：仍无消息归因信息，`consumed` 仍靠 `entry_appended` + `turn_end` 配对。契约测试把新字段纳入预期，不改机制 |
+
+**三个「生产可行确认点」也在 1.1.0 上探明**（实现依赖它们，故与 F1–F5 同级固化为契约测试，红一条即该确认点失效、必须回到对应章节重选）：
+
+| 确认点 | 结论 | 固化测试 |
+|---|---|---|
+| P2 注入体是否进入**真实最终输入**（§7.6） | **可确认**。确认点 = 扩展 `context_with_system` 钩子：`context` 阶段追加的 `customType: "mesh.inbox"` 消息在 system 前缀恢复后仍恰好一条存在于最终 transcript。空转（不起轮）不产生模型调用 ⇒ 装 hook ≠ 确认 | `tests/pi/probe-p2-input.test.ts` |
+| hook 覆盖矩阵（P2 / 崩溃恢复选点） | `agent_start`·`turn_*`·`message_*`·`agent_settled`·`agent_before_settle`·`context`·`context_with_system` 点亮；`entry_appended` 不覆盖 `sendCustomMessage`（只走 `appendCustomEntry`/boundary）；`before_agent_start` 只走用户 prompt 路径（I19 ⇒ 库永不触发）；provider HTTP 钩子（`before_provider_request` / `provider_stream_event`）在 faux 下不点亮，**不得**选作确认点 | `tests/pi/probe-hooks.test.ts` |
+| 磁盘 session 的 create / open（§8.6） | **确定**。`SessionManager.create()` 在 `newSession()` 即把 `getSessionFile()` 置为非空路径（`?? getSessionId()` 永不回退）；文件本体延迟到首条 user/assistant 消息后落盘；按同路径 `open()` 恢复同一 sessionId | `tests/pi/probe-disk-session.test.ts` |
+
 ### 2.4 `StreamPort`：锁定的 10 个方法
 
 `StreamPort` 是 `mesh-core` 与 pi SDK 之间**唯一**的接口。它恰好 10 个方法，一个不多一个不少；`mesh-core` 对 pi 的全部依赖都收敛在这里。
@@ -482,8 +499,11 @@ interface StreamPort {
 
   injectContext(endpointId: string, text: string): Unsubscribe;   // §7.6 P2 路径
 
-  status(endpointId: string): { state: EndpointState; busy: boolean; inFlight: number };
+  status(endpointId: string): { state: EndpointState; busy: boolean; inFlight: number;
+                                idleMs?: number };
         // ↑ inFlight 来自 mesh_deliveries 自持计数，不是 SDK 的 pendingMessageCount（F3）
+        //   idleMs 可选（v0.1.0 新增）：端点空闲时长，供 §15.2 派生 online / idle 用；
+        //   端口给不出时缺省，Presence 退回按端点状态派生
 
   hasEntries(endpointId: string, entryIds: string[]): Promise<Set<string>>;
         // ↑ 返回其中"仍存在于该 stream"的子集。I22 存在性核对与崩溃恢复核对的唯一手段。
@@ -780,7 +800,7 @@ interface Envelope<E = unknown> {
   id: string;                    // ULID，全局唯一
   seq: number;                   // 会话内单调递增，Router 在同一事务里分配
   from: AccountId;               // 由执行上下文推导，不接受入参
-  fromEndpoint: EndpointId;
+  fromEndpoint: EndpointId | null;   // 宿主经 send({from}) 发的消息没有来源端点 ⇒ null
   routedAt: string;              // 真实墙钟 ISO8601（用于运维，不用于业务排序）
   idempotencyKey: string;        // = hash(conversationId, from, clientToken)，见 §5.5
   seal?: string;                 // HMAC(系统层 + 意图层 + payload 摘要)，密钥仅库进程持有
@@ -796,7 +816,11 @@ interface Envelope<E = unknown> {
   correlationId?: string;        // 请求-应答配对（§14）；配 expect: "reply" 使用
   requestType?: string;          // 可选的类型名，如 "get_profile"，库不解释
   logicalTs?: string;            // 不透明；库只按注入的比较器排序（Q10）
-  claim?: { by: AccountId; at: string };      // 仅 queue 类会话：被谁领走（§17）
+  late?: boolean;                // §14.4：超时后才到的合法应答，只定向回发起方
+  claim?: { by: AccountId; at: string };      // 仅 queue：被谁领走（§17）。
+                                 // **投影字段**：权威在 mesh_deliveries.claimed_by/at，
+                                 // 正文 payload 永不被改写（I11 + seal 的前提，§17）；
+                                 // 没有 delivery 上下文时（历史 / 渲染）恒为 undefined
 
   // ── 载荷 ────────────────────────────────────────────────
   payload: { text?: string; data?: unknown; attachments?: SharedRef[] };
@@ -1290,6 +1314,8 @@ inFlight(endpointId) = count(deliveries
 
 ① **同一个词不跨类复用**——`ENDPOINT_GONE` 只做 `parked` 的原因，它的终态形态叫 `TTL_EXPIRED`。
 ② **新增码必须落进上表**；`drop_reason` 的取值集合在 `devMode` 下按上表校验，写入未登记的码直接抛错——否则失败率指标会静静地漏掉一整类失败。
+
+**`MUTED` 在 v0.1.0 不再是默认路径。** 静音是"别吵我"，不是"别给我"：命中 `mutedUntil` 的投递**保留在 Inbox**、档位被强制为 `silent`、不唤醒（`urgent` 也不破例，`expect` 也不破例），解除静音后未读还在。所以常态下 `mesh_deliveries` 里不会出现 `dropped(MUTED)` 行——这个码只留给宿主显式要求丢弃的情形，取值集合不变（删码是破坏性变更，§28.1）。连带后果有两个：静音成员在冷流上会按 "`silent` + 冷流 ⇒ `parked`" 走（§7.2，非终态，热化后仍可见）；历史上已经落成 `dropped(MUTED)` 的行**不复活**。
 
 完整速查见附录 D。
 
@@ -1839,7 +1865,7 @@ upgradeToGroup(directConvId, extraMembers, caps?) →
 | `mesh_conversation_admin` | `conversationId`, `op`, 及该 `op` 的参数 | `{ ok }` | 随 `op` 而定 | `NOT_A_MEMBER`、`CAP_REQUIRED`、`NO_ADMIN_LEFT`、`JOIN_DENIED`、`ARG_INVALID` |
 | `mesh_claim` | `messageId` | `{ ok, leaseUntil }` | `read` | `CLAIM_TAKEN`、`CLAIM_EXPIRED`、`NOT_A_MEMBER` |
 | `mesh_shared_get` | `spaceId`, `key`, `version?` | 对象，或 `{ tombstoned: true }` | — | `SPACE_FORBIDDEN`、`NO_SUCH_KEY` |
-| `mesh_shared_put` | `spaceId`, `key`, `data`, `expectedVersion?`, `contentType?`, `op?` | `{ ok, version }`，或冲突详情（含当前值与当前 `version`） | — | `SPACE_FORBIDDEN`、`VERSION_MISMATCH`、`OBJECT_TOO_LARGE` |
+| `mesh_shared_put` | `spaceId`, `key`, `data`, `expectedVersion?`, `contentType?`, `op?`（`replace`\|`append`）, `maxLen?`（仅 `append`） | `{ ok, version }`，或冲突详情（含当前值与当前 `version`） | — | `SPACE_FORBIDDEN`、`VERSION_MISMATCH`、`OBJECT_TOO_LARGE`、`ARG_INVALID` |
 | `mesh_shared_list` | `spaceId`, `keyPrefix?`, `sinceVersion?`, `limit?` | 键与版本列表 | — | `SPACE_FORBIDDEN` |
 
 四条**合并与取舍**的规范理由，它们解释了为什么工具面是 14 个而不是更多：
@@ -1850,6 +1876,8 @@ upgradeToGroup(directConvId, extraMembers, caps?) →
 | **应答工具叫 `mesh_ack` 而不是 `mesh_respond`** | 同一个动作既用于关闭 `expect: "ack"` 的请求，也用于 `queue` 的完成确认（§17）。一个名字覆盖两处，不需要 Agent 记住两个 |
 | **必须有 `mesh_lookup`** | 没有它，Agent 只能给**已经知道 id** 的账号发消息，而 id 从哪来没有答案——这是功能性缺口。按 `capabilities`（§4.2）检索正是"我需要一个会做 X 的对象"的正确表达，且不要求库理解 X 是什么（M1） |
 | **必须有 `mesh_shared_list`** | 共享空间的变更通知是 best-effort（§18）。通知丢了以后**追赶只能靠拉**，没有 list 就没有追赶手段 |
+
+**声明了的参数必须真正生效，否则显式拒绝。** `mesh_shared_put` 的三个参数组合是互斥的：`expectedVersion` 不能与 `op: "append"` 同用（CAS 与追加是两种并发语义），`maxLen` 只在 `append` 下有效，`op` 只认 `replace` / `append`——违反者返回 `ARG_INVALID` 而不是静默忽略。同理 `mesh_shared_list` 的 `sinceVersion` / `limit` 必须真的过滤与分页。一个被静默忽略的参数比一个报错的参数难查得多，这与附录 F 通则③（越界配置直接 reject，不静默夹取）是同一条原则。
 
 `mesh_conversation_admin` 合并了 `addMember` / `removeMember` / `setCaps` / `setTopic` / `announcement` / `join` / `leave` / `subscribe` / `unsubscribe`，每个 `op` 按 §4.4 的能力位单独校验，缺位一律返回**工具层错误** `CAP_REQUIRED` 并在 `message` 里点明缺哪一位——注意它不是 §7.10 的 `reject`，因为能力校验发生在任何 delivery 行产生之前（见下方工具层错误码表）。`dissolve` **不得**默认出现在工具面——解散是不可逆动作，宿主要开放它须显式配置。
 
@@ -2080,6 +2108,7 @@ CREATE TABLE mesh_accounts (
   profile_ref   TEXT,                        -- 不透明，宿主用
   presence      TEXT NOT NULL DEFAULT 'offline',
   presence_until TEXT, presence_reason TEXT,
+  presence_explicit INTEGER NOT NULL DEFAULT 0,  -- 迁移 001：1 = 宿主显式 setPresence（§15.2）
   created_at    TEXT NOT NULL,
   archived_at   TEXT,
   ext           TEXT
@@ -2095,7 +2124,8 @@ INSERT INTO mesh_accounts (id, display_name, endpoint_class, initiate, created_a
 | `capabilities` | **开放取值**的字符串数组，库只做存取与相等匹配，不做语义解释。宿主用它表达"这个账号能干什么" |
 | `initiate` | 该账号**可主动发起**的 `kind` 集合。Router 每次发送都校验 `envelope.kind ∈ initiate`，否则 `reject(CANNOT_INITIATE)` |
 | `default_grade` | 账号级默认档位。为空时走全局默认；被 `DeliveryPolicy` 的返回值覆盖（§7.2） |
-| `presence` / `presence_until` / `presence_reason` | Presence 三元组（§15）。`presence_until` 到期后读取端按 `offline` 解释，库**不**起定时器改写它 |
+| `presence` / `presence_until` / `presence_reason` | Presence 三元组（§15）。`presence_until` 到期后读取端按派生值解释，库**不**起定时器改写它 |
+| `presence_explicit` | 区分"宿主显式设过"与"从端点状态派生"。`1` 且 `presence_until` 未过期时显式值优先；过期即回落派生并发一次 `presence_changed{source:"derived"}`。**不靠 presence 字符串猜来源**——这是 §15.2「冲突时宿主优先」能落地的前提 |
 | `archived_at` | 非空 = 已归档。归档账号**不得**作为发送方，但仍可作为历史消息的 `from_account`（外键完整性） |
 
 索引：主键即够。按 `endpoint_class` 的全表扫描在账号量级（通常 < 10⁴）下无需索引；宿主若有更大规模，自行加。
@@ -2109,6 +2139,8 @@ CREATE TABLE mesh_endpoints (
   topology      TEXT NOT NULL CHECK (topology IN ('unified','perConversation','pooled')),
   scope         TEXT, scope_key TEXT,        -- perConversation 时的 scope/key
   pool_slot     INTEGER,                     -- pooled 时的槽位序号
+  pool_size     INTEGER,                     -- 迁移 002：pooled 的分片基数（NULL ⇒ 回退 1）
+  pool_affinity TEXT,                        -- 迁移 002：pooled 的亲和策略（NULL ⇒ "none"）
   pi_session_id TEXT,                        -- 底层会话 id（仅 stream 类）
   lease_mode    TEXT NOT NULL DEFAULT 'shared',  -- shared|exclusive（§8.4）
   lease_until   TEXT,                        -- exclusive 的超时，到期强制释放
@@ -2127,6 +2159,7 @@ CREATE UNIQUE INDEX ux_endpoint_pool ON mesh_endpoints(account_id, pool_slot)
 | 字段 | 说明 |
 |---|---|
 | `topology` | 三种拓扑之一（§8.1）。`unified` 时 `scope` / `scope_key` / `pool_slot` 全为 NULL |
+| `pool_size` / `pool_affinity` | `pooled` 的拓扑参数，**必须**持久化：不落库则重启后分片基数与亲和策略丢失，同一会话会被路由到另一个槽位，等于悄悄换了一条流。历史行为 NULL 时回退 `size = 1` / `affinity = "none"`（等价"单槽位、无亲和"） |
 | `pi_session_id` | 指向底层会话。`sink` / `external` 类账号的 endpoint 此列为 NULL |
 | `lease_mode` / `lease_until` | 库自持的租约（§8.4）。`exclusive` **必须**带 `lease_until`（默认 `exclusiveLeaseTtlMs` = 60s）；到期即视为已释放，**不得**依赖持有者主动归还 |
 | `lock_path` | `.lock` 文件路径。I1 的物理载体：抢锁失败即拒绝启动，**绝不**接管 |
@@ -2232,7 +2265,7 @@ CREATE INDEX ix_membership_account ON mesh_memberships(account_id) WHERE left_at
 | `last_spoke_seq` / `last_mentioned_seq` | 原文预算的推导输入（§7.4）。**只增不减**；它们让"最近参与过的人更可能拿到原文"这条默认策略不需要额外的活跃度表 |
 | `verbatim_pinned` | **三态整数**：`1` 强制给原文、`0` 强制不给、`NULL` 按预算。宿主要覆盖的只是"给不给原文"这一个布尔决定，三态比枚举清楚，也比二值加"是否设置"的双列干净 |
 | `left_at` | 非空 = 已退出。**行保留不删**，否则历史消息的成员归属无法审计；所有成员查询**必须**带 `left_at IS NULL` |
-| `muted_until` | 收件人静音该会话到何时。命中时投递终止为 `dropped(MUTED)`（§7.10） |
+| `muted_until` | 收件人静音该会话到何时。命中时**强制 `silent` 且不唤醒**，投递仍进 Inbox；只有宿主显式要求丢弃才落 `dropped(MUTED)`（§7.10 末） |
 
 为什么 `caps` 用 JSON 数组而不是位图整数：宿主自定义的能力位不需要改 schema，也不需要争抢位序。查询用 `json_each` 或宿主自建的表达式索引。
 
@@ -2362,8 +2395,13 @@ CREATE TABLE mesh_deliveries (
   drop_reason TEXT,                            -- 含 'folded'（§7.5，不计失败率）
   entry_id    TEXT,                            -- 落地的条目 id（onEntry 归因，§7.6）
   attempts    INTEGER NOT NULL DEFAULT 0,      -- queue 重投计数（§17）
-  claim_until TEXT,                            -- claimed 的租约到期
+  claim_until TEXT,                            -- 待领 / 持有窗口的到期时刻（§17.2）
+  claimed_by  TEXT,                            -- 迁移 003：领取者 accountId（**不写进 payload**）
+  claimed_at  TEXT,                            -- 迁移 003：领取时刻
+  claim_error TEXT,                            -- 迁移 003：末次 nack 的错误（死信可追溯，§17.7）
+  redeliver_reason TEXT,                       -- 迁移 004：为何重投（§23.1 trace）
   parked_reason TEXT, parked_at TEXT,          -- parked 诊断与 parkTtl 判定
+  note        TEXT,                            -- 定档留痕：不唤醒 / 降档的抑制原因（§23.1）
   queued_at TEXT, handoff_at TEXT, delivered_at TEXT, consumed_at TEXT,
   state_changed_at TEXT NOT NULL,              -- 最近一次跃迁时刻
   UNIQUE (message_id, endpoint_id)             -- M5 后半：按 endpoint 而非 account
@@ -2375,7 +2413,10 @@ CREATE UNIQUE INDEX ux_delivery_noep ON mesh_deliveries(message_id, account_id)
 CREATE INDEX ix_delivery_inflight ON mesh_deliveries(endpoint_id, state)
   WHERE state IN ('queued','delivered');       -- §7.8 自持背压计数走这个索引
 CREATE INDEX ix_delivery_parked ON mesh_deliveries(state, parked_at) WHERE state = 'parked';
-CREATE INDEX ix_delivery_claim ON mesh_deliveries(state, claim_until) WHERE state = 'claimed';
+-- 迁移 003 把它从 WHERE state='claimed' 扩成两态：回收扫描要同时覆盖
+-- 「投了没人领」（delivered）与「领了没 ack」（claimed）两个窗口（§17.2）
+CREATE INDEX ix_delivery_claim ON mesh_deliveries(state, claim_until)
+  WHERE state IN ('delivered','claimed');
 ```
 
 | 字段 | 说明 |
@@ -2388,12 +2429,15 @@ CREATE INDEX ix_delivery_claim ON mesh_deliveries(state, claim_until) WHERE stat
 | `partial` | `consumed(partial)`：接收方轮次被 `abort()` 打断。**只由 abort 造成**，压缩不是成因（§7.9④） |
 | `drop_reason` | `dropped` 时**必须**非空（I17）。取值集合以 §7.10 为权威，`devMode` 下校验；`folded` **不计**失败率 |
 | `entry_id` | 落地条目 id。它同时是 I22 的强制手段：下次投递前用它核对条目是否还在 |
-| `attempts` / `claim_until` | `queue` 竞争消费用（§17）。`claim_until` 到期即回 `queued` 供其他消费者重新竞争 |
+| `attempts` / `claim_until` | `queue` 竞争消费用（§17）。`claim_until` 覆盖**两个窗口**：`delivered` 时是"待领"窗口，`claimed` 时是"持有"窗口；任一到期都走回收（`attempts + 1` → 重投或死信） |
+| `claimed_by` / `claimed_at` | 领取者与领取时刻。**归属落在 delivery 行而不是消息正文**：早期实现用 `json_set(payload,'$.claim',…)` 改写正文，既违反消息不可变（I11）又让 `seal` 失效（§22.4 对 payload 取摘要）。`attempts` 兼作租约代次——回收 / 重投即 +1，旧代的 ack 不再被接受 |
+| `claim_error` | 末次 nack 的错误，死信时保留，供 §17.7 追溯"消费者是不是在同一条消息上反复崩溃" |
+| `note` / `redeliver_reason` | 两条**正交**的留痕轴，`observer.trace` 都会回传（§23.1）：`note` 解释"为什么这次不唤醒 / 降了档"（`mute` / `dnd` / `offline` / `no_cap` / `activation`），定档时写；`redeliver_reason` 解释"为什么又投了一次"（`entry_vanished` / `handoff_timeout` / `claim_timeout` / 原 `parked_reason`），重投站点写。定档**不得**覆盖重投原因 |
 | `parked_reason` / `parked_at` | `parked` 的诊断与 TTL 判定。`parked_at` + `parkTtlMs`（默认 1h）到期转 `dropped(TTL_EXPIRED)`——**没有 TTL 的挂起等于静默丢失** |
 | `handoff_at` | `deliver()` 已调用、`entry_appended` 尚未到达的时刻。**它不是状态**，delivery 此间仍留在 `queued`。超过 `handoffTimeoutMs`（默认 30s）计 `delivery_handoff_timeout` 并回退重投（§7.9①） |
 | `state_changed_at` | **NOT NULL**，最近一次跃迁时刻。回放 `InboxView`（§23）按它做时间过滤——没有这一列就只能靠四个分散的 `*_at` 猜"当时是什么状态" |
 
-四条索引各有明确用途：`ux_delivery_noep` 补 NULL 去重的漏；`ix_delivery_inflight` 是背压计数的唯一路径（`state IN ('queued','delivered')`）；`ix_delivery_parked` 服务 `parkTtlMs` 扫描；`ix_delivery_claim` 服务 claim 超时扫描。三条部分索引都只覆盖少数活跃行，不随历史增长。
+四条索引各有明确用途：`ux_delivery_noep` 补 NULL 去重的漏；`ix_delivery_inflight` 是背压计数的唯一路径（`state IN ('queued','delivered')`）；`ix_delivery_parked` 服务 `parkTtlMs` 扫描；`ix_delivery_claim` 服务 claim 超时扫描，覆盖待领与持有两个窗口。三条部分索引都只覆盖少数活跃行，不随历史增长。
 
 不变量：
 - **I5**（同一条消息对同一 Endpoint 只投一次）由 `UNIQUE (message_id, endpoint_id)` **加** `ux_delivery_noep` 共同保证。这是把幂等键从 account 换成 endpoint 时唯一需要小心的地方：**多端并存要求同一 `(message, account)` 可以有多行，但每个 endpoint 只能一行**；而未选端的行 `endpoint_id IS NULL`，SQLite 不对 NULL 做唯一性去重，因此必须由部分唯一索引按 `(message_id, account_id)` 兜住。
@@ -2638,29 +2682,55 @@ COMMIT;
 整个库只有一个构造函数：没有可 `new` 的类、没有全局单例、没有隐式初始化。
 
 ```ts
-export function createMesh(options: MeshOptions): Promise<MeshHost>;
+export function createMesh(options: CreateMeshOptions): Promise<MeshHost>;
 
+// ── core 的装配面（`@pi/agent-mesh/core`，LLM 盲）────────────────────────
 export interface MeshOptions {
   dbPath: string;                    // SQLite 文件路径（目录须可写，库负责建表与迁移）
   policies: Partial<Policies> & Pick<Policies, "sessionFactory">;
-                                     // ★ 唯一必填的策略槽；其余八槽缺省用库默认实现
-  transport?: Transport;             // 默认 InProcessTransport（§19）
+                                     // core 视角仍是必填槽；包根入口见 CreateMeshOptions
+  transport?: Transport | "sameHost"; // 默认 InProcessTransport；"sameHost" 由库构造（§19）
+  transportOptions?: { pollIntervalMs?: number; claimTtlMs?: number; maxAttempts?: number };
+                                     // 仅 transport === "sameHost" 生效（§19.3）
   streamPort?: StreamPort;           // 默认 mesh-pi 的实现（§2.4）
   limits?: Partial<Limits>;          // 未给的项用默认值（全表见附录 F）
   devMode?: boolean;                 // 默认 false；开启不变量断言与重入检测（§23.7）
+  fts?: boolean;                     // 默认 true；false 删 FTS 表并让 search 明确报"功能关闭"
+  walMaxBytes?: number;              // 默认 8 MiB；WAL 超阈值即告警 + 停发（§27.4）
+  mentionAllCap?: Cap;               // 默认 "speak"；放行 @all 的能力位（§6.1、附录 F.2）
+  busyTimeoutMs?: number;            // 默认 5000；SQLite busy_timeout（§19.5）
+  recoverDeadEndpoints?: boolean;    // 默认 false；启动时回收死写者遗留的锁（§19.6、§27.4）
+  seal?: { key: string };            // 提供即启用消息 seal；密钥只在内存（§22.4）
 }
+
+// ── 包根的装配面（`@pi/agent-mesh`，可直接给 LLM 配置）────────────────────
+export type CreateMeshOptions = Omit<MeshOptions, "policies"> & {
+  policies?: Partial<Policies>;      // 九槽全可选，含 sessionFactory
+  llm?: LlmConfig;                   // Mesh 自己的模型 / Provider / 凭据配置（§12.6 ⑦）
+  runtime?: RuntimeConfig;           // 内建工具白名单、资源隔离、retry / timeout / compaction
+};
 ```
 
 | 字段 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `dbPath` | **是** | — | 单一真相的落点。同一路径**不得**被两个 mesh 实例同时打开（M3；库用 `.lock` 检测并拒绝启动） |
-| `policies.sessionFactory` | **是** | — | 见下方"为什么只有它必填" |
+| `policies.sessionFactory` | 否（二选一） | 由 `llm` / `runtime` 装配 | 见下方"为什么 `sessionFactory` 从必填变成了二选一" |
+| `llm` / `runtime` | 否（二选一） | — | 给了就由 mesh-pi 按**完全隔离**装配 `SessionFactory`；两者与 `policies.sessionFactory` 都缺 ⇒ `createMesh` reject（`MESH_NO_SESSION_SOURCE`） |
 | `policies` 其余八槽 | 否 | 库默认实现（§12.3 末表） | 替换粒度是**槽**而不是整个对象 |
-| `transport` | 否 | `InProcessTransport` | 多进程同机换 `SqliteOutboxTransport`；跨机器 1.0.0 不支持（§19） |
-| `streamPort` | 否 | `mesh-pi` 实现 | 自定义实现会使 `replay`（§23.2）、崩溃恢复双向核对（§8.4）、`.lock` 单写者（M3）三项保证失效，库启动时降级并警告（§2.4） |
+| `transport` / `transportOptions` | 否 | `InProcessTransport` | 同机多进程传字符串 `"sameHost"` 由库构造；自定义实现须具备 `subscribe` / `publish` / `ack`（有资源则再加 `stop`），缺能力即拒绝启动。跨机器不支持（§19） |
+| `streamPort` | 否 | `mesh-pi` 实现 | 自定义实现须实现 §2.4 的 10 个方法（启动时逐个校验），并会使 `replay`（§23.2）、崩溃恢复双向核对（§8.4）、`.lock` 单写者（M3）三项保证失效，库启动时降级并警告 |
 | `limits` / `devMode` | 否 | 见 `Limits` / `false` | `limits` 只覆盖显式给出的项；`devMode` 生产**不应**开启（断言会在关键路径上做额外 SQL） |
+| `fts` / `walMaxBytes` / `busyTimeoutMs` | 否 | `true` / 8 MiB / 5000 | 存储面开关，详见附录 F.2 |
+| `mentionAllCap` | 否 | `"speak"` | 收紧为 `"setCaps"` 可让全员唤醒只归管理员（§6.1） |
+| `recoverDeadEndpoints` | 否 | `false` | 只有 pid 确实不存在且启动时刻不吻合才回收；无法判定一律拒绝、**绝不猜**（§19.6） |
+| `seal` | 否 | 关闭 | 启用后验签失败的投递被拒绝并发 `invariant_violated{code:"seal_mismatch"}`；库**绝不**自行生成密钥（§22.4） |
 
-**为什么只有 `SessionFactory` 必填。** 其余八个槽的行为库都能自己给出一个安全的默认，唯独一件事库永远猜不到：一个 Agent 的 system prompt、模型、工具白名单、工作目录。这些是领域，领域归宿主（M1）。所以九个槽里八个可选一个必填，且必填这一项在**类型层面**就表达出来——`Partial<Policies> & Pick<Policies, "sessionFactory">` 不是笔误，是把"忘了给 sessionFactory"从运行时错误提前成编译错误。
+**为什么 `sessionFactory` 从必填变成了二选一。** 原始设计里它是唯一必填槽，理由是"库永远猜不到一个 Agent 的 system prompt、模型、工具白名单、工作目录"。这条理由今天只剩前后两项：system prompt 与工作目录仍归宿主，但**模型与工具白名单已经由本库自己的配置面表达**（`llm` / `runtime`，§12.6 ⑦）。于是入口变成二选一：
+
+- **普通路径** `createMesh({ dbPath, llm, runtime })`：库在 mesh-pi 层装配 `SessionFactory`，并做**完全隔离**——不读 `~/.pi/agent` 的 `models.json` / `auth.json` / `settings.json`，不继承全局 extension / skill / prompt / theme，不加载 cwd 祖先目录的 `AGENTS.md` / `CLAUDE.md`，默认不启用任何 pi 内建工具（`runtime.builtinTools` 缺省 `[]`）。机器上已有的 pi 配置**不影响**运行结果，使用者也不需要登录或维护 pi 配置。
+- **高级路径** `createMesh({ dbPath, policies: { sessionFactory } })`：宿主自管 session，与原始设计完全一致。
+
+两者同时给出时**高级路径优先**；都不给则 `createMesh` 直接 reject，不返回半可用的 Host。`mesh-core` 仍然只认 `SessionFactory`，`llm` / `runtime` 只存在于包根与 mesh-pi（M1：core 不理解 LLM）。
 
 ```ts
 export interface Policies {                 // 九个槽，逐个定义见 §12.3
@@ -2672,13 +2742,15 @@ export interface Policies {                 // 九个槽，逐个定义见 §12.
   accessControl: AccessControl;             // 读写与发送许可（§22.2）
   retention: RetentionPolicy;               // 原文预算（§7.4）
   endpointSelector: EndpointSelector;       // 拓扑选端（§8.1）
-  sessionFactory: SessionFactory;           // ★ 唯一必填（§8.6）
+  sessionFactory: SessionFactory;           // ★ core 必填；包根可由 llm/runtime 装配（§8.6）
 }
 ```
 
-`Limits` 是一个纯数值配置对象（26 项），字段名、默认值、取值范围与调优影响见 **附录 F** 与 §27.1。这里只强调其中一项：`policyTimeoutMs`（默认 50ms）统一约束上面九个槽（I21，§12.3）——它是唯一一个同时属于配置面和不变量面的限额。
+`Limits` 是一个纯数值配置对象（**30 项**），字段名、默认值、取值范围与调优影响见 **附录 F** 与 §27.1。这里只强调其中一项：`policyTimeoutMs`（默认 50ms）统一约束上面九个槽（I21，§12.3）——它是唯一一个同时属于配置面和不变量面的限额。
 
-`createMesh` **返回前必须完成**四件事，任何一件失败就 reject，**不得**返回一个半可用的 `MeshHost`：① 打开 DB、执行 schema 迁移、校验 `mesh_meta` 的版本（§11.7）；② 抢占该 `dbPath` 的实例锁与已注册 Endpoint 的 `.lock`（M3）——抢不到即拒绝启动，**绝不"顺手接管"**；③ 跑一次崩溃恢复核对，把 `queued` / `delivered` 未 `consumed` 的投递与 stream 镜像双向对齐（§8.4）；④ 把库的 `context` 钩子注册到链尾（I23），否则 P2 注入会被静默覆盖（§7.6）。
+`createMesh` **返回前必须完成**四件事，任何一件失败就 reject，**不得**返回一个半可用的 `MeshHost`：① 抢占该 `dbPath` 的**实例锁**（M3）——抢不到即拒绝启动，**绝不"顺手接管"**；② 打开 DB、执行 schema 迁移、校验 `mesh_meta` 的版本（§11.7）；③ 处理已注册 Endpoint 的 `.lock`（回收 / 探测，§19.6），再跑一次崩溃恢复核对，把 `queued` / `delivered` 未 `consumed` 的投递与 stream 镜像双向对齐（§8.4）；④ 把库的 `context` 钩子注册到链尾（I23），否则 P2 注入会被静默覆盖（§7.6）。
+
+**①②的顺序不可交换**：迁移会改写文件、并在升级路径上先写 `<dbPath>.premigrate.bak` 备份（§28.3），所以必须先确认没有第二个实例在用这个文件。端点锁放在②之后，是因为它要读迁移后的 `mesh_endpoints`。
 
 `close()` 是它的逆操作，同样是全有全无：先停止接受新投递，再等在途 handoff 收敛或超时，最后释放锁与 DB 句柄。
 
@@ -2716,6 +2788,7 @@ export interface MeshHost {
   subscribe(conv: string, account: string, opts?: { fromSeq?: number }): Promise<void>;   // topic，§16
   unsubscribe(conv: string, account: string): Promise<void>;                              // topic，§16
   setAnnouncement(conv: string, text: string, by: string): Promise<void>;
+  setTopic(conv: string, text: string, by: string): Promise<void>;          // 需 setTopic 位（§4.4）
   mute(conv: string, account: string, until: string): Promise<void>;
   dissolve(conv: string, by: string): Promise<void>;
   upgradeToGroup(directConv: string, extra: string[], by: string): Promise<Conversation>; // §9.7
@@ -2724,7 +2797,8 @@ export interface MeshHost {
   send(m: SendInput & { from: string }): Promise<{ messageId: string; seq: number }>;
   request(m: SendInput & { from: string; expect: "ack" | "reply" },
           opts?: { await?: boolean }): Promise<{ correlationId: string } | AckResult>;     // §14
-  ack(r: { correlationId: string; from: string; data?: unknown; error?: unknown }): Promise<void>;
+  ack(r: { correlationId: string; from: string; endpointId?: string;
+           data?: unknown; error?: unknown }): Promise<void>;   // endpointId 只用于事件归因
   claim(messageId: string, by: string): Promise<{ ok: boolean; leaseUntil?: string }>;     // queue，§17
   requeue(messageId: string, targetConv: string): Promise<void>;                          // 死信重投，§17
 
@@ -2736,20 +2810,25 @@ export interface MeshHost {
 
   // ── 共享空间（§18）─────────────────────────────────────
   shared: {
-    get(spaceId: string, key: string, opts: { as: string; version?: number }): Promise<SharedObject | null>;
+    get(spaceId: string, key: string, opts: { as: string; version?: number })
+      : Promise<SharedObjectMeta | null>;        // get 填 data，list 不填（§12.6 ③）
     put(spaceId: string, key: string, data: unknown,
         opts: { as: string; expectedVersion?: number; contentType?: string;
-                acl?: Acl; ext?: unknown }): Promise<PutResult>;
+                acl?: Acl; ext?: unknown }): Promise<{ version: number }>;
     append(spaceId: string, key: string, item: unknown,
-           opts: { as: string; maxLen?: number }): Promise<PutResult>;
+           opts: { as: string; maxLen?: number }): Promise<{ version: number }>;
     del(spaceId: string, key: string, opts: { as: string }): Promise<void>;
-    list(spaceId: string, opts: { as: string; keyPrefix?: string }): Promise<SharedObjectMeta[]>;
+    list(spaceId: string, opts: { as: string; keyPrefix?: string;
+                                  sinceVersion?: number; limit?: number })
+      : Promise<SharedObjectMeta[]>;
   };
 
   // ── 流控制（宿主决定何时热化 / 驱逐）───────────────────
   warm(endpointId: string, lease?: MeshLease): Promise<void>;             // §8.3
   evict(endpointId: string): Promise<void>;                               // §8.3
   toolSet(endpointId: string, only?: MeshToolName[]): ToolDefinition[];   // 交给 SessionFactory 注册，§10.1
+  reclaimEndpoint(endpointId: string)                                     // §19.6、§27.4
+    : Promise<{ outcome: "reclaimed" | "held" | "unknown" }>;
 
   // ── 事件与观测 ────────────────────────────────────────
   on<K extends keyof MeshEvents>(e: K, h: (p: MeshEvents[K]) => void): Unsubscribe;
@@ -2769,7 +2848,8 @@ export interface MeshHost {
 | 会话 | `addMember` / `setCaps` | 授出的 `caps` **必须**是授予者自身 caps 的子集（I8，§4.4） |
 | 会话 | `join` / `leave` | `join` 需会话开了 `openJoin`；最后一个 `setCaps` 持有者离开前须先授出，否则 `reject(NO_ADMIN_LEFT)` |
 | 会话 | `subscribe` / `unsubscribe` | 仅 `topic`（无成员表）；**不得**用于 `group`（§16） |
-| 会话 | `mute` / `dissolve` / `upgradeToGroup` | `mute` 期间投递转 `dropped(MUTED)`；`dissolve` 是 tombstone 不是物理删除（§11.2）；升群保留原单聊、历史**不**迁移（§9.7） |
+| 会话 | `setTopic` / `setAnnouncement` | 都要求操作者持 `setTopic` 位；两者都走 `conversation_changed`（§9.3） |
+| 会话 | `mute` / `dissolve` / `upgradeToGroup` | `mute` 期间**保留 Inbox、强制 `silent`、不唤醒**（v0.1.0 起不再 `dropped(MUTED)`，见 §7.10）；`dissolve` 是 tombstone 不是物理删除（§11.2），并把该会话上全部 `open` 的待应答静默转 `abandoned`（§14.4）；升群保留原单聊、历史**不**迁移（§9.7） |
 | 发送 | `send` | 走完整管线：落 `mesh_messages`、扇出、定档、计指标、可被折叠 |
 | 发送 | `request` / `ack` | `expect` 是**唯一**唤醒判据（§7.3）；`await: true` 阻塞到 ack 或超时（§14） |
 | 发送 | `claim` / `requeue` | `claim` 失败返回 `{ ok: false }` 而不抛错——竞争失败是正常结果（§17） |
@@ -2779,6 +2859,7 @@ export interface MeshHost {
 | 共享 | `shared.*` | `as` 必填，库据此过 ACL（§18.3）；`put` 的 `expectedVersion` 提供乐观并发 |
 | 流 | `warm` / `evict` | `warm` 默认取 `exclusive` 租约（M3）；`evict` 后投递转 `parked` 而不是失败 |
 | 流 | `toolSet` | 只返回定义，注册由 `SessionFactory` 完成（§10.1） |
+| 流 | `reclaimEndpoint` | 运维入口：只有锁主 pid 确实不存在、或启动时刻不吻合（`dead`）才回收返回 `reclaimed`；锁主存活返回 `held`；锁损坏 / 不可读 / 判不出返回 `unknown` 并拒绝接管（§19.6「绝不猜」） |
 | 事件 | `on` / `observer` / `close` | 处理器抛错**不影响**投递（§12.5）；`observer` 全只读（§12.4） |
 
 **四处需要解释的设计。**
@@ -2893,7 +2974,7 @@ interface EndpointSelector {
 }
 ```
 
-**⑨ `SessionFactory` — 会话工厂（唯一必填）** ｜ **默认**：**没有**，库造不出别人的 session（§8.6）。｜ **降级**：无法降级 ⇒ `parked(NO_SESSION)` 并**必须**告警。
+**⑨ `SessionFactory` — 会话工厂（高级路径，可由 `llm` / `runtime` 缺省装配）** ｜ **默认**：包根入口下由 mesh-pi 按 `llm` / `runtime` 完全隔离装配（§12.1）；`@pi/agent-mesh/core` 单用时**没有**默认，必须宿主提供。｜ **降级**：无法降级 ⇒ `parked(NO_SESSION)` 并**必须**告警。
 
 ```ts
 interface SessionFactory {
@@ -2905,7 +2986,7 @@ interface SessionFactory {
 }
 ```
 
-这是唯一一个"降级本身就需要人介入"的槽，也是 `parked` 原因码里唯一要求告警的一个（§7.10）。它的耗时**不**受 `policyTimeoutMs` 约束：建 session 本身是慢操作，按 `warm()` 自己的超时计（§8.3）。
+这是唯一一个"降级本身就需要人介入"的槽，也是 `parked` 原因码里唯一要求告警的一个（§7.10）。它的耗时**不**受 `policyTimeoutMs` 约束：建 session 本身是慢操作，按自己的秒级 deadline 计（实现取 **30 秒**；§20.2 的"建议 5s"是下限建议而非上限）。超时与抛错的收尾一致：释放写者锁、清 `endpoint_lock`、端点转 `unavailable`、发 `policy_degraded{slot:"sessionFactory"}`，并以 `NO_SESSION`（**不是** `ENDPOINT_GONE` / `PORT_TIMEOUT`）结束。
 
 **槽总表**（语义与调优详表见 §20）
 
@@ -2919,9 +3000,11 @@ interface SessionFactory {
 | `accessControl` | 否 | 全部放行（caps / Acl 仍生效） | **拒绝（fail-closed）** | 是 |
 | `retention` | 否 | `gap ≤ 20` / 3 会话 / LRU（§7.4） | 不给原文 | 是 |
 | `endpointSelector` | 否 | 按 `StreamTopology` 解析（§8.1） | `parked(ENDPOINT_GONE)` | 是 |
-| `sessionFactory` | **是** | **无** | `parked(NO_SESSION)` + 告警 | 否（`warm` 时） |
+| `sessionFactory` | 否（包根）/ **是**（`/core`） | 包根：按 `llm`/`runtime` 装配；`/core`：**无** | `parked(NO_SESSION)` + 告警 | 否（`warm` 时） |
 
-八个槽有默认实现，一个必填。**九个槽全部受同一套超时与降级保护**——这条比任何单槽的语义都重要：它保证一个写坏的宿主插件最多让库变笨，不会让库变得不确定。
+**九个槽全部受同一套超时与降级保护**——这条比任何单槽的语义都重要：它保证一个写坏的宿主插件最多让库变笨，不会让库变得不确定。`sessionFactory` 是例外中的例外：它用自己的秒级 deadline（见上），且没有可降级的默认行为。
+
+**非法返回值与超时、抛错同等对待。** 每个槽都声明了自己的合法返回形态（`Grade` 三取一、`boolean`、`string[]`、`{bytes:number; ttlSeq?:number}`…）；返回值不满足形态时按**非法**处理，走与超时相同的降级方向并发 `policy_degraded`，`reason` 取 `"illegal"`（另两个值是 `"timeout"` / `"threw"`）。两处降级方向值得单独记：`accessControl` 返回 `undefined` 算非法 ⇒ **deny**（fail-closed；但**钩子整个缺失**是放行，二者不同）；`retention` 降级给 `{bytes: 0, ttlSeq: -1}`（不给原文，fail-closed），而不是放开预算。
 
 ### 12.4 `Observer`
 
@@ -2960,6 +3043,11 @@ interface Observer {
 
 `forkAt` 看起来像写操作——它确实会建出一个新的 Endpoint。但它用的是 pi 的 `forkFrom`，**不改动原流的任何字节**，原 Endpoint 的镜像、游标、投递状态一律不动。它留在 `Observer` 上是因为它的用途是调查（"从这一条开始换个策略会怎样"），不是运行时能力。
 
+**v0.1.0 的两处能力边界（签名在、承诺收窄）：**
+
+- **`forkAt` 一律抛 `MeshUnsupportedError`。** `forkFrom` 属于源码门禁的禁用 API（它会在库看不见的地方复制一条流，`.lock` 单写者与镜像归属都失去定义）。方法留在接口上是为了不动公共面，调用它**必定**失败，不会静默返回一个半成品 Endpoint。
+- **`replay` 是"基础转写"，不是历史精确重建。** 它从 `mesh_stream_entries` 的 byte-fidelity 镜像加当前策略重演出 `prompt` / `entries` / `inbox` / `injected` 四段，**不**承诺逐字节复原当时喂给模型的输入：P2 注入体不落盘（§7.6）因而无法回放历史注入，模型与策略也可能已经换过。它回答的是"这条流里发生过什么、按今天的策略会怎么组织"，不回答"当时模型到底看到了哪些 token"。
+
 ### 12.5 事件表
 
 ```ts
@@ -2988,6 +3076,8 @@ interface MeshEvents {
 ```
 
 十五个事件，一个不多。**每个事件都携带 `endpointId`**：上面未显式写出该字段的事件，由库在派发时补上（发生地的 endpoint；纯账号级事件用该账号的主 endpoint）。这条是硬要求，因为排障的第一个问题永远是"哪个 Agent 身上出的事"。
+
+> **v0.1.0 实现差距（未关闭，不是规范变更）**：带端点的五个事件（`message_delivered` / `message_consumed` / `message_parked` / `message_dropped` / `message_acked` / `endpoint_state_changed`）已按上表带全 `endpointId`；其余九个（`message_routed`、`inbox_overflowed`、`conversation_changed`、`membership_caps_changed`、`shared_object_changed`、`presence_changed`、`request_timeout`、`policy_degraded`、`invariant_violated`）**尚未补**。同理，§12.6 ⑤ 的 `MeshEvent` 判别联合（带 `at` / `endpointId` 的 `MeshEventMeta`）虽已导出类型，但事件总线仍只派发 `MeshEvents[K]` 形态的载荷，没有生成判别联合。两项都登记在 `notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`，**补实现还是收窄规范由该计划定夺**。
 
 | 事件 | 载荷要点 | 何时发出 | 订阅者典型用法 |
 |---|---|---|---|
@@ -3063,6 +3153,22 @@ type DeliveryState = "routed" | "queued" | "delivered" | "consumed"
                    | "parked" | "dropped"     // parked 是旁路非终态（§7.9）
                    | "claimed" | "acked";     // queue 会话追加的两态（§17）
 
+type ContextPath = "P1" | "P2" | "P3";        // 三条进上下文路径（§7.6）
+type ExpectKind  = "ack" | "reply" | "none";  // §14.2
+type Priority    = "urgent" | "normal" | "low";   // §7.2
+type PolicyDegradeReason = "timeout" | "threw" | "illegal";   // §12.3 末、§20.1
+type MeshErrorCode = RejectCode | ToolErrorCode;  // 两类同步错误码的并（§7.10、§10.1）
+
+// mesh_conversation_admin 的 op 判别联合（§10.1）；dissolve 不默认出现在工具面
+type ConversationAdminOp =
+  | { op: "addMember"; account: AccountId; caps?: Cap[] }
+  | { op: "removeMember"; account: AccountId }
+  | { op: "setCaps"; account: AccountId; caps: Cap[] }
+  | { op: "setTopic"; topic?: string; announcement?: string }
+  | { op: "join" } | { op: "leave" }
+  | { op: "subscribe"; fromSeq?: number } | { op: "unsubscribe" }
+  | { op: "dissolve" };
+
 // ── 三类原因码（§7.10 权威表的类型化）。三类之间**不得**复用同一个词 ──
 type RejectCode = "NOT_A_MEMBER" | "NO_SPEAK_CAP" | "CANNOT_INITIATE"
                 | "TARGETING_NOT_SUPPORTED" | "FANOUT_TOO_LARGE"
@@ -3100,7 +3206,7 @@ interface Membership {
   conversationId: ConversationId; accountId: AccountId;
   caps: Set<Cap>;                  // 建群者默认全集；普通成员默认 {speak, read}
   joinedSeq: number;               // historyVisibility: "since_join" 的过滤基准
-  mutedUntil?: string;             // 到期前投给它的 delivery 转 dropped(MUTED)
+  mutedUntil?: string;             // 到期前投给它的 delivery 强制 silent 且不唤醒（§7.10 末）
   verbatimPinned?: boolean;        // 宿主覆盖原文预算的三态：true / false / undefined=按预算（§7.4）
   ext?: Record<string, unknown>;
 }
@@ -3241,9 +3347,11 @@ interface PendingDelivery {        // Transport 的投递单元（§19）
 type DeliveryHandler = (d: PendingDelivery) => void | Promise<void>;
 type Unsubscribe     = () => void;   // 所有 on* / register* / subscribe 的返回：调一次即摘钩子
 
-interface SharedObjectMeta {       // 不含 data：避免把大对象喂进策略。Acl / AclRule 见 §18.4
-  key: string; version: number; ownerId: AccountId; acl: Acl;
-  size: number; contentType?: string; updatedAt: string;
+interface SharedObjectMeta {       // Acl / AclRule 见 §18.4
+  key: string; version: number; ownerId: AccountId;
+  updatedBy: AccountId;            // §18.4：当前版本的最后写入者
+  acl: Acl; size: number; contentType?: string; updatedAt: string;
+  data?: unknown;                  // get 填充；list **不**填（避免把大对象整表回传）
 }
 
 interface AclCtx {                 // AccessControl 各钩子的公共入参片段
@@ -3257,8 +3365,23 @@ interface InvariantReport {         // observer.checkInvariants 的返回（§23
   ok: boolean; checked: number; at: string;
   violations: Array<{ id: string; assertion: string; count: number; sample: unknown[] }>;
 }
-interface ToolDefinition { name: string; description: string; inputSchema: object }
-                                    // 注入 pi 的工具形状，宿主可在库给的 14 个之外追加
+interface ToolDefinition {          // 注入 pi 的工具形状，宿主可在库给的 14 个之外追加
+  name: MeshToolName | string; label: string; description: string;
+  promptSnippet?: string; promptGuidelines?: string[];
+  parameters: object;               // JSON Schema（TypeBox 兼容）；即早期草案里的 inputSchema
+  execute(toolCallId: string, params: Record<string, unknown>,
+          signal: AbortSignal | undefined, onUpdate: undefined,
+          ctx: unknown): Promise<MeshToolResult>;
+}
+interface MeshToolResult {          // 结构上与 pi 的工具返回兼容（mesh-pi 负责桥接注册）
+  content: string | Array<{ type: "text"; text: string }>;
+                                    // content 里装的是 JSON 串：成功是 { ok:true, … } 或裸结果，
+                                    // 失败是 { error: { code, message, hint? } }
+                                    // （code ∈ §10.1 末表 / §7.10 的 reject 码）。
+                                    // 按 limits.toolResultMaxBytes 截断，截断时并回 truncated:true；
+                                    // 任何预算（含病理极小值）下返回的都**必须**是合法 JSON
+  details?: unknown; terminate?: boolean;
+}
 type MeshToolName =                 // §10.1 的 14 个，一个不多一个不少
     "mesh_send" | "mesh_ack" | "mesh_lookup" | "mesh_inbox" | "mesh_history"
   | "mesh_conversations" | "mesh_members" | "mesh_contacts"
@@ -3275,8 +3398,10 @@ type PolicySlot = keyof Policies;
 // = "delivery" | "activation" | "floor" | "renderer" | "clock"
 // | "accessControl" | "retention" | "endpointSelector" | "sessionFactory"
 
-type RequiredPolicySlot = "sessionFactory";          // 唯一必填的槽（§12.1）
+type RequiredPolicySlot = "sessionFactory";          // core 入口下唯一必填的槽（§12.1）
 type OptionalPolicySlot = Exclude<PolicySlot, RequiredPolicySlot>;   // 其余八个有默认实现
+// 包根入口下 sessionFactory 也可缺省（由 llm / runtime 装配），这两个类型描述的是
+// `@pi/agent-mesh/core` 的 MeshOptions，不是包根的 CreateMeshOptions
 
 // 超时或抛错时的降级目标（§12.1 的降级表；I21：必发 policy_degraded）
 type DegradeTarget =
@@ -3334,11 +3459,115 @@ type MeshEvent = MeshEventMeta & (
 );
 ```
 
+**⑥ 端口与工具面的辅助投影**
+
+```ts
+interface PortStatus {              // StreamPort.status 的返回（§2.4）
+  state: EndpointState; busy: boolean;
+  inFlight: number;                 // 端口自持 handoff 计数，不是 SDK 的 pendingMessageCount（F3）
+  idleMs?: number;                  // §15.2 派生 idle 的时长锚点；缺省回落到 last_active_at
+}
+interface PortEntryEvent {          // StreamPort.onEntry 的载荷（§8.5 镜像入库）
+  endpointId: EndpointId; entryId: EntryId; parentId?: string;
+  envelopeId?: MessageId;           // delivered 归因的唯一依据（§7.9①）
+  entryType: string;                // 原样透传，库不枚举校验
+  seqInStream: number;              // 端口分配的流内序号（pi 的 SessionEntry 没有 seq，F4）
+  rawJson: string;                  // byte-fidelity 原文
+}
+
+interface EnvelopePayload { text?: string; data?: unknown; attachments?: SharedRef[] }
+interface SharedRef { spaceId: SpaceId; key: string; version?: number }   // 附件只传引用（§18.7）
+interface WakeRateLimit { count: number; windowMs: number }               // A3 的限额对（§7.3）
+
+interface MemberRow  { accountId: AccountId; displayName: string;
+                       caps: Cap[]; presence: PresenceState }             // mesh_members 工具返回
+interface ContactRow { accountId: AccountId; displayName: string;
+                       alias?: string; tags?: unknown }                   // mesh_contacts 工具返回
+interface RecentPreview { seq: number; from: AccountId; name: string;
+                          preview: string;                                // 截断到 40 字
+                          mentionsMe: boolean; expectsMyAck: boolean }    // InboxState.recent 的元素
+
+// MeshHost 三个 register / create 入参的具名形态（§12.2 的内联对象即它们）
+interface RegisterAccountInput { id?: string; displayName: string; endpointClass: EndpointClass;
+  capabilities?: string[]; initiate?: MessageKind[]; defaultGrade?: Grade;
+  profileRef?: string; ext?: unknown }
+interface RegisterEndpointInput { accountId: AccountId; topology: StreamTopology; piSessionId?: string }
+interface CreateConversationInput { type: "group" | "topic" | "queue"; creator: AccountId;
+  members?: AccountId[]; topic?: string; config?: Partial<ConversationConfig>; ext?: unknown }
+
+// Agent 工具闭包拿到的上下文：身份（accountId / endpointId）由建流时闭包捕获，
+// **不是**入参，所以 Agent 无法通过改参数切换身份（§5.4、§10.2）
+interface ToolContext { readonly accountId: AccountId; readonly endpointId: EndpointId; /* …§10.1 的动作面… */ }
+```
+
+**⑦ LLM 与运行时配置（只在包根，`mesh-core` 看不见）**
+
+这一组类型是 §12.1 里 `CreateMeshOptions.llm` / `.runtime` 的结构。它们**不属于** `mesh-core`：core 仍然只认 `SessionFactory`，不理解模型、Provider 与凭据（M1）。
+
+```ts
+interface LlmConfig {
+  model: string;                             // "providerId:modelId"（按首个冒号切分）
+  providers?: Record<string, ProviderConfig>; // 未登记的 providerId 走 pi 内建目录，
+                                              // 但**绝不**读 ~/.pi/agent/models.json
+  thinkingLevel?: string;
+  apiKey?: string;                           // 仅测试链路；优先级低于 providers.<id>
+  apiKeyEnv?: string;                        // 生产首选：显式环境变量名（不镜像 pi 的隐式变量表）
+}
+interface ProviderConfig {
+  baseUrl?: string; api?: string;            // api = pi-ai 的适配器名（anthropic-messages / …）
+  apiKey?: string; apiKeyEnv?: string;
+  authHeader?: boolean;                      // 缺省 true（Bearer）；false 用 x-api-key
+  headers?: Record<string, string>;
+  contextWindow?: number; maxTokens?: number; reasoning?: boolean;
+}
+
+interface RuntimeConfig {
+  builtinTools?: string[];                   // 缺省 []：全禁 pi 内建工具；
+                                             // Mesh 的 14 个工具恒经 customTools 注入，不被它过滤
+  retry?: { enabled?: boolean; maxRetries?: number;
+            baseDelayMs?: number; maxAgentDelayMs?: number };
+  timeout?: number;                          // provider 请求超时（ms）
+  compaction?: { enabled?: boolean; reserveTokens?: number; keepRecentTokens?: number };
+                                             // pi 的上下文压缩，**与 §7.5 的 mailbox 折叠无关**
+  resources?: RuntimeResources;
+}
+interface RuntimeResources {                 // 全部缺省关闭；要继承必须显式打开并自担风险
+  extensions?: boolean; skills?: boolean; prompts?: boolean;
+  themes?: boolean; contextFiles?: boolean;  // contextFiles = cwd 祖先的 AGENTS.md / CLAUDE.md
+}
+
+interface Profile { llm?: LlmConfig; runtime?: RuntimeConfig }   // 按 Account.profileRef 选择
+interface ResolvedLlm {                      // resolveLlmConfig 的结果（fail-fast 之后）
+  providerId: string; modelId: string; thinkingLevel?: string;
+  credential: { key: string; source: string };   // key 不进日志 / 事件 / DB / 配置指纹
+  custom?: { baseUrl: string; api: string; headers?: Record<string, string>;
+             authHeader?: boolean; contextWindow: number; maxTokens: number; reasoning: boolean };
+}
+
+type MeshConfigCode =                        // 装配层错误码，与 core 的四族码分属两层、互不复用
+    "MESH_BAD_CONFIG" | "MESH_MISSING_CREDENTIAL"
+  | "MESH_UNKNOWN_MODEL" | "MESH_NO_SESSION_SOURCE";
+```
+
+**三条硬规则。** ① **凭据只走显式入口**：`apiKey`（测试）或 `apiKeyEnv`（生产）二选一，缺失即 `MESH_MISSING_CREDENTIAL` fail-fast；库不读 `~/.pi/agent/auth.json`，也不镜像 pi 的隐式环境变量表。② **secret 不外泄**：不进日志、事件、session、DB，也不进 `configFingerprint()`（配置指纹对 `{llm, runtime}` 做稳定哈希时剔除凭据）。③ **配置错误在 `createMesh` 就炸**：坏模型、缺凭据、坏 base URL 一律同步 reject 且错误消息只引用 Mesh 的配置项名，不暴露 pi 的内部路径。
+
 **三处最该盯住的取值集合**：`EndpointState` 的五态、`PresenceState` 的七值、三个原因码集合。这三处一旦各处自己编一套，症状是指标对不上而不是程序崩溃——`devMode` 下库对 `drop_reason` 与 `parked_reason` 按 §7.10 校验，是为了把这类漂移提前变成异常（附录 D）。
 
 ### 12.7 最小示例
 
 端到端的最小装配。这段代码里**没有一行涉及具体业务概念**——领域全在 `buildPrompt` 与 `hostMemory` 里，都是宿主的。这就是 M1 的验收样子。
+
+下面用的是**高级路径**（宿主自管 session）。普通路径只需要把第 1 步换成一句配置，其余完全一样：
+
+```ts
+const mesh = await createMesh({
+  dbPath: "./data/mesh.db",
+  llm: { model: "anthropic:claude-opus-5", apiKeyEnv: "ANTHROPIC_API_KEY" },
+  // runtime 省略 ⇒ builtinTools: []（不启用任何 pi 内建工具）、资源全隔离
+});
+```
+
+两条路径的分界只有一个问题：**system prompt 与 cwd 要不要由宿主逐账号定制**。要，就自己给 `sessionFactory`；不要，就给 `llm`。
 
 ```ts
 import { createMesh } from "@pi/agent-mesh";
@@ -3353,7 +3582,7 @@ const build = (cwd: string, sm: SessionManager, account: Account, tools: ToolDef
     tools,                                           // 库给的 14 个工具，原样注册
   });
 
-// ── 1. 装配：九个策略槽里只提供必填的 SessionFactory ────────────────
+// ── 1. 装配（高级路径）：九个策略槽里只提供 SessionFactory ──────────
 const mesh = await createMesh({
   dbPath: "./data/mesh.db",
   devMode: true,                                     // 开启不变量断言（§23.4）
@@ -3865,6 +4094,8 @@ Presence 有且只有两个来源：
 
 反过来，宿主设 `dnd` 而流是 `hot` 时也是宿主值生效——一个热流上的 Agent 完全可以在业务语义上"不希望被打断"。
 
+**"宿主设过没有"必须是一个独立的布尔列，不能从 presence 字符串反推**（`mesh_accounts.presence_explicit`，§11.1）。理由：默认值 `offline` 与宿主显式设的 `offline` 字面相同，靠字符串猜就会把"从没设过"当成"宿主要求离线"，于是派生永远不生效。读取规则因此是：`presence_explicit = 1` 且 `presence_until` 未过期 ⇒ 取显式值；否则取派生值。`until` 过期后的回落是**可观察**的——发一次 `presence_changed { source: "derived" }`，同一状态不重复发。显式设置发 `source: "host"`。
+
 ### 15.3 Presence 只影响唤醒，不影响投递
 
 这是本章最重要的一条，也是 Presence 与"聊天软件的在线状态"最大的差别：
@@ -3887,7 +4118,7 @@ Presence 有且只有两个来源：
 
 ② **会引入不可恢复的消息丢失。** Presence 的派生值随流的冷热抖动，而流的冷热由 `idleEvictMs` 这类运维参数决定。让运维参数决定消息存不存在，意味着一次驱逐时机的巧合就能永久吞掉一条任务派发。
 
-③ **`dnd` 表达的是"别叫我"，不是"别给我"。** 这两件事在设计上被刻意分开：不想收消息的语义是**退出会话**或 `MUTED`（`dropped(MUTED)`，§7.10），不是 `dnd`。混在一起会让"免打扰一小时"和"退群"变成同一个操作。
+③ **`dnd` 表达的是"别叫我"，不是"别给我"。** 这两件事在设计上被刻意分开：不想收消息的语义是**退出会话**，不想被叫醒的语义是 `mute`（§7.10 末），都不是 `dnd`。混在一起会让"免打扰一小时"和"退群"变成同一个操作。
 
 因此 Presence 恰好只作用于 §7.3 唤醒判定里的一条规则（A2），此外**不出现在投递路径的任何环节**。`priority: "urgent"` 是 A2 的**默认开启**的例外：没有这个例外，`urgent` 在默认配置下就没有任何可观察效果。
 
@@ -4613,7 +4844,7 @@ interface SharedRef { spaceId: SpaceId; key: string; version?: number; }
 
 ### 19.2 `Transport` 接口与两个内建实现
 
-接口故意做窄，只有四个成员：
+接口故意做窄，只有四个必需成员加一个可选的收尾钩子：
 
 ```ts
 interface Transport {
@@ -4621,10 +4852,13 @@ interface Transport {
   subscribe(endpointId: EndpointId, h: DeliveryHandler): Unsubscribe; // 本进程认领哪些 endpoint
   ack(deliveryId: string, state: DeliveryState): Promise<void>;       // 回写终态
   readonly kind: "inProcess" | "sameHost" | string;                   // 自定义实现可用其它字符串
+  stop?(): void | Promise<void>;        // 有轮询 / 定时器 / 句柄的实现必须停掉；无资源者可不实现
 }
 
 type DeliveryHandler = (d: PendingDelivery) => Promise<void>;
 ```
+
+**自定义实现要能证明自己具备这些能力，否则拒绝启动。** `createMesh` 在收到非内建 `Transport` 时逐个校验 `publish` / `subscribe` / `ack` 是函数（给了 `stop` 也一并校验），缺任一项即以 `MESH_BAD_CONFIG` reject。理由与自定义 `StreamPort` 的 10 方法校验相同：一个少实现了 `ack` 的 Transport 不会报错，只会让 `mesh_outbox` 永远停在 `claimed`，而这要到积压告警时才被发现。`MeshHost.close()` 一律 `await transport.stop?.()`，不按实现类型分支。
 
 | 实现 | `kind` | 语义 | 何时用 |
 |---|---|---|---|
@@ -4759,12 +4993,12 @@ PRAGMA wal_autocheckpoint = 1000;
 | `accessControl` | 否 | SharedStore 每次读/写；Router 每次成员操作与 `topic` 发布 | `{ actor, action, target, tags }` | `boolean` 或 `{ allow, reason }` | `caps` 判定：`read` 可读、`speak` 可发、`setCaps` 可改权限（§4.4） | `policyTimeoutMs`（50ms，**建议按槽覆盖**，见 §20.2） | **拒绝**（fail-closed，九个槽里唯一一个） | `policy_degraded { slot: "accessControl", degradedTo: "deny" }` |
 | `retention` | 否 | SessionHost 组装上下文预算；Mailbox 判定未读折叠 | `{ endpointId, conversations, unreadPerConversation, budgetBytes }` | 每会话"给不给原文 + 原文预算字节" | 等价于 `maxVerbatimConversations=3` + `verbatimGapK=20`（§7.4） | `policyTimeoutMs`（50ms） | **不给原文**（只记游标） | `policy_degraded { slot: "retention", degradedTo: "noVerbatim" }` |
 | `endpointSelector` | 否 | Mailbox 为每条 delivery 解析目标端点 | `{ accountId, conversationId, envelope, topology }` | `EndpointId` / `EndpointId[]` / `null` | 按三种拓扑各自的规则（§8.1） | `policyTimeoutMs`（50ms） | **`parked`**（不投，等下次重算） | `policy_degraded { slot: "endpointSelector", degradedTo: "parked" }` |
-| `sessionFactory` | **是** | SessionHost 热化 endpoint（`cold → warming`）；崩溃恢复时重开 | `{ endpointId, accountId, topology, piSessionId? }` | 一条可用的 pi session（经 `StreamPort`） | **无**（库不知道模型、system prompt、工具白名单、cwd） | 必须按槽覆盖至秒级（建议 5s） | **无降级** ⇒ delivery 转 `parked(NO_SESSION)` + 告警 | `policy_degraded { slot: "sessionFactory", degradedTo: null }` + `message_parked { reason: "NO_SESSION" }` |
+| `sessionFactory` | 否（包根）/ **是**（`/core`） | SessionHost 热化 endpoint（`cold → warming`）；崩溃恢复时重开 | `{ endpointId, accountId, topology, piSessionId? }` | 一条可用的 pi session（经 `StreamPort`） | 包根：按 `llm` / `runtime` 隔离装配（§12.1）；`/core`：**无** | 自有秒级 deadline（实现取 30s），**不**受 `policyTimeoutMs` 约束 | **无降级** ⇒ delivery 转 `parked(NO_SESSION)` + 告警 | `policy_degraded { slot: "sessionFactory", degradedTo: "unrecoverable" }` + `message_parked { reason: "NO_SESSION" }` |
 
 关于这张表的四条读法：
 
-1. **只有 `sessionFactory` 必填。** 其余八个槽的默认实现全部可用，因此**库能独立跑起来，不依赖任何宿主**——这是"库形态"的验收标准之一（§25 P0）。
-2. **`parked(NO_SESSION)` 是唯一要告警的 park 原因。** 其余 park 原因（`ENDPOINT_GONE` / `LEASE_HELD` / `NO_SINK_HANDLER` / `SINK_REFUSED` / `PORT_TIMEOUT`）都是"等条件恢复"的常态，只记计数器；`NO_SESSION` 不同，它意味着宿主提供的唯一必填槽坏了，没有任何兜底路径，**必须**惊动人。
+1. **九个槽都有可用默认，`sessionFactory` 的默认来自包根的 `llm` / `runtime` 装配**（§12.1）。所以 `createMesh({ dbPath, llm })` 就能跑起来，不需要宿主实现任何槽——这是"库形态"的验收标准之一（§25 P0）。只用 `@pi/agent-mesh/core` 的宿主没有这个缺省，`sessionFactory` 仍是必填。
+2. **`parked(NO_SESSION)` 是唯一要告警的 park 原因。** 其余 park 原因（`ENDPOINT_GONE` / `LEASE_HELD` / `NO_SINK_HANDLER` / `SINK_REFUSED` / `PORT_TIMEOUT`）都是"等条件恢复"的常态，只记计数器；`NO_SESSION` 不同，它意味着造 session 这件事彻底失败了（无论是宿主给的 `sessionFactory` 还是库按 `llm` 装配的那个），没有任何兜底路径，**必须**惊动人。
 3. **降级方向按"哪个方向的错更容易被发现"选，不按"哪个方向更宽松"选。** 少醒一次比乱醒一片好排查（`delivery`/`activation`）；上下文爆掉是最贵的失败（`retention`）；全群失声比一次嘈杂更难发现（`floor`）；宁可等，不可乱投（`endpointSelector`）；只有权限例外——判定失败时放行是最坏结果，所以 `accessControl` 是唯一 fail-closed 的槽。
 4. **降级事件不是可选的。** 任何槽降级都**必须**发 `policy_degraded`（I21）。没有这个事件，宿主就不知道自己的策略在悄悄失效，而库的行为看起来完全正常——这是最难排查的一类故障。
 
@@ -4789,7 +5023,7 @@ PRAGMA wal_autocheckpoint = 1000;
 |---|---|---|
 | `delivery` / `activation` / `endpointSelector` / `floor` / `renderer` / `clock` / `retention` | **不覆盖**，保持 50ms | 扇出路径上，且这七个槽的正确实现都是纯计算，50ms 已宽裕两个数量级 |
 | `accessControl` | **可以**放宽到 200–500ms | 唯一有合理理由查外部服务的槽。放宽的代价由它自己承担：fail-closed 意味着超时会拒绝，宿主必须自己加缓存 |
-| `sessionFactory` | **必须**放宽到秒级（建议 5s） | 造 session 是真实 I/O（开文件、装扩展、连模型）。它不在扇出路径上，一次热化对应一条流 |
+| `sessionFactory` | **必须**放宽到秒级（实现取 **30s**；早期建议值 5s 过紧——冷启动要开文件、装扩展、连模型） | 造 session 是真实 I/O。它不在扇出路径上，一次热化对应一条流 |
 
 `devMode` 在任何槽的 p99 超过其阈值一半时**提前**报警（§23.7）——这是 I21 的早期预警：还没超时，但快了。
 
@@ -5271,12 +5505,14 @@ SELECT d.account_id, d.endpoint_id, ep.topology, ep.state AS ep_state,
 observer.replay(endpointId, { untilSeq }) → ReplayResult
 
 interface ReplayResult {
-  prompt: string;          // 当时那次调用真正看到的完整 prompt 文本
+  prompt: string;          // 由镜像条目拼出的 prompt 文本
   entries: StreamEntry[];  // 参与重建的镜像条目（§8.5）
-  inbox: InboxView;        // 当时的收件箱快照
-  injected: string[];      // 当时由 context 钩子注入的文本（P2 路径）
+  inbox: InboxView;        // 收件箱快照
+  injected: string[];      // context 钩子注入的文本（P2 路径）
 }
 ```
+
+> **v0.1.0 的精度边界：`replay` 是基础转写，不是历史精确重建。** 下面描述的是**目标形态**；当前实现按当前镜像与当前策略重演，`inbox` / `injected` 取的是**现在**能重算出来的值，而不是"当时那一刻"的值。原因是 P2 注入体不落盘（§7.6），`InboxView` 的时点重放依赖下面那条 SQL 把状态机倒带，而模型、策略、渲染器都可能在此期间换过。所以 `replay` 回答"这条流里发生过什么、按今天的口径会怎么组织"，**不**回答"当时模型看到的 token 逐字节是什么"，也**不**承诺模型指纹一致。把它当审计证据时必须知道这条边界。
 
 实现是纯查询：读 `mesh_stream_entries.raw_json`，按 `parent_id` 重建流树到指定点，拼成 prompt 文本。**零 LLM 调用、零 token**。
 
@@ -5380,7 +5616,7 @@ SELECT m.conversation_id, m.seq, d.grade, d.path,
 observer.checkInvariants() → InvariantReport
 ```
 
-十六条断言全部**纯 SQL 可判定**，走只读连接（`PRAGMA query_only`），代价小到可以在生产定期跑。统一约定：**每条查询返回空集即通过，返回任何行即违反**——返回的行就是违规样本。任一条违反时库计 `invariant_violated` 并发同名事件（§12.5）。
+十六条断言里十五条**纯 SQL 可判定**（C10 额外需要一次进程活性探测，见下），全部走**独立的只读连接**（`readonly` 打开，不复用写连接），代价小到可以在生产定期跑。走独立只读连接而不是共享写连接，是为了让"看一眼状态"在机制上就不可能写到库——`Observer` 完全只读是一条不变量，不是一句约定（§12.4）。统一约定：**每条查询返回空集即通过，返回任何行即违反**——返回的行就是违规样本。任一条违反时库计 `invariant_violated` 并发同名事件（§12.5）。
 
 | 编号 | 不变量 | 违反时的含义 |
 |---|---|---|
@@ -5408,7 +5644,10 @@ SELECT message_id, account_id, COUNT(*) AS n FROM mesh_deliveries
 
 -- C3（I17 / §7.9）状态与时间戳组合合法
 SELECT id, state, drop_reason FROM mesh_deliveries
- WHERE (consumed_at IS NOT NULL AND delivered_at IS NULL)
+ WHERE (consumed_at IS NOT NULL AND delivered_at IS NULL AND partial = 0)
+    -- ↑ partial = 1 是合法例外：CATCHUP 固化（§7.6）与崩溃恢复核对（§8.4）都会把
+    --   还没 delivered 的 queued 行直接推到 consumed(partial)——"进过摘要 / 进过 session，
+    --   但从没走过本进程的 delivered 跃迁"。不留这个例外，一次正常折叠就会报 C3 违反。
     OR (delivered_at IS NOT NULL AND queued_at IS NULL)
     OR (state = 'consumed' AND consumed_at IS NULL)
     OR (state = 'delivered' AND delivered_at IS NULL)
@@ -5473,7 +5712,11 @@ SELECT m.id, m.tombstoned_by
 SELECT id, state, lock_path FROM mesh_endpoints
  WHERE state IN ('warming','hot','evicting') AND (lock_path IS NULL OR lock_path = '');
 SELECT id, lock_path FROM mesh_endpoints WHERE state = 'hot';
---   ⇒ 执行器：上一条返回的每个 lock_path 必须在文件系统上存在且属于活进程；否则违反 I1
+--   ⇒ 执行器：对上一条返回的每个 lock_path 做**活 owner 判定**（pid 存在 + 进程启动时刻
+--     与锁文件记录吻合），而不是只 stat 文件是否存在——一个 pid 复用后留下的陈旧锁文件
+--     照样存在，只看存在性等于把"锁主已死"判成健康。三值：dead ⇒ 违反 I1；alive ⇒ 通过；
+--     unknown（锁损坏 / 读不到启动时刻）⇒ **不判违反**（§19.6「绝不猜」），交 reclaim 告警。
+--     宿主未注入活性探针时退化为"文件存在性"，报告里**必须**标注这是降级口径。
 
 -- C11（I17）parked 必带原因与时间
 SELECT id FROM mesh_deliveries
@@ -6080,11 +6323,23 @@ Fold(k) = b_summary / (k · b)     # 折叠压缩比，k 越大收益越大
 
 ### 26.1 六步适配
 
-#### 第 1 步：提供 `SessionFactory`
+#### 第 1 步：给出会话来源（`llm` 配置 **或** `SessionFactory`）
 
-**做什么。** 实现九个策略槽里唯一必填的那个（§20.1），把宿主已有的 pi session 托管逻辑接进来。库通过它拿到 `AgentSession`，此后所有写入都经 `StreamPort` 收敛到这一条（M3）。
+**做什么。** 二选一：① 给 `createMesh({ llm, runtime })`，库在 mesh-pi 层自己装配 session（完全隔离，不读机器上的任何 pi 配置，§12.1）；② 自己实现 `SessionFactory`，把宿主已有的 pi session 托管逻辑接进来。无论哪条路，库拿到 `AgentSession` 之后所有写入都经 `StreamPort` 收敛到一条通道（M3）。
 
-**为什么。** 只有宿主知道 system prompt、模型、工具白名单、`cwd` 从哪来。库如果自己造 session，就必须理解这些，M1 立刻破。`create` 用于首次建流，`open` 用于崩溃或驱逐后按 `piSessionId` 恢复（§8.4）。
+**怎么选。** 只有 system prompt 与 `cwd` 是库永远猜不到的；模型、Provider、凭据、内建工具白名单在 v0.1.0 已经由本库的配置面表达。所以：**要逐账号定制 system prompt / cwd 就走 ②，否则走 ①**。走 ② 时 `create` 用于首次建流，`open` 用于崩溃或驱逐后按 `piSessionId` 恢复（§8.4）；两者的装配**必须完全一致**，否则恢复出来的流与原来不是同一个东西。
+
+**最小代码（路径 ①）。**
+
+```ts
+const mesh = await createMesh({
+  dbPath: "./data/mesh.db",
+  llm: { model: "anthropic:claude-opus-5", apiKeyEnv: "ANTHROPIC_API_KEY" },
+  runtime: { builtinTools: [] },     // 缺省也是 []：不启用任何 pi 内建工具
+});
+```
+
+下面是路径 ②。
 
 **最小代码。**
 
@@ -6249,7 +6504,7 @@ const mesh = await createMesh({
   dbPath: "./data/mesh.db",
   devMode: true,                                  // 集成期务必开（§23.7）
   policies: {
-    sessionFactory: {                             // 九槽中唯一必填
+    sessionFactory: {                             // 高级路径；只给 llm 时这段可整段省略
       create: async ({ account, tools }) => build(account, tools,
         await SessionManager.create({ cwd: `./agents/${account.id}` })),
       open: async ({ endpoint, account, tools }) => build(account, tools,
@@ -6470,9 +6725,14 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 | 旋钮 | 类型 | 默认 | 作用与约束 | 章节 |
 |---|---|---|---|---|
 | `dbPath` | `string` | — | 必填。同一路径**不得**被两个 mesh 实例同时打开，库用 `.lock` 检测并拒绝启动（M3） | §12.1 |
-| `transport` | `Transport` | `InProcessTransport` | 单进程用默认；同机多进程换 `SqliteOutboxTransport`。**跨机器 1.0.0 不支持**。换 Transport **不改变**顺序语义（顺序由 `seq` 保证，§7.7） | §19 |
-| `streamPort` | `StreamPort` | `mesh-pi` 实现 | 自定义实现会使会话回放、崩溃恢复双向核对、`.lock` 单写者三项保证失效；库启动时降级并警告 | §2.4 |
+| `transport` | `Transport \| "sameHost"` | `InProcessTransport` | 单进程用默认；同机多进程传字符串 `"sameHost"` 由库构造（细调走 `transportOptions`）。**跨机器不支持**。换 Transport **不改变**顺序语义（顺序由 `seq` 保证，§7.7） | §19 |
+| `streamPort` | `StreamPort` | `mesh-pi` 实现 | 自定义实现启动时逐个校验 10 个方法；它会使会话回放、崩溃恢复双向核对、`.lock` 单写者三项保证失效，库降级并警告 | §2.4 |
 | `devMode` | `boolean` | `false` | 开启不变量断言、策略重入检测、`context` 注册顺序每次求值校验、`ext` 访问的 Proxy 拦截。**生产不应开启**：断言会在关键路径上做额外 SQL | §23.7 |
+| `llm` / `runtime` | `LlmConfig` / `RuntimeConfig` | — | **仅包根**。给了就由库装配 `SessionFactory` 并做完全隔离（不读机器上任何 pi 配置）；与 `policies.sessionFactory` 二选一，两者都缺即拒绝启动 | §12.1、§12.6 ⑦ |
+| `fts` | `boolean` | `true` | 关掉即删 FTS 表并让 `observer.search` 明确报「功能关闭」。`false → true` 会回填历史 | §12.4 |
+| `walMaxBytes` | `number` | `8 MiB` | WAL 超阈值即告警 + 检查点 + **停发**，直到 WAL 收缩 | §27.4 |
+| `recoverDeadEndpoints` | `boolean` | `false` | 启动时回收死写者遗留的锁。**只有 pid 确实不存在且启动时刻不吻合才回收**，判不出一律拒绝 | §19.6 |
+| `seal` | `{ key }` | 关闭 | 启用消息 `seal`；密钥由宿主给、只在内存，库绝不自行生成 | §22.4 |
 | `historyVisibility` | `"none" \| "since_join" \| "full"` | `since_join` | 会话级。`none` = 什么都查不到；`since_join` = 只有 `seq > joinedSeq`；`full` = 全部历史。`upgradeToGroup` 创建的新群**默认 `none`** 且不迁移任何历史——原单聊内容是两人的私下对话 | §9.4 |
 | `maxHistoryOnJoin` | `number` | `0` | 入会时注入上下文的历史条数，**仅 `historyVisibility: "full"` 下有意义**。默认 0 = 不注入，因为"能查到"与"自动进上下文"是两件事 | §9.4 |
 | `openJoin` | `boolean` | `false` | `false` 时 `join()` 一律 `reject(JOIN_DENIED)`，只能被 `addMember` 拉进来 | §9.3 |
@@ -6652,19 +6912,25 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 **版本号存在 `mesh_meta`**：
 
 ```sql
--- mesh_meta 是 (k, v) 键值表；迁移相关的三个键：
---   schema_version   当前 schema 版本（整数字符串，从 '1' 开始）
+-- mesh_meta 是 (k, v) 键值表；迁移相关的五个键：
+--   schema_version    schema 的**兼容世代**（整数字符串，1.x 内恒为 '1'，由 000_init.sql 写入）
 --   schema_applied_at 最近一次迁移完成时间（ISO-8601 UTC）
---   library_version  最近一次打开该 DB 的库版本（用于事后取证）
+--   library_version   最近一次打开该 DB 的库版本（用于事后取证）
+--   migration:<文件名> 每个已成功应用的脚本一行，与该脚本同事务盖章（续跑的依据）
+--   backup_path       最近一次升级迁移前写出的备份文件路径
 ```
 
-`createMesh` 在返回之前**必须**完成版本校验（§12.1 第 1 步），三种结果：
+**版本世代与脚本清单是两件事。** `schema_version` 回答"这个库认不认识这个库文件"，只在**破坏性世代**更替时 +1；"哪些脚本已经跑过"由 `migration:<文件名>` 逐条记录。两者分开的理由是脚本只做加法（下面约定 3）：追加一个 `ADD COLUMN` 不会让旧库读不懂新文件，因此没有理由让世代号跟着每个脚本涨——涨了反而会让一个只加列的补丁把所有旧进程挡在门外。
 
-| DB 的 `schema_version` | 库期望的版本 | 行为 |
+`createMesh` 在返回之前**必须**完成版本校验（§12.1 第②步），三种结果：
+
+| DB 的 `schema_version` | 库的世代 | 行为 |
 |---|---|---|
-| 不存在（空库） | v_n | 建全部表，写入 `schema_version = n` |
-| < v_n | v_n | **依次**执行 n − v 个迁移脚本，每个脚本一个事务，全部成功后更新 `schema_version` |
-| > v_n | v_n | **必须拒绝启动**并抛错。旧库不得打开新 DB——它不认识新列，写出来的行会缺字段 |
+| 不存在（空库） | n | 按序跑全部脚本建表，逐个盖 `migration:<文件名>` 章 |
+| ≤ n | n | 按文件名排序取出**没盖过章的**脚本，逐个执行；升级路径先备份（见下） |
+| > n | n | **必须拒绝启动**并抛错。旧库不得打开新 DB——它不认识新列，写出来的行会缺字段 |
+
+**v0.1.0 的实际脚本清单**（世代恒为 `1`）：`000_init.sql`（17 表 + FTS）、`001_presence_source.sql`（`mesh_accounts.presence_explicit`）、`002_pool_meta.sql`（`mesh_endpoints.pool_size` / `pool_affinity`）、`003_claim_owner.sql`（`mesh_deliveries.claimed_by` / `claimed_at` / `claim_error` + 重建 `ix_delivery_claim` 覆盖两态）、`004_delivery_decision.sql`（`mesh_deliveries.redeliver_reason`）。全部是加列 / 加索引，无破坏性变更。`000_init.sql` 是**只读基线**，连注释都不改——API/DDL 快照对它取 sha256，漂移即门禁失败。
 
 **迁移脚本约定**：
 
@@ -6683,24 +6949,26 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 
 **迁移前必须备份，这是硬规则。** 具体地：
 
-- 库在执行任何迁移脚本**之前**，**必须**校验 `mesh_meta` 里存在一条本次迁移的备份声明，或者由调用方显式传入"我知道没有备份"的确认标志。默认行为是**没有备份就不迁移**。
-- 备份**必须**用 27.3 的在线方法（`VACUUM INTO` 或备份 API），**不得**用 `cp`。
+- 库在执行任何**升级**脚本（已有 `mesh_meta` 且还有未盖章的脚本）之前，**必须**自己写出一份一致性备份到 `<dbPath>.premigrate.bak`，并把路径记进 `mesh_meta.backup_path`；**备份失败即抛错、拒绝无保护迁移**。空库建表与 `:memory:` 不走这条路径（没有可丢的数据）。
+- 备份**必须**用 27.3 的在线方法（在线备份 API 或 `VACUUM INTO`），**不得**用 `cp`。
 - 备份副本**应当**跑一次 `checkInvariants()`——迁移一个本来就不一致的库只会把问题带到新版本。
 
 **迁移期间的锁策略：**
 
 ```
 ① 抢 <dbPath>.lock 的独占持有（M3）——抢不到即拒绝迁移
-② 检查是否存在其它进程持有的 stream .lock
-     存在 ⇒ 拒绝迁移并列出这些 endpoint
-③ BEGIN IMMEDIATE  →  执行一个脚本  →  更新 schema_version  →  COMMIT
-④ 逐个脚本重复 ③；任一脚本失败即整体中止（已提交的脚本保留，版本号停在那里）
-⑤ 释放锁，正常启动
+②（升级路径）写 <dbPath>.premigrate.bak 备份；失败即中止
+③ BEGIN IMMEDIATE → 执行一个脚本 → 同事务盖 migration:<文件名> 章 → COMMIT
+④ 逐个脚本重复 ③；任一脚本失败即整体中止（已盖章的保留，下次启动从未盖章处续跑）
+⑤ 检查是否存在其它进程持有的 stream .lock，存在即拒绝继续并列出这些 endpoint
+⑥ 释放锁，正常启动
 ```
 
-②是多进程部署下最容易被跳过的一步，也是最不能跳过的一步：**没有主进程，也没有选主**（27.2），所以库唯一能做的事就是"发现还有别人在跑就拒绝迁移"。运维纪律因此是明确的：**多进程部署的升级必须全停、迁移、再全起**，不存在滚动升级路径。这是 1.0.0 有意接受的限制——支持滚动升级需要"新旧 schema 同时可读写"的双写期，那是一整套额外机制，而目标部署规模（8–30 个 Agent）不值得为此付这个复杂度。
+**①必须早于②③**：迁移会改写文件，所以"确认没有第二个实例在用这个文件"必须发生在打开 / 迁移之前，而不是之后（§12.1）。⑤放在迁移之后，是因为它要读迁移后的 `mesh_endpoints`。
 
-④的"已提交的脚本保留"意味着迁移可以停在中间版本。这是安全的：版本号始终等于"已成功应用的最后一个脚本序号"，下次启动会从那里继续。这也是脚本必须逐个独立成事务的原因。
+⑤是多进程部署下最容易被跳过的一步，也是最不能跳过的一步：**没有主进程，也没有选主**（27.2），所以库唯一能做的事就是"发现还有别人在跑就拒绝迁移"。运维纪律因此是明确的：**多进程部署的升级必须全停、迁移、再全起**，不存在滚动升级路径。这是 1.0.0 有意接受的限制——支持滚动升级需要"新旧 schema 同时可读写"的双写期，那是一整套额外机制，而目标部署规模（8–30 个 Agent）不值得为此付这个复杂度。
+
+④的"已盖章的保留"意味着迁移可以停在半路。这是安全的：已盖章集合始终等于"已成功应用的脚本集合"，下次启动精确地从未盖章的那一个继续，不会重跑也不会漏跑。这也是脚本必须逐个独立成事务、并且**盖章与脚本同事务**的原因——分成两个事务就会出现"脚本跑了但没盖章"的重跑窗口。
 
 ### 28.4 1.x 计划
 
@@ -6722,9 +6990,9 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 
 ### 28.5 pi SDK 版本兼容
 
-**依赖声明**：`@earendil-works/pi-coding-agent` **≥ 0.84.4**，作为 `peerDependency`（理由见 §29.2）。
+**依赖声明**：`@earendil-works/pi-coding-agent` **`^1.1.0`**，作为**直接 `dependency`**、在 `mesh-pi` 内惰性加载（v0.1.0 起；原设计是 optional `peerDependency`，改动理由与代价见 §29.2）。
 
-0.84.4 是本文档全部 SDK 事实的核实基线：§2.2 的八条实测结论、§2.3 的 F1–F5、以及 `StreamPort` 十个方法的可实现性，全部是对该版本源码的一手核实结果。**低于该版本的行为未经核实，不予支持。**
+核实基线有两层：0.84.4 是本文档全部 SDK 事实的**首次**核实基线（§2.2 的八条实测结论、§2.3 的 F1–F5、`StreamPort` 十个方法的可实现性）；**1.1.0 是当前实现基线**，五条 F 已逐条重跑复核，唯一差异（`agent_settled` 增 `aborted`）登记在 §2.3 末。**低于 1.1.0 的行为在 v0.1.0 未经核实，不予支持。**
 
 **F1–F5 契约测试是升级 pi 时的第一道闸。** 它们的职责不是"探索 pi 能做什么"（那件事已经做完了），而是**锁住这些已确认的事实不被 SDK 升级悄悄改掉**。要锁的清单：
 
@@ -6737,6 +7005,7 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 | `delivered` 只能以 `entry_appended` 为判据（F5） | 在接收方 streaming 中投递，断言 `sendCustomMessage` 已返回但事件尚未到达 |
 | `context` 钩子 last-writer-wins、无优先级（I23 的前提） | 注册两个钩子，断言后注册者完整覆盖前者 |
 | 三个内存窗口的落盘时机（§2.2⑧） | 各分支断言"何时才在 session 里查得到" |
+| 三个生产确认点仍然成立（§2.3 末） | P2 注入体能在 `context_with_system` 里被定位；`entry_appended` / `before_agent_start` / provider HTTP 钩子的覆盖面不变；`getSessionFile()` 在 create 点即非空 |
 
 **判据不是"能编译"，而是"能在真 pi 上取到期望的值"。** 类型只在实现时才会报错，而一个不存在的 API 在设计文档里可以一直看起来很合理——这正是 F2 那条负面知识的来源，也是这套测试必须**先写、当门禁写**的原因（P0 第一周就要跑起来，§25）。
 
@@ -6750,7 +7019,7 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
      改变了 StreamPort 的语义      ⇒ 次版本 + CHANGELOG「行为变化」
      推翻了本文档某条 SDK 事实      ⇒ 更新 §2.2 / §2.3，评估是否需要主版本
 ④ 无论哪一档，都要在 §2.3 增补一条：F 编号、被推翻的版本、新语义
-⑤ 抬高 peerDependency 下界（不放宽上界——上界靠契约测试守，不靠版本号猜）
+⑤ 抬高依赖声明的下界（不放宽上界——上界靠契约测试守，不靠版本号猜）
 ```
 
 第③步的分档标准值得说明：**`mesh-core` 的 85% 代码对 pi 升级完全免疫**，因为它只认 `StreamPort` 的十个方法。所以 pi 的绝大多数变化止步于 `mesh-pi`，是补丁级的。这就是 §3.3 那条模块切分线在版本策略上的兑现——它不只是"测试不需要 pi"，更是"pi 变了也不用动大部分代码"。
@@ -6807,27 +7076,28 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 
 ### 29.2 依赖策略
 
-**运行时依赖只有一个：SQLite 驱动。** 其它一个都没有——没有日志库、没有 UUID 库（ULID 自己实现，几十行）、没有 schema 校验库、没有 EventEmitter 包装。
+**运行时依赖只有两个：SQLite 驱动和 pi SDK。** 其它一个都没有——没有日志库、没有 UUID 库（ULID 自己实现，几十行）、没有 schema 校验库、没有 EventEmitter 包装。
 
-理由不是极简主义，是**被嵌入库的依赖成本是被放大的**：本库要住在宿主的进程里，每个运行时依赖都可能与宿主已有的版本冲突，而冲突的代价由宿主承担、由宿主排查。一个只依赖 SQLite 驱动的库可以被无条件嵌入。
+理由不是极简主义，是**被嵌入库的依赖成本是被放大的**：本库要住在宿主的进程里，每个运行时依赖都可能与宿主已有的版本冲突，而冲突的代价由宿主承担、由宿主排查。
 
 | 依赖 | 类别 | 约束 |
 |---|---|---|
-| SQLite 驱动 | `dependencies` | 唯一的运行时依赖。**必须**支持 WAL、`busy_timeout`、在线备份 API 或 `VACUUM INTO`（27.3 依赖它） |
-| `@earendil-works/pi-coding-agent` ≥ 0.84.4 | **`peerDependency`**（`peerDependenciesMeta.optional: true`） | 只有 `mesh-pi` 用；`@pi/agent-mesh/core` 的使用者不需要它 |
+| SQLite 驱动 | `dependencies` | **必须**支持 WAL、`busy_timeout`、在线备份 API 或 `VACUUM INTO`（27.3 依赖它） |
+| `@earendil-works/pi-coding-agent` `^1.1.0` | **`dependencies`**（v0.1.0 起；原设计是 optional `peerDependency`） | 只有 `mesh-pi` 用，且**惰性加载**：`@pi/agent-mesh/core` 的使用者既不需要配置它，运行时也不会加载它 |
 | TypeScript、测试框架、依赖图扫描器 | `devDependencies` | 不进产物 |
+| Node.js | `engines` | `>=22.19.0` |
 
-**为什么 pi 是 peer 而不是普通依赖。** 三条理由，第一条是决定性的：
+**pi 从 optional peer 改成直接依赖的理由与代价。** 原设计把 pi 放在 `peerDependencies` + `optional: true`，三条理由是：① 宿主已经有一个 pi 实例，装成私有依赖可能出现第二份副本，于是库注册的钩子挂在宿主根本不用的模块实例上，表现为"一切正常但消息永远不进上下文"；② 版本应由宿主决定；③ `optional: true` 让 `core` 子入口可独立使用。
 
-1. **宿主已经有一个 pi 实例，且必须是同一个。** 本库通过 `ctx` 注册 `context` 钩子、订阅 `entry_appended`、调 `sendCustomMessage`——这些全都作用在宿主创建的那个 Agent 上。如果 pi 被装成本库的私有依赖，npm 完全可能装出第二份副本，于是库注册的钩子挂在一个宿主根本不用的模块实例上，表现为**一切正常但消息永远不进上下文**——静默、无错误、极难排查。peer 依赖是唯一能保证"就是宿主那一份"的声明方式。
-2. **版本必须由宿主决定。** pi 的版本影响宿主自己的全部 Agent 行为，本库无权替它选。库能做的只是声明下界（≥ 0.84.4）并用契约测试守住上界（§28.5）。
-3. **`optional: true` 让 `core` 子入口真正可独立使用**：只用 `@pi/agent-mesh/core` 的宿主不装 pi，安装不报警。
+v0.1.0 推翻了①和②的前提：库现在**自己装配 session**（`createMesh({ llm, runtime })`，§12.1），pi 实例由库创建而不是宿主传入，"必须是宿主那一份"不再成立；模型与隔离级别也由本库的配置面决定。与之对应的硬门槛变成两条——**"空目录装完就能跑，不需要手动装 pi"**（直接依赖满足）与**"core-only 的使用者不加载 pi"**（惰性加载满足）——optional peer 满足不了第一条。
+
+代价有三，必须明写：① 仍然自管 session 的宿主（高级路径 `policies.sessionFactory`）要**自己确保**传进来的 `AgentSession` 与库解析到的是同一份 pi 模块，npm 的去重通常能做到，但这不再由声明方式保证；② 版本上界由本库声明（`^1.1.0`）而不是宿主；③ 只用 `core` 的使用者仍会在 `node_modules` 里下载到 pi，只是永不加载。
 
 **`mesh-core` 零 pi 依赖怎么落地成机制**，三层，缺任何一层这条约束都会在几个月内腐蚀掉：
 
 | 层 | 手段 | 触发时机 |
 |---|---|---|
-| 声明层 | pi 只在 `peerDependencies`，`optional: true` | 安装时 |
+| 声明层 | pi 的 import 只允许出现在 `src/pi/**`，且**只经唯一一个惰性加载点**（`loadPiSdk`）；包根与 `core` 入口**不得**静态 import pi | 安装 / 构建时 |
 | 静态层 | **CI 依赖图扫描**：从 `src/core/**` 出发遍历 import 图，命中任何 pi 包即**构建失败**；同时校验反向规则——`src/pi/**` 只能 import `src/core` 的公共类型与 `StreamPort`，不得 import 其内部模块（§3.3） | 每次 CI |
 | 产物层 | 对 `dist/core/index.js` 做一次**无 pi 环境的冒烟导入**（把 pi 从 `node_modules` 移走后 `import` 它并跑一个 `FakeStreamPort` 用例） | 发布前 |
 
@@ -6841,7 +7111,7 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 |---|---|---|---|
 | 1 | **单测覆盖率** | `mesh-core` 语句覆盖 ≥ 90%；投递语义、状态机、折叠、未读四个模块**分支**覆盖 ≥ 95% | §23.5 |
 | 2 | **16 条 SQL 断言** | 在每个集成测试结束时跑 `checkInvariants()`，全部通过；`invariant_violated` 计数为 0 | §23.4 |
-| 3 | **F1–F5 契约测试** | 在真实 pi（≥ 0.84.4）上跑，七条事实逐条断言（§28.5 的表），不允许 skip | §2.3 |
+| 3 | **F1–F5 契约测试** | 在真实 pi（`^1.1.0`，配 faux provider、不调真实模型）上跑，§28.5 表里的每条事实逐条断言，不允许 skip | §2.3 |
 | 4 | **崩溃恢复属性测试** | 随机 kill 100 次后 16 条断言全绿，且幂等键无重复、Inbox 一致 | §23.6 |
 | 5 | **四个指标目标** | 基准场景跑完后：每消息平均唤醒数 ≤ 1.2（idle 分支）且 busy 分支 = 0、每消息平均原文份数 ≤ 3、静默率 > 0.5、原文率 < 0.25 | §24.2 |
 | 6 | **`policy_degraded` = 0** | 默认策略组合下跑完全部测试，该计数器为 0——它同时是"默认实现没有慢路径"的证据 | §20 |
@@ -6867,7 +7137,7 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 | 1 | 确定版本号 | 按 §28.1 的"改动类型 × 版本号"表逐条比对本次改动，**取最高档**；有争议时向上取 |
 | 2 | 更新 CHANGELOG | 三个必需段落：**破坏性变更**、**行为变化**（含 `Limits` 默认值调整）、**弃用**（含各条所处阶段） |
 | 3 | 校验弃用周期 | 本次要移除的每一个符号，确认它已走完标注 + 运行时告警两个次版本（§28.2） |
-| 4 | 校验 peer 下界 | pi 的 `peerDependencies` 下界与本次契约测试实际验证的版本一致（§28.5） |
+| 4 | 校验依赖下界 | pi 在 `dependencies` 里的范围与本次契约测试实际验证的版本一致（§28.5） |
 | 5 | 跑 29.3 全部 14 项 | 全绿。**任一项红灯即终止发布**，不豁免 |
 | 6 | 跑真实 LLM 集成测试 | 至少一个多 Agent 群聊场景端到端跑通——`FakeStreamPort` 与真 pi 的行为漂移只能被这一步抓到 |
 | 7 | 构建产物并检查体积 | `dist/` 无源码泄漏、无 sourcemap 指向不存在的路径、`files` 字段只含 `dist` 与 `migrations` |
@@ -7412,7 +7682,7 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `NO_SINK_HANDLER` | 目标是 `sink` 但宿主未 `registerSinkHandler` | Mailbox（§6.3） | 同上 | **宿主装配缺陷**：注册 handler 后积压会自动重投。启动自检里应当覆盖这一项 |
 | `SINK_REFUSED` | sink 连续拒收 | `SinkHandler` 返回值 | 同上 | 查下游（UI / 真人通道）是否离线或过载。这条区别于 `NO_SINK_HANDLER`：handler 在，但它说"现在不行" |
 | `PORT_TIMEOUT` | `StreamPort` 调用超时 | `Stream` / `StreamPort` | 同上 | 结合 `delivery_handoff_timeout` 与 `handoffTimeoutMs`（默认 30s）判断对端那一轮是否挂死 |
-| `NO_SESSION` | `SessionFactory` 失败（唯一必填插槽失败） | `SessionFactory` | 同上，但该 Endpoint 的**全部**投递都会堆积 | **唯一要告警的 `parked` 原因。** 它意味着该 Endpoint 完全无法承接投递，积压只会单向增长；不修就等着 1h 后成批 `TTL_EXPIRED` |
+| `NO_SESSION` | 造 session 失败（宿主的 `SessionFactory`，或库按 `llm` 装配的那个） | `SessionFactory` | 同上，但该 Endpoint 的**全部**投递都会堆积 | **唯一要告警的 `parked` 原因。** 它意味着该 Endpoint 完全无法承接投递，积压只会单向增长；不修就等着 1h 后成批 `TTL_EXPIRED` |
 
 ### `dropped(reason)`——八个
 
@@ -7425,7 +7695,7 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `TRANSPORT_FAILED` | 跨进程 Transport 重试耗尽（§19） | Transport | 同上 | 查目标进程存活与 Transport 通道。1.0.0 只支持同机多进程，跨机器不支持 |
 | `MAX_ATTEMPTS` | `queue` 会话中 claim/重试次数耗尽（§17） | Mailbox（queue 语义） | 该任务没有任何消费者成功 ack | 相当于死信。检查消费者是否在反复崩溃于同一条消息（毒消息），需要宿主侧的死信处置 |
 | `ACL_DENIED` | 扇出时 `AccessControl` 拒绝投给该收件人 | `AccessControl` | 无投递、无未读 | 正常拒绝。若面积异常大，先看 `policy_degraded`——`accessControl` 降级方向是 **fail-closed** |
-| `MUTED` | 收件人静音了该会话 | Mailbox | 无投递、无未读，符合用户意图 | 不需处理。它与 `ACL_DENIED` 的区别是**收件人自己的选择**，不要合并统计 |
+| `MUTED` | 收件人静音了该会话，且宿主显式要求丢弃 | Mailbox | 无投递、无未读 | **v0.1.0 起不是默认路径**：静音默认保留 Inbox + 强制 `silent` + 不唤醒（§7.10 末），所以常态下不产生这个码。仍出现时说明宿主配了显式丢弃；它与 `ACL_DENIED` 的区别是**收件人自己的选择**，不要合并统计 |
 | `TOMBSTONED` | 消息在投出去之前被 tombstone（§5.6） | Router / Mailbox | 从未看到过这条消息 | 正常。撤回在投递前生效是最好的情况；已 `delivered` 的无法撤回（I11 消息不可变） |
 | `WAKE_THROTTLED_AND_EXPIRED` | 被唤醒限流（I20）降档后一直没等到下一轮，直至过期 | Mailbox | 该消息**永久不会**进上下文 | 说明限流阈值与该账号的实际活跃度不匹配：要么该 Endpoint 太久不被激活，要么 A3 门限过紧。与 `TTL_EXPIRED` 分开统计，根因不同 |
 
@@ -7503,7 +7773,7 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `messages_total` | 落库消息条数（**四个目标指标的公共分母**） |
 | `deliveries_total` | 落库 delivery 条数 |
 | `wake_per_message_idle` | 唤醒次数，当时目标 endpoint **空闲** |
-| `wake_per_message_busy` | 唤醒次数，当时目标 endpoint **忙** |
+| `wake_per_message_busy` | 唤醒次数，当时目标 endpoint **忙**。目标值恒 0，因此它是一个 **canary**：库自己不在任何正确路径上给它 +1（忙流的待投会并进正在进行的轮次，不另起一轮），非 0 即意味着有一条"忙时另起轮次"的路径被引入。**v0.1.0 的实现里没有任何自增点**——这使它在"合并逻辑被改坏"时也不会报警，取舍记在 `notes/plan/2026-10-19-post-0.1.0-open-items-plan.md` |
 | `verbatim_copies` | 进入上下文的原文份数（同一条消息被镜像、被 P2 注入、被渲进 steer 记 3 份） |
 | `silent_grade` | 定档为 `silent` 的 delivery 数 |
 | `cold_hit` | `silent` 档投给 `cold` 流的 delivery 数 |
@@ -7536,7 +7806,7 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 ② **`limits` 是逐项覆盖，不是整体替换。** `MeshOptions.limits` 传 `Partial<Limits>`，未给出的项用默认值（§12.1）。
 ③ **超出允许范围的值在 `createMesh` 时直接 reject**，不做静默夹取——一个被悄悄改回默认值的配置比一个启动失败的配置难查得多。
 
-### F.1 `Limits`：26 项运行期限额
+### F.1 `Limits`：30 项运行期限额
 
 | 名称 | 类型 | 默认值 | 单位 | 作用 | 允许范围 | 相关章节 |
 |---|---|---|---|---|---|---|
@@ -7563,6 +7833,10 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `maxAttempts` | number | `3` | 次 | `queue` 重投上限，耗尽落 `dropped(MAX_ATTEMPTS)` | 1–100 | §17 |
 | `policyTimeoutMs` | number | `50` | 毫秒 | **九个策略槽统一超时**（I21）。超时按规定方向降级并**必须**发 `policy_degraded` | 1–1000 | §20、§12.1 |
 | `handoffTimeoutMs` | number | `30000` | 毫秒 | `deliver()` 后等 `entry_appended` 的上限，超时回退 `queued` 并记 `delivery_handoff_timeout` | 1000–600000 | §7.9① |
+| `sweepIntervalMs` | number | `30000` | 毫秒 | 运行期周期清扫的间隔（`parked` TTL、claim 回收、outbox 对账、sink 退避重投）。**调度不重叠**：上一轮未跑完就跳过本轮；`close()` 停表 | `0`（禁用）或 1000–86.4×10⁶ | §7.9② |
+| `sinkBackoffBaseMs` | number | `1000` | 毫秒 | `SinkHandler` 拒收后的首次退避间隔，之后按 `base × 2^(attempts−1)` 指数增长 | 1–86.4×10⁶ | §21.2 |
+| `sinkBackoffMaxMs` | number | `30000` | 毫秒 | 退避间隔上限——**指数退避必须有上限**，否则一次长时间下线会让恢复后的首投延迟到不可接受 | ≥`sinkBackoffBaseMs`，≤86.4×10⁶ | §21.2 |
+| `outboxDoneRetentionMs` | number | `86400000` | 毫秒 | `mesh_outbox` 里 `done` 行的保留窗口，超窗即删。**只删 outbox 载体行**，`mesh_messages` / `mesh_deliveries` 账本一行不动；`failed` 行**不**自动清理（排障证据） | `0`（不清理）或 60000–7×86.4×10⁶ | §19.3 |
 | `toolResultMaxBytes` | number | `8192` | 字节 | 工具返回截断阈值，超出截断并标记 | 1024–65536 | §10.2 |
 | `sharedObjectMaxBytes` | number | `65536` | 字节 | 共享对象单体上限，超出 `reject` | 1024–4×10⁶ | §18 |
 | `sharedVersionsKept` | number | `10` | 个 | 共享对象保留的历史版本数，超窗口只留元信息（`data` 置 NULL） | 0–1000 | §18 |
@@ -7574,11 +7848,17 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | 名称 | 类型 | 默认值 | 单位 | 作用 | 允许范围 | 相关章节 |
 |---|---|---|---|---|---|---|
 | `dbPath` | string | — | 路径 | SQLite 文件位置。**必填**，同一路径不得被两个实例同时打开（M3） | 目录须可写 | §11、§12.1 |
-| `transport` | `Transport` | `InProcessTransport` | — | 投递搬运实现。同机多进程换 `SqliteOutboxTransport`；**跨机器 1.0.0 不支持** | 两种内建或自定义实现 | §19 |
+| `transport` | `Transport \| "sameHost"` | `InProcessTransport` | — | 投递搬运实现。同机多进程传字符串 `"sameHost"`（库自己构造）；**跨机器不支持** | 两种内建、字符串 `"sameHost"`、或自定义实现 | §19 |
+| `transportOptions` | 对象 | 见 §19.3 | — | 仅 `transport === "sameHost"` 生效：`pollIntervalMs` / `claimTtlMs` / `maxAttempts` | — | §19.3 |
 | `streamPort` | `StreamPort` | `mesh-pi` 实现 | — | 流端口实现。自定义会使 `replay`、恢复双向核对、`.lock` 单写者三项保证失效 | 实现 10 个方法 | §2.4 |
 | `devMode` | boolean | `false` | — | 开启不变量断言、原因码/计数器名校验、单写者检测、Renderer 包裹校验 | `true` / `false`，生产**不应**开 | §23.7 |
 | `mentionAllCap` | 能力位名 | `"speak"` | — | 哪一个能力位（§4.4）放行 `mentions: ["@all"]`。收紧为 `"admin"` 可让全员唤醒只归管理员 | §4.4 的能力位之一 | §9.5、§4.4 |
 | `busyTimeoutMs` | number | `5000` | 毫秒 | SQLite `busy_timeout`。多进程共享同一文件时的锁等待上限，`0` = 立即失败 | 0–60000 | §19 |
+| `fts` | boolean | `true` | — | 是否建 / 保留 FTS5 全文索引。`false` 时删 contentless 表、跳过索引写入，`observer.search` 抛明确的「功能关闭」而不是悄悄返回空集。开关可来回切：`false → true` 会从消息表回填历史 | `true` / `false` | §11.3、§12.4 |
+| `walMaxBytes` | number | `8388608`（8 MiB） | 字节 | `<dbPath>-wal` 超过此值即告警 + TRUNCATE 检查点，并**停发**直至 WAL 收缩 | >0 | §27.4 |
+| `recoverDeadEndpoints` | boolean | `false` | — | 启动时是否回收死写者遗留的实例锁与端点锁。接管前必须验证 pid 确实不存在**且**启动时刻不吻合；判不出就拒绝（§19.6）。默认关闭＝崩溃后由运维人工确认 | `true` / `false` | §19.6、§27.4 |
+| `seal` | `{ key: string }` | 关闭 | — | 提供即启用消息 `seal`（HMAC-SHA256）。密钥由宿主给、**只在内存**，不落库 / 不进日志 / 不进事件 / 不进配置指纹；库**绝不**自行生成密钥。启用后验签失败的投递被拒绝并发 `invariant_violated{code:"seal_mismatch"}`，原消息行保留 | 非空字符串 | §22.4 |
+| `llm` / `runtime`（仅包根） | `LlmConfig` / `RuntimeConfig` | — | — | 模型、Provider、凭据、内建工具白名单与资源隔离。给了就由库装配 `SessionFactory`；与 `policies.sessionFactory` 二选一 | §12.6 ⑦ | §12.1 |
 | `retention`（策略槽） | `RetentionPolicy` | `DefaultRetentionPolicy` | — | 原文预算的**决策**入口；`verbatimGapK` / `maxVerbatimConversations` 只是默认实现的参数 | 九槽之一 | §7.4、§20 |
 
 **`retention` 不是数字旋钮而是策略槽**，值得单独强调：原文预算涉及"谁配得上原文、预算多大、挤出顺序"三个决定，把它们写成三个魔数会让宿主无法表达任何非默认口径。数字（`verbatimGapK` = 20、`maxVerbatimConversations` = 3）只是**库自带默认实现**读取的参数；替换了 `retention` 槽的宿主，这两个数就不再生效。同理，`devMode` 与 `retention` 是本表里唯二会改变**语义**而非**阈值**的开关。
@@ -7625,6 +7905,8 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 
 本附录与 §11 内容一致：**§11 讲理由，本附录供直接执行**。语句按依赖顺序排列，从空库起顺序执行即可建出全部 **17 张表 + `mesh_messages_fts`（fts5）**。
 
+本附录给的是**当前形态**（基线 `000_init.sql` 叠加 `001`–`004` 四个加列脚本之后的样子，脚本清单见 §28.3）。实现侧的 `000_init.sql` 是**只读基线**、逐字节受快照门禁保护，所以迁移后的列在本附录里标了来源脚本；要复刻实际建库过程请按序跑 `migrations/`，不要把本附录当成单个可执行脚本。`fts` 关闭时 `mesh_messages_fts` 不建（附录 F.2）。
+
 ```sql
 -- ═══ 0. 连接级设置（每个连接都要设，不随文件持久化的部分见注） ═══
 PRAGMA journal_mode = WAL;        -- 持久化于文件
@@ -7650,6 +7932,7 @@ CREATE TABLE mesh_accounts (
   profile_ref    TEXT,
   presence       TEXT NOT NULL DEFAULT 'offline',
   presence_until TEXT, presence_reason TEXT,
+  presence_explicit INTEGER NOT NULL DEFAULT 0,   -- 迁移 001（§15.2）
   created_at     TEXT NOT NULL, archived_at TEXT,
   ext            TEXT
 );
@@ -7662,6 +7945,7 @@ CREATE TABLE mesh_endpoints (
   account_id    TEXT NOT NULL REFERENCES mesh_accounts(id),
   topology      TEXT NOT NULL CHECK (topology IN ('unified','perConversation','pooled')),
   scope         TEXT, scope_key TEXT, pool_slot INTEGER,
+  pool_size     INTEGER, pool_affinity TEXT,     -- 迁移 002（§8.1）
   pi_session_id TEXT,
   lease_mode    TEXT NOT NULL DEFAULT 'shared' CHECK (lease_mode IN ('shared','exclusive')),
   lease_until   TEXT,
@@ -7791,8 +8075,10 @@ CREATE TABLE mesh_deliveries (
   parked_reason TEXT,                                 -- parked 诊断，见附录 D
   drop_reason   TEXT,                                 -- 含 'folded'（不计失败率）
   entry_id      TEXT,                                 -- 落地的 entry（onEntry 归因）
-  attempts      INTEGER NOT NULL DEFAULT 0,           -- queue 重投计数
-  claim_until   TEXT,                                 -- claimed 的租约到期
+  attempts      INTEGER NOT NULL DEFAULT 0,           -- queue 重投计数 / 租约代次
+  claim_until   TEXT,                                 -- 待领(delivered) 与持有(claimed) 两窗口
+  claimed_by    TEXT, claimed_at TEXT, claim_error TEXT,   -- 迁移 003（§17）
+  redeliver_reason TEXT,                              -- 迁移 004：为何重投（§23.1）
   parked_at TEXT, queued_at TEXT, delivered_at TEXT, consumed_at TEXT,
   handoff_at    TEXT,                                 -- deliver() 已调、entry_appended 未到
   state_changed_at TEXT NOT NULL,                     -- 最近一次跃迁时刻（回放过滤列）
@@ -7805,7 +8091,8 @@ CREATE UNIQUE INDEX ux_delivery_noep ON mesh_deliveries(message_id, account_id)
 CREATE INDEX ix_delivery_inflight ON mesh_deliveries(endpoint_id, state)
   WHERE state IN ('queued','delivered');              -- 自持背压计数走这个索引
 CREATE INDEX ix_delivery_parked   ON mesh_deliveries(state, parked_at)  WHERE state = 'parked';
-CREATE INDEX ix_delivery_claim    ON mesh_deliveries(state, claim_until) WHERE state = 'claimed';
+CREATE INDEX ix_delivery_claim    ON mesh_deliveries(state, claim_until)
+  WHERE state IN ('delivered','claimed');             -- 迁移 003 扩成两态（§17.2）
 CREATE INDEX ix_delivery_message  ON mesh_deliveries(message_id);
 
 CREATE TABLE mesh_inboxes (
@@ -7937,6 +8224,13 @@ CREATE TABLE mesh_counters (                    -- name 的取值集合见附录
 | `StreamTopology` | 拓扑三值：`unified` `perConversation` `pooled` | §8.1 |
 | `MeshLease` | 库自持租约两值：`shared` `exclusive`（**不是** pi 的 `SessionLeaseMode`） | §8.2 |
 | `MeshToolName` | Agent 侧 14 个工具名的联合类型，一个不多一个不少 | §12.6 / §10.1 |
+| `ContextPath` | 三条进上下文路径：`P1` `P2` `P3` | §12.6 / §7.6 |
+| `ExpectKind` | `ack` `reply` `none`——唤醒的唯一判据 | §12.6 / §14.2 |
+| `Priority` | `urgent` `normal` `low` | §12.6 / §7.2 |
+| `PolicyDegradeReason` | 策略槽降级原因三值：`timeout` `threw` `illegal` | §12.6 / §20.1 |
+| `MeshErrorCode` | `RejectCode \| ToolErrorCode`，两类同步错误码的并 | §12.6 |
+| `ConversationAdminOp` | `mesh_conversation_admin` 的 op 判别联合（9 个 op） | §12.6 / §10.1 |
+| `MeshConfigCode` | 装配层错误码四值，与 core 四族码分属两层 | §12.6 ⑦ / §12.1 |
 
 三个枚举尤其值得盯：`EndpointState` 的五态、`PresenceState` 的七值、三个原因码集合。实现时各处自己编一套是最常见的漂移来源，也是 `devMode` 要按附录 D / 附录 E 校验取值的原因。
 
@@ -7959,18 +8253,20 @@ CREATE TABLE mesh_counters (                    -- name 的取值集合见附录
 | `InboxView` | 整只收件箱；两个待应答方向分列在**顶层**而非每个会话里 | §12.6 / §10.4 |
 | `StreamEntry` | 镜像条目投影，含 `rawJson`（byte-fidelity，库不解析） | §12.6 / §8.5 |
 | `DeliveryTrace` | 一行一投递的轨迹，状态机的最后一跳（精度边界见 §23.2） | §12.6 / §7.9 |
-| `SharedObject` | 共享对象含 body 的完整投影 | §18 |
-| `SharedObjectMeta` | 共享对象元信息，**不含 body**——避免把大对象喂进策略 | §12.6 / §18 |
-| `PutResult` | 共享写入结果，含新 `version` 与冲突信息 | §18 |
-| `Acl` | 共享对象访问控制表达式 | §18 |
-| `AckResult` | `request({ await: true })` 的返回；`data` 与 `error` 互斥 | §12.6 / §14 |
-| `ToolDefinition` | 注入宿主 Agent 的工具形状（`name` / `description` / `inputSchema`） | §12.6 / §10 |
+| `SharedObjectMeta` | 共享对象投影。`get` 填 `data`，`list` **不**填——避免把大对象整表回传或喂进策略。v0.1.0 把原设计里的 `SharedObject`（含 body）与 `SharedObjectMeta`（不含 body）**合成了这一个类型**，由 `data` 在不在决定形态 | §12.6 ③ / §18 |
+| `Acl` / `AclRule` | 共享对象访问控制表达式与单条规则 | §18 |
+| `AckResult` | `request({ await: true })` 的返回；`data` 与 `error` 互斥，另有 `timedOut` / `abandoned` 两个终态标记 | §12.6 / §14 |
+| `ToolDefinition` | 注入宿主 Agent 的工具形状（`name` / `label` / `description` / `parameters` / `execute`） | §12.6 ③ / §10 |
+| `MeshToolResult` | 工具返回壳：`content` 装 JSON 串，按 `toolResultMaxBytes` 截断且恒为合法 JSON | §12.6 ③ / §10.2 |
+| `EnvelopePayload` / `SharedRef` | 信封载荷三件套（`text` / `data` / `attachments`）与附件引用 | §12.6 ⑥ / §5.2、§18.7 |
+| `MemberRow` / `ContactRow` / `RecentPreview` | `mesh_members` / `mesh_contacts` 的返回行与 `InboxState.recent` 的元素 | §12.6 ⑥ / §10.1 |
+| `RegisterAccountInput` / `RegisterEndpointInput` / `CreateConversationInput` | `MeshHost` 三个注册 / 建会话入参的具名形态 | §12.6 ⑥ / §12.2 |
 
 ### H.3 策略槽与端口
 
 | 类型名 | 一句话 | 定义位置 |
 |---|---|---|
-| `Policies` | 九个策略槽的聚合；只有 `sessionFactory` 必填 | §12.1 |
+| `Policies` | 九个策略槽的聚合；包根下九槽全可选（`sessionFactory` 可由 `llm` / `runtime` 装配），`/core` 下 `sessionFactory` 仍必填 | §12.1 |
 | `DeliveryPolicy` | 定档：这条消息对这个收件人是哪一档 | §12.3 / §7.2 |
 | `ActivationPolicy` | 是否唤醒；唯一判据是 `expect` | §12.3 / §7.3 |
 | `RetentionPolicy` | 原文预算：谁配得上原文、预算多大、挤出顺序 | §12.3 / §7.4 |
@@ -7980,10 +8276,12 @@ CREATE TABLE mesh_counters (                    -- name 的取值集合见附录
 | `AccessControl` | 读写与发送许可；**唯一 fail-closed 的槽** | §12.3 / §22.2 |
 | `AclCtx` | `AccessControl` 入参里的权限片段，`op` 四值 | §12.6 / §22.2 |
 | `EndpointSelector` | 拓扑选端；降级方向 `parked` | §12.3 / §8.1 |
-| `SessionFactory` | 造流；**唯一必填**，无法降级，失败即 `parked(NO_SESSION)` 并告警 | §12.3 / §8.6 |
+| `SessionFactory` | 造流；无法降级，失败即 `parked(NO_SESSION)` 并告警。包根下可由 `llm` / `runtime` 缺省装配 | §12.3 / §8.6 |
 | `SinkHandler` | `sink` 类账号的投递出口；未注册即 `parked(NO_SINK_HANDLER)` | §6.3 |
 | `StreamPort` | `mesh-core` 与 `mesh-pi` 之间的唯一接缝，锁定 10 个方法 | §2.4 |
-| `Transport` | 投递搬运抽象；1.0.0 只支持进程内与同机多进程 | §19 |
+| `PortStatus` / `PortEntryEvent` | `StreamPort.status` 的返回与 `onEntry` 的载荷 | §12.6 ⑥ / §2.4 |
+| `Transport` | 投递搬运抽象；只支持进程内与同机多进程，另有可选 `stop()` 收尾钩子 | §19 |
+| `LlmConfig` / `ProviderConfig` / `RuntimeConfig` / `RuntimeResources` / `Profile` / `ResolvedLlm` | 包根的 LLM 与运行时配置面；**不进 `mesh-core`** | §12.6 ⑦ / §12.1 |
 | `PendingDelivery` | Transport 搬运的单元；进程内实现下就是个内存对象 | §12.6 / §19 |
 | `DeliveryHandler` | Transport 的收端回调 | §12.6 / §19 |
 
@@ -7991,8 +8289,9 @@ CREATE TABLE mesh_counters (                    -- name 的取值集合见附录
 
 | 类型名 | 一句话 | 定义位置 |
 |---|---|---|
-| `MeshOptions` | `createMesh` 的唯一入参 | §12.1 |
-| `Limits` | 26 项运行期限额，逐项覆盖 | §12.1 / 附录 F.1 |
+| `MeshOptions` | core 的装配入参 | §12.1 |
+| `CreateMeshOptions` | 包根 `createMesh` 的入参：`MeshOptions` 去掉必填 `policies`，加 `llm` / `runtime` | §12.1 |
+| `Limits` | **30 项**运行期限额，逐项覆盖 | §12.1 / 附录 F.1 |
 | `MeshHost` | 宿主拿到的全部能力；一个只读入口 + 一个事件入口 + 写方法 | §12.2 |
 | `MeshEvents` | 15 个事件的名与载荷；事件是**通知不是钩子**，每个都带 `endpointId` | §12.5 / 附录 C |
 | `Observer` | 只读观测面，**完全只读**：`trace` / `replay` / `counters` / `checkInvariants` / `inbox` | §12.4 / §23 |
@@ -8141,7 +8440,7 @@ pi session 的条目是**单会话视角**的，问不出"这条消息在 7 个�
 
 **Q：升级 pi 会不会把库搞挂？**
 
-有这个风险（M-R22），所以库把 SDK 使用面收窄到 §2.1 的约二十个 API，且全部穿过 `StreamPort` 的 10 个方法。升级时只需回归 `mesh-pi` 一层。真正的护栏是**pi 契约测试**：§2.2 的每条平台事实对应一个会红的测试，SDK 悄悄改语义时它先红（§23.5、M-R11）。库锁定 `@earendil-works/pi-coding-agent` ≥ 0.84.4，升级前**应当**先跑契约测试。
+有这个风险（M-R22），所以库把 SDK 使用面收窄到 §2.1 的约二十个 API，且全部穿过 `StreamPort` 的 10 个方法。升级时只需回归 `mesh-pi` 一层。真正的护栏是**pi 契约测试**：§2.2 的每条平台事实对应一个会红的测试，SDK 悄悄改语义时它先红（§23.5、M-R11）。库锁定 `@earendil-works/pi-coding-agent` `^1.1.0`，升级前**应当**先跑契约测试。
 
 **Q：能跨机器部署吗？**
 
@@ -8225,7 +8524,7 @@ pi session 的条目是**单会话视角**的，问不出"这条消息在 7 个�
 
 **Q：回放会污染真实流吗？**
 
-不会。回放走独立的只读路径：读 `mesh_messages` 与 `mesh_deliveries` 重建视图，**不得**调用 `StreamPort` 的任何写方法（`deliver`/`nudge`/`note`/`injectContext`），也不写任何 mesh 表。回放的正确性判据是逐字节一致（含注入内容一致），它是 P5 的验收项。见 §23.2、§25。
+不会。回放走独立的只读路径：读 `mesh_messages` 与 `mesh_deliveries` 重建视图，**不得**调用 `StreamPort` 的任何写方法（`deliver`/`nudge`/`note`/`injectContext`），也不写任何 mesh 表。v0.1.0 的 `replay` 是**基础转写**而不是历史精确重建——逐字节一致（含历史注入内容一致）需要 P2 注入体可回溯，而 P2 本来就不落盘（§7.6）。见 §12.4 末、§23.2。
 
 **Q：库文件能删吗？DB 文件删了会怎样？**
 
@@ -8257,9 +8556,9 @@ pi session 的条目是**单会话视角**的，问不出"这条消息在 7 个�
 |---|---|
 | 方案名 | **Pi Agent Mesh** |
 | 包名 | `@pi/agent-mesh`（模块 `mesh-core` / `mesh-pi`） |
-| 文档版本 | **1.0.0** |
+| 文档版本 | **1.0.1** |
 | 状态 | **定稿**。核心功能面已冻结；扩展功能面按 §28.4 的 1.x 路线演进 |
-| 平台依赖 | `@earendil-works/pi-coding-agent` **≥ 0.84.4** |
+| 平台依赖 | `@earendil-works/pi-coding-agent` **`^1.1.0`**（直接依赖、惰性加载，§29.2）；Node.js **≥ 22.19.0** |
 | 存储依赖 | SQLite（better-sqlite3 或等价），需 fts5 支持 |
 | 实现语言 | TypeScript（ESM + CJS 双产物） |
 | 冻结范围 | 三档投递、投递状态机、原因码、15 个事件、17 张表 + 1 张 FTS 表、九个策略槽、`StreamPort` 的 10 个方法、23 个计数器、14 个 Agent 工具 |
@@ -8305,6 +8604,7 @@ pi session 的条目是**单会话视角**的，问不出"这条消息在 7 个�
 | 版本 | 日期 | 状态 | 变更 |
 |---|---|---|---|
 | **1.0.0** | 2026-09-06 | 定稿 | **首个发布版本。** 完整规定：三档投递与档位映射矩阵、投递状态机（含 `parked` 旁路非终态）、三类互不复用的原因码、`expect` 作为唤醒唯一判据、投递集 = 未读集、溢出折叠、三条进上下文路径、四种会话形态、三种流拓扑、九个策略槽与统一 50ms 超时的定向降级、八个组件与两个横切层、`StreamPort` 的 10 个方法、17 张表 + FTS、15 个事件、23 个计数器、16 条 SQL 断言、14 个 Agent 工具、23 条不变量、20 条决策记录、30 条风险、8 条开放问题 |
+| **1.0.1** | 2026-10-19 | 定稿 | **按 v0.1.0 实现回填，无新增功能面。** 平台基线 0.84.4 → `^1.1.0` 并登记 `agent_settled.aborted`、三个生产确认点（§2.3 末、§28.5、§29.2、附录 L.1）；pi 由 optional peer 改为直接依赖 + 惰性加载（§29.2）；`createMesh` 入参拆成 `MeshOptions`（core）与 `CreateMeshOptions`（包根，含 `llm` / `runtime`），`sessionFactory` 在包根变为二选一（§12.1、§12.3、§20.1、附录 H）；`MeshOptions` 补 `transportOptions` / `fts` / `walMaxBytes` / `mentionAllCap` / `busyTimeoutMs` / `recoverDeadEndpoints` / `seal`（§12.1、附录 F.2）；`MeshHost` 补 `setTopic` / `reclaimEndpoint`，`shared.*` 签名按实现回填（§12.2）；`Limits` 26 → 30 项（§12.1、附录 F.1、附录 H）；三张表补 7 列 + `ix_delivery_claim` 扩成两态，迁移模型改为"世代号 + 逐脚本盖章"（§11.1、§11.4、§28.3、附录 G）；`mute` 由 `dropped(MUTED)` 改为"保留 Inbox + 强制 `silent` + 不唤醒"（§7.10、附录 D）；C3 断言给 `partial = 1` 开例外、C10 改活 owner 判定（§23.4）；`forkAt` 标记为 unsupported、`replay` 收窄为基础转写（§12.4）；§12.6 补 ⑥⑦ 两组公共类型（端口 / 工具面辅助投影、LLM 与运行时配置）。**两处已知实现差距**（9 个事件缺 `endpointId`、`wake_per_message_busy` 无自增点）在正文就地标注并登记进 `notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`，**未**改写规范要求 |
 
 1.0.0 之后的版本记录追加在此表，格式不变。1.x 的功能路线见 §28.4，其中开放问题 O1–O8 的预计版本见附录 J。**破坏性变更**若不可避免，**必须**在此表标注并给出迁移脚本（§28.3）。
 

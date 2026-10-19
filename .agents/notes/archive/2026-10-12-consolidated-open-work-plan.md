@@ -1,19 +1,31 @@
 ---
 title: 未完成事项整合计划（0.1.0 稳定版 + Mesh 统一 LLM 配置）
 date: 2026-10-12
-status: done
+status: archived
+archived_date: 2026-10-19
+archived_from: notes/plan/2026-10-12-consolidated-open-work-plan.md
+archived_reason: W00–W16 全部关闭、G01–G09 全绿、M0–M5 全部 done，2026-10-19 复核确认交付面属实；关闭后仍悬空的事项已转入 notes/plan/2026-10-19-post-0.1.0-open-items-plan.md
 owner: unassigned
-tags: [plan, consolidated, v0.1.0, implementation-gap, llm-config, pi-isolation]
+tags: [plan, consolidated, v0.1.0, implementation-gap, llm-config, pi-isolation, archived]
 related:
-  - ../archive/2026-10-01-deferred-fixes-plan.md
-  - ../archive/2026-09-29-deferred-capabilities-audit.md
-  - ../archive/2026-09-30-samehost-transport-review.md
+  - ./2026-10-01-deferred-fixes-plan.md
+  - ./2026-09-29-deferred-capabilities-audit.md
+  - ./2026-09-30-samehost-transport-review.md
   - ../tech/2026-09-07-pi-agent-mesh-spec.md
+  - ../plan/2026-10-19-post-0.1.0-open-items-plan.md
 ---
+
+> **已归档（2026-10-19）**：本计划的工作已全部完成，**不再是当前的未完成事项清单**。
+> 当前有效的计划是 [`notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`](../plan/2026-10-19-post-0.1.0-open-items-plan.md)。
+>
+> 本文**仍是 v0.1.0「当时为什么这么做」的事实来源**：§4 的 C01–C10 合同、§5 的 LD1–LD8 决策、
+> §6 的 69 项去向登记，以及 §11 里 W00–W16 逐批的关闭记录（含每批的偏差与剩余风险）。
+> 查这些内容来本文；判断**当前**该做什么、当前契约是什么，一律以上面那份计划和
+> [规范](../tech/2026-09-07-pi-agent-mesh-spec.md) 为准。规范已于 2026-10-19 按 v0.1.0 实现回填（文档版本 1.0.1）。
 
 ## 1. 目标与状态
 
-这份计划是**当前唯一有效的未完成事项清单**。它合并了三份文档的未完成内容：实现差距审计（2026-10-09）、0.1.0 本地稳定版计划（2026-10-09）和 Mesh 统一 LLM 配置计划（2026-10-12）。已完成的早期 plan 和 review 已移入 `notes/archive/`，见第 2 节。
+这份计划（**归档前**）是当时唯一有效的未完成事项清单。它合并了三份文档的未完成内容：实现差距审计（2026-10-09）、0.1.0 本地稳定版计划（2026-10-09）和 Mesh 统一 LLM 配置计划（2026-10-12）。已完成的早期 plan 和 review 已移入 `notes/archive/`，见第 2 节。
 
 总目标有两条：
 
@@ -22,7 +34,7 @@ related:
 
 状态说明：
 
-- `status: done`：W00–W16 已全部关闭（各批关闭记录见 §11），G01–G09 门槛全绿（`verify:local --all` 与 `verify:package` 均 full 通过、无 skip），M0–M5 里程碑全部 done。
+- 完成判定（2026-10-17 达成，2026-10-19 复核后归档）：W00–W16 已全部关闭（各批关闭记录见 §11），G01–G09 门槛全绿（`verify:local --all` 与 `verify:package` 均 full 通过、无 skip），M0–M5 里程碑全部 done。
 - 规划期的 `draft`（尚未实施）/ `todo` / `not_run` 状态已随实现逐一作废；C01–C10 已由用户确认并全部实现，未闭合项（69 项）已 100% 有去向。
 - 本地就绪不等于公开发布审批、真实 LLM 集成通过、其他平台兼容，也不等于从真实历史发布库迁移通过，更不等于已发布到 registry（未经要求不 commit / push / publish）。
 
@@ -296,7 +308,7 @@ W01 是硬闸门：其探针结论会复核第 3–7 批的拆分与体量，探
 
 | WP | 覆盖 | 依赖 | 目标与关键验收 |
 | --- | --- | --- | --- |
-| W01 合同、能力探针、安全验证环境 | C01–C10；E 基线 | W00-L1 | 冻结 API、错误码、状态转换表；保存 API/DDL 基线快照。用真实 SDK 1.1.0 + faux 探针确认 P2 最终输入、hook 覆盖、磁盘 create/open 的**生产可行确认点**，没有就阻塞 W08/W11。先把测试、pack、tsup（`clean:true`）里的破坏性清理改成独立工作目录。**done**（2026-10-13：三个确认点全部可行、无 blocked，见 `notes/tech/2026-10-13-pi-1.1.0-probe-findings.md`） |
+| W01 合同、能力探针、安全验证环境 | C01–C10；E 基线 | W00-L1 | 冻结 API、错误码、状态转换表；保存 API/DDL 基线快照。用真实 SDK 1.1.0 + faux 探针确认 P2 最终输入、hook 覆盖、磁盘 create/open 的**生产可行确认点**，没有就阻塞 W08/W11。先把测试、pack、tsup（`clean:true`）里的破坏性清理改成独立工作目录。**done**（2026-10-13：三个确认点全部可行、无 blocked，见 `notes/archive/2026-10-13-pi-1.1.0-probe-findings.md`） |
 | W02 Store、迁移、运行故障 | N04、I05、I34、C07 | W01 | BEGIN 失败后可重试；先加锁再迁移；有备份、版本校验、逐脚本续跑；FTS 开关的新建/重开/升级矩阵；不可写、时钟回退、WAL 超阈值、损坏都有告警和停发边界 | **done**（2026-10-13：I05①/②、C07 备份+逐脚本续跑、N04 FTS 开关矩阵、I34 存储故障执行链均落地并有契约测试，见 §11） |
 | W03 策略、信封、渲染 | N05、I06、I07、I33、I35、C03 | W02 | 信封三处一致；LogicalClock 接线；seal 生成与验签闭环；九个槽都覆盖正常、抛错、非法值、超时；NO_SESSION 不被改写；裸文本和定界符不能越壳 | **done**（2026-10-13：N05/I06/I07/I33/I35/C03 全部落地并有契约测试，见 §11） |
 | W04 群治理、权限、订阅、配置 | N02、I13、I17、I18、I24、I30、C01/C04/C09 | W03 | 首聊被拒不留会话；最后的 setCaps 有保护；建群失败无半结构；未订阅者拿不到 topic 名单；mute 不 drop 也不唤醒；显式 offline 不被覆盖 | **done**（2026-10-14：九项全部落地并有 6 套契约测试，见 §11） |
@@ -374,7 +386,7 @@ W01 是硬闸门：其探针结论会复核第 3–7 批的拆分与体量，探
 ## 11. 进度记录
 
 - 2026-10-12：整合 2026-10-09 实现差距审计、0.1.0 本地稳定版计划和 2026-10-12 LLM 配置计划，形成本计划；4 份已完成的早期 plan 和 2 份 review 移入 `notes/archive/`，三份被整合的原文随后删除（可从提交 `2b8890e`、`ee2704b` 找回）。源码自 74e20c8 起未变，审计结论仍然适用。记录了 LD3 与 C07 的冲突，待用户决策。未实施、未测试、未修改源码或依赖。
-- 2026-10-13：**LD1–LD8 与 C07 已冻结**（用户定夺）：LD1=`createMesh({ llm, runtime })` 内部装配并保留高级 `policies.sessionFactory`；LD2=完全隔离，兼容开关显式开启；LD3=pi 走 `dependencies` 直接依赖、版本取**最新 1.1.0**（覆盖 C07 的 optional-peer，用户改写）；LD4=显式 `apiKey`/`apiKeyEnv`，不镜像隐式环境变量表；LD5=steer/followUp 由 Mesh 固定，retry/timeout/compaction 白名单开放；LD6=`Account.profileRef` 选 profile；LD7=本轮只消除配置/安装感知；LD8=demo 只读 Mesh 配置；C07=`engines.node>=22.19.0`、pi 矩阵 0.85.1→1.1.0。技术设计、配置 schema 与 §12.1/§12.3 差异清单见 `notes/tech/2026-10-13-mesh-llm-config-design.md`（W00-L1 完成）。
+- 2026-10-13：**LD1–LD8 与 C07 已冻结**（用户定夺）：LD1=`createMesh({ llm, runtime })` 内部装配并保留高级 `policies.sessionFactory`；LD2=完全隔离，兼容开关显式开启；LD3=pi 走 `dependencies` 直接依赖、版本取**最新 1.1.0**（覆盖 C07 的 optional-peer，用户改写）；LD4=显式 `apiKey`/`apiKeyEnv`，不镜像隐式环境变量表；LD5=steer/followUp 由 Mesh 固定，retry/timeout/compaction 白名单开放；LD6=`Account.profileRef` 选 profile；LD7=本轮只消除配置/安装感知；LD8=demo 只读 Mesh 配置；C07=`engines.node>=22.19.0`、pi 矩阵 0.85.1→1.1.0。技术设计、配置 schema 与 §12.1/§12.3 差异清单见 `notes/archive/2026-10-13-mesh-llm-config-design.md`（W00-L1 完成）。
 - 2026-10-13：**第 0 步完成**——pi SDK 0.85.1→1.1.0 升级并重新基线：`package.json` 移 pi 到 `dependencies@^1.1.0`（移除 optional peer）、`pi-ai@^1.1.0`、`engines>=22.19.0`；`scripts/pack.mjs` 的 Node 守卫与「可选 peer」文案同步。唯一行为断裂是契约探针 CT-F2：`agent_settled` 在 1.1.0 新增 `aborted:boolean`（仍无消息归因，F2 结论不变），按探针自身规则回 §2.3 复核后回调预期（`tests/pi/pi-contract.test.ts`）。结果 238/238 测试、`check:imports`、`pack`（离线消费者冒烟）全绿，demo 对 1.1.0 类型检查通过。W00-L2..L10 未开始。
 - 2026-10-13：**W00-L2..L10 完成**——Mesh 统一 LLM 配置落地：新增 `src/pi/llm-config.ts`（`LlmConfig`/`ProviderConfig`/`RuntimeConfig`/`Profile`/`ResolvedLlm` 类型；`resolveLlmConfig` 同步 fail-fast，`MESH_BAD_CONFIG`/`MESH_MISSING_CREDENTIAL`/`MESH_UNKNOWN_MODEL` 走 `MeshConfigError{code}`；`configFingerprint` sha256 且剔除 secret）+ `tests/pi/llm-config.test.ts`。`src/pi/session-factory.ts` 新增 `createAssembledSessionFactory`（内存 CredentialStore、`modelsPath:null`、`refreshOnCreate:false`、内存 SettingsManager、`DefaultResourceLoader` 全 `no*`、`ModelRuntime.create`+`registerProvider`+`setRuntimeApiKey`+`getModel`；`agentDir` 用 `stateDir` 私有目录）与工具白名单配方（`builtinTools` + Mesh 工具名，`getCallableToolsFn()` 读权威名单）+ `tests/pi/session-factory.test.ts`（隔离 + 工具白名单 + faux 真实 turn 管线探针）。`src/index.ts` 新增 `CreateMeshOptions = MeshOptions & { llm?; runtime? }` 与 `createMesh({ llm, runtime })` 内部装配（core 契约不变，保留 `policies.sessionFactory` 高级路径）。demo（L9）改读 Mesh 配置：`demo/src/config.ts` 删除 pi models/auth/settings 镜像，`loadAndValidateDemo` 返回 `{config, resolvedLlm, fingerprint, credentialSource}` 并抛 ConfigError 作旧 `provider`/`modelId` 迁移提示；`demo/src/runtime.ts`/`demo/src/server.ts` 走新入口并加 `MeshConfigError` fail-fast（坏模型/缺凭据干净 exit(1)，secret 不入 health/指纹）。quickstart/README/start.sh/example 同步（L10）。结果 258 测试、`check:imports`、`typecheck`、`build` 全绿，demo 端到端（boot + health + 真实 LLM turn + 缺凭据/坏模型 fail-fast）验证通过。**测出并记录 faux 限制**：faux `streamSimple` 在请求含任何工具定义时无法流式（callCount=0），空工具集才走真实 turn 管线——真实模型无此问题（demo 已验证），契约层按「空工具」口径锁定。**留待后续**：L6 的 profileRef/多 profile 与恢复期模型变更规则（本轮单 profile 主路径，见设计文档）、L8 的 ESM/CJS+core-only 全矩阵 / 离线 tarball 验收（并入 W16-G08）、L7 的 API 快照（并入 W01）。
 - 2026-10-13：**W01 完成**——合同冻结 + 能力探针 + 安全验证环境（第 ② 批硬闸门）。
@@ -382,7 +394,7 @@ W01 是硬闸门：其探针结论会复核第 3–7 批的拆分与体量，探
   - **关联 ID / 合同**：C01–C10、E 基线；§7.10（错误码表）、§7.9（状态转换）、§12（API 面）、迁移只读规则。
   - **① 错误码 + 状态转换单一权威源（冻结不改名/不改字面量）**：`src/core/types.ts` 四族码由 `type X = "a"|"b"` 改为 `const ARRAY as const` + `type X = typeof ARRAY[number]`（`REJECT_CODES`/`PARK_REASONS`/`DROP_REASONS`/`TOOL_ERROR_CODES`）；`src/core/mailbox.ts` 的 `DROP_REASONS`/`PARK_REASONS`、`src/core/tools.ts` 的 `REGISTERED_CODES` 从 const 数组派生（`folded` 纯内部 drop 不下发工具面，仍排除）；`src/pi/llm-config.ts` 抽出 `MESH_ERROR_CODES as const` + `MeshConfigCode`，`MeshConfigError.code` 收紧为 `MeshConfigCode`（新增 `MESH_NO_SESSION_SOURCE` 并落在 `src/index.ts:344` 的 createMesh 装配校验）。**API 影响**：根导出新增 `MESH_ERROR_CODES`（值）+ `MeshConfigCode`（类型），core 入口经 `export *` 暴露四个 const 数组；公开类型名与字面量值不变。
   - **② API/DDL 基线快照**：新 `scripts/gen-snapshots.mjs`（TS compiler API 枚举 `src/index.ts` + `src/core/index.ts` 的值/类型导出 → `snapshots/api-surface.json`；`node:crypto` sha256 `migrations/000_init.sql` → `snapshots/migrations/000_init.sha256`；`--check` 漂移即 exit 1）。新 `tests/e2e/api-snapshot.test.ts`（3 tests：--check 一致 + 基线非空含关键符号 + sha 格式）。`scripts/pack.mjs` 第 2 步接入 `gen-snapshots --check`。**schema 影响**：只哈希、不改 `000_init.sql`（增量迁移留 W02+）。
-  - **③ 三探针（真实 pi 1.1.0 + faux，结论见 `notes/tech/2026-10-13-pi-1.1.0-probe-findings.md`）**：`tests/pi/probe-p2-input.test.ts`（P2 最终输入**可确认**，确认点 = `context_with_system` 钩子）、`tests/pi/probe-hooks.test.ts`（session 事件 + 扩展钩子覆盖矩阵；`before_agent_start` 只走用户 prompt 路径、provider HTTP 钩子在 faux 下不点亮、`entry_appended` 不覆盖 sendCustomMessage）、`tests/pi/probe-disk-session.test.ts`（`getSessionFile()` create 点即确定、首条消息后落盘、open 同路径恢复同 id）。**无 blocked**，W08/W11/W13 不阻塞。
+  - **③ 三探针（真实 pi 1.1.0 + faux，结论见 `notes/archive/2026-10-13-pi-1.1.0-probe-findings.md`）**：`tests/pi/probe-p2-input.test.ts`（P2 最终输入**可确认**，确认点 = `context_with_system` 钩子）、`tests/pi/probe-hooks.test.ts`（session 事件 + 扩展钩子覆盖矩阵；`before_agent_start` 只走用户 prompt 路径、provider HTTP 钩子在 faux 下不点亮、`entry_appended` 不覆盖 sendCustomMessage）、`tests/pi/probe-disk-session.test.ts`（`getSessionFile()` create 点即确定、首条消息后落盘、open 同路径恢复同 id）。**无 blocked**，W08/W11/W13 不阻塞。
   - **④ 破坏性清理审计收口**：测试/三探针/pack 均 `mkdtemp`（临时 HOME/stateDir）、`finally` `rmSync`；tsup `clean:true` 只清 `dist/`；`.lock` 自清理。结论文本并入 findings 文档。
   - **命令与环境**：macOS arm64、Node 24.19.0（满足 ≥22.19）、pi 1.1.0。执行 `npm run typecheck` → `npm run check:imports`（G1–G4，21 源文件）→ `npm test` → `node scripts/gen-snapshots.mjs --check` → `npm run build` → `npm run pack`（含离线消费者冒烟）全绿；**测试 275/275（21 文件）**。
   - **剩余风险**：① 快照依赖 node_modules 中 pi 类型可解析（`skipLibCheck` 只解析不校验），冷 clone 后 `npm ci` 前 `--check` 会缺依赖——按 pack 前置（先 `npm install`）执行；② provider HTTP 钩子（`before_provider_request`/`provider_stream_event`）在 faux 下不点亮、真实 HTTP 会点亮，W08/W11 的确认点已刻意不选它们，但真实 provider 路径的这三钩子未在 faux 下复验（留 W13 真实装配一并覆盖）。
@@ -623,3 +635,6 @@ W01 是硬闸门：其探针结论会复核第 3–7 批的拆分与体量，探
   - **命令与环境**：macOS arm64、Node 24.19.0、pi 1.1.0。执行 `npm run pack`（tsc / check-imports / gen-snapshots / vitest / tsup / 软链冒烟 / 类型面消费全绿，tarball 重建）→ `npm run verify:package`（G08+G09 full、无 skip、exit 0）→ `npm run verify:local -- --all`（G01–G07 复核全绿、无 skip、exit 0）。
   - **偏差（按计划第 3 条「偏离规范须记录」）**：① 「离线安装」= 隔离真实安装、允许访问 registry（非 `npm --offline`；真 `--offline` 需预置本地 cache/镜像，与本环境联网事实及「不能软链仓库依赖」的原始门槛不符）；② 「无 pi」腿 = 真装后删 `@earendil-works`（pi 是硬依赖，无法在 install 阶段省略），等价 pack 的「不软链 pi」语义但基于真实安装；③ 支持矩阵不声称已验证 Node 22.x（`engines>=22.19.0` 为下限，本机实测 24.19.0）；④ `quickstart.ts` 自引用 `@pi/agent-mesh` 依赖 Node 包自引用解析 + 原生 TS 剥壳，已实测成立（G08 E 腿 exit 0）；⑤ 「全部 examples」= quickstart.ts 一份（`examples/` 无其它文件）。
   - **剩余风险 / 留待**：① G08 全 pi 腿不做真实 LLM turn（零真实模型/凭据约束），以「import 矩阵 + core-only 功能 DB + `createMesh({llm})` 配置解析/fail-fast」作为 pi 已装且可加载的运行时证据，真实 LLM 闭环仅 demo 手工验证；② 升级库件（从 74e20c8 合成基线或历史发布库升级）按计划为「非目标」，未进 G08 矩阵（G09 只做「是否存在」轻量断言）；③ 非 macOS arm64 的 OS 与其它 Node/SDK 版本未验证，支持矩阵只声明 `>=22.19.0` 下限 + 本机 24.19.0 实测。
+
+- 2026-10-19：**复核本计划的交付面，结论：W00–W16 的关闭记录属实，本计划继续保持 `done`，不重开。** 实测（Linux x64 / Node 22.20.0 / pi 1.1.0）：全量测试 **621 passed + 1 skipped（622，70 文件）**、`check:imports`、`typecheck`、`gen-snapshots --check`、`build` 全绿；`verify:local` 的 G01–G05 与 G07 通过（G07 单独跑，exit 0）。**唯一判不了的是 G06**——三个基准的正确性断言每轮都过，但"相对基线退化 ≤20%"与"≥200 任务/秒"是按 §8.2 的 macOS arm64 参考机标定的绝对值，换机即不成立；这不构成退化的证据，也不构成没有退化的证据。关闭之后仍悬空的事项（事件 `endpointId` 未全覆盖、`MeshEvent` 判别联合无生产路径、`wake_per_message_busy` 无自增点、LD6 多 profile 未实现、G06 口径机器绑定、demo 在 `615c1f0` 超出 LD8/D07 范围）以及各工作包"剩余风险 / 留待"里仍无人接的条目，已另立 [`notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`](../plan/2026-10-19-post-0.1.0-open-items-plan.md)，**不在本计划追加**。同日按 v0.1.0 实现回填规范（规范变更记录 1.0.1），W00/W01 的两份技术文档在结论并入规范后归档。
+- 2026-10-19：**本计划归档**（`status: done` → `archived`）。完成判定见 §1 的状态说明，复核证据见上一条。本文此后只作历史依据：C01–C10 合同、LD1–LD8 决策、69 项去向与 §11 的 W00–W16 关闭记录仍可引用，但**不得据此判断当前该做什么**——当前计划与当前契约分别以 `notes/plan/2026-10-19-post-0.1.0-open-items-plan.md` 与规范为准。

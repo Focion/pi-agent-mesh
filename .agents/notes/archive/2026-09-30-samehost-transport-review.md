@@ -4,7 +4,7 @@ date: 2026-09-30
 status: archived
 archived_date: 2026-10-12
 archived_from: notes/review/2026-09-30-samehost-transport-review.md
-archived_reason: 已完成；剩余事项已并入 notes/plan/2026-10-12-consolidated-open-work-plan.md
+archived_reason: 已完成；剩余事项已并入 notes/archive/2026-10-12-consolidated-open-work-plan.md
 owner: unassigned
 tags: [review, samehost, transport, lock, m3, correctness]
 related:
@@ -12,7 +12,7 @@ related:
   - notes/archive/2026-09-29-deferred-capabilities-audit.md
 ---
 
-> **已归档（2026-10-12）**：本文档所列工作已完成，不再作为当前依据；剩余事项请参见 [notes/plan/2026-10-12-consolidated-open-work-plan.md](../plan/2026-10-12-consolidated-open-work-plan.md)。
+> **已归档（2026-10-12）**：本文档所列工作已完成，不再作为当前依据；剩余事项请参见 [notes/archive/2026-10-12-consolidated-open-work-plan.md](./2026-10-12-consolidated-open-work-plan.md)。
 
 # sameHost 多进程 Transport 与锁语义 CR
 

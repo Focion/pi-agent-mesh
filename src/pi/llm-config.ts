@@ -1,7 +1,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // llm-config：Mesh 统一 LLM 配置的解析与 fail-fast（W00-L3）。
 //
-// 设计依据：.agents/notes/tech/2026-10-13-mesh-llm-config-design.md
+// 设计依据：规范 §12.1（装配入口）与 §12.6 ⑦（LLM 与运行时配置类型）。
+//   原始设计稿已归档：.agents/notes/archive/2026-10-13-mesh-llm-config-design.md
 // 分层边界：本模块属于 mesh-pi（可依赖 core 的 util），公共类型只在此与
 // src/index.ts 导出，不进 src/core/types.ts —— core 保持 LLM 盲（M1/M2）。
 //

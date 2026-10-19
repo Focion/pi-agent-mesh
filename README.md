@@ -2,7 +2,7 @@
 
 构建在 pi SDK 之上的多智能体消息与共享状态层——`@pi/agent-mesh`。
 
-规范见 [`.agents/notes/tech/2026-09-07-pi-agent-mesh-spec.md`](.agents/notes/tech/2026-09-07-pi-agent-mesh-spec.md)（v1.0.0 规范），落地记录见 [`.agents/notes/plan/`](.agents/notes/plan/)。
+规范见 [`.agents/notes/tech/2026-09-07-pi-agent-mesh-spec.md`](.agents/notes/tech/2026-09-07-pi-agent-mesh-spec.md)（文档版本 v1.0.1），未完成事项见 [`.agents/notes/plan/`](.agents/notes/plan/)，v0.1.0 的落地与关闭记录见 [`.agents/notes/archive/`](.agents/notes/archive/)。
 
 ## 现状（v0.1.0）
 
@@ -267,7 +267,7 @@ tests/                  单测（core/pi）+ 契约 + e2e + bench
 
 | 维度 | 声明 | 验证口径 |
 | --- | --- | --- |
-| Node.js | `>=22.19.0`（engines 下限） | 本机验证于 Node 24.19.0 |
+| Node.js | `>=22.19.0`（engines 下限） | 实测于 Node 24.19.0（macOS arm64）与 Node 22.20.0（Linux x64）；低于下限时 vitest 的 fork 池会直接失败 |
 | 模块系统 | ESM + CJS 双产物（`index` / `core/index` + `.d.ts` / `.d.cts`） | `npm run verify:package`（G08 消费者矩阵） |
 | pi SDK | `@earendil-works/pi-coding-agent@^1.1.0` 直接依赖，`loadPiSdk()` 惰性加载 | core-only 冒烟不加载 pi（G08 无 pi 腿） |
 | 存储 | better-sqlite3 `^13`（SQLite，原生模块） | 真实文件 DB 创建/重开/迁移（G08 B 腿） |

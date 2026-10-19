@@ -47,8 +47,9 @@
 
 | 文档 | 说明 |
 | --- | --- |
-| [`notes/tech/2026-09-07-pi-agent-mesh-spec.md`](notes/tech/2026-09-07-pi-agent-mesh-spec.md) | **权威规范 v1.0.0**：平台基线、架构、投递语义、存储 schema、API、不变量、决策记录与风险登记。代码里的 `§x.y` 引用都指向它。 |
-| [`notes/plan/2026-10-12-consolidated-open-work-plan.md`](notes/plan/2026-10-12-consolidated-open-work-plan.md) | **唯一有效的未完成事项计划**：0.1.0 本地稳定版（C01–C10 合同、69 项审计登记、W00–W16 工作包、G01–G09 门槛）与 Mesh 统一 LLM 配置。已完成的早期计划和 review 见 `notes/archive/`。 |
+| [`notes/tech/2026-09-07-pi-agent-mesh-spec.md`](notes/tech/2026-09-07-pi-agent-mesh-spec.md) | **权威规范（文档版本 1.0.1）**：平台基线、架构、投递语义、存储 schema、API、不变量、决策记录与风险登记。代码里的 `§x.y` 引用都指向它。1.0.1 已按 v0.1.0 实现回填（见附录 L.4）；仍存在的实现差距在正文就地标注并指向当前计划。 |
+| [`notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`](notes/plan/2026-10-19-post-0.1.0-open-items-plan.md) | **当前唯一有效的未完成事项计划**：0.1.0 关闭后仍悬空的 D1–D6（待用户定夺）与 T1–T9（待办）。动手前先看它有没有覆盖你要改的面。 |
+| [`notes/archive/2026-10-12-consolidated-open-work-plan.md`](notes/archive/2026-10-12-consolidated-open-work-plan.md) | **已归档，但仍是 v0.1.0 的历史依据**：C01–C10 合同、LD1–LD8 决策、69 项去向，以及 §11 里 W00–W16 逐批的关闭记录（含偏差与剩余风险）。查「当时为什么这么做」来这里；判断当前该做什么不看它。 |
 
 规范体量很大（8000+ 行），按需读章节而不是整篇：查投递行为看 §7，查表结构看 §11，查对外 API 看 §12，查不变量看 §22.1。
 
