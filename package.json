@@ -36,6 +36,7 @@
     "check:imports": "node scripts/check-imports.mjs",
     "demo": "node demo/src/server.ts",
     "demo:start": "bash scripts/start-demo.sh",
+    "demo:smoke": "node scripts/demo-smoke.mjs",
     "pack": "node scripts/pack.mjs",
     "verify:local": "node scripts/verify-local.mjs",
     "verify:package": "node scripts/verify-package.mjs",

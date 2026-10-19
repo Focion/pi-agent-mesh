@@ -1,9 +1,12 @@
 ---
 title: demo 5-Tab 能力面板：追认与回归口径（D6）
 date: 2026-10-19
-status: active
+status: archived
 owner: unassigned
 tags: [plan, demo, regression, decision]
+archived_date: 2026-10-19
+archived_from: notes/plan/2026-10-19-demo-5-tab-regression-plan.md
+archived_reason: 步骤 2–4 已落地（scripts/demo-smoke.mjs + npm run demo:smoke + AGENTS.md 补充），D6 追认完成
 related:
   - ../archive/2026-10-19-post-0.1.0-open-items-plan.md
   - ../tech/2026-09-07-pi-agent-mesh-spec.md
@@ -50,9 +53,9 @@ related:
 | # | 事项 | 依赖 | 状态 |
 | --- | --- | --- | --- |
 | 1 | 追认 5-Tab 扩展，形成决策记录（本计划） | - | done |
-| 2 | 写 `scripts/demo-smoke.mjs`：假定 8787 已就绪，逐条跑上表的 1–7（HTTP 断言 `ok:true` + 字段，SSE 首帧） | 1 | todo |
-| 3 | 给 demo 补一条**离线冒烟 seam**（临时）——`createAssembledSessionFactory` 换成 stub + faux provider，让 1 + 3 + 6 能脱离真实凭据跑 | 2 | todo |
-| 4 | 把冒烟挂进一个 `npm run demo:smoke` 入口，并把「改 demo 必须 GUI 复核受影响的 Tab」写进 AGENTS.md/README | 2 | todo |
+| 2 | 写 `scripts/demo-smoke.mjs`：假定 8787 已就绪，逐条跑上表的 1–7（HTTP 断言 `ok:true` + 字段，SSE 首帧） | 1 | done |
+| 3 | 给 demo 补一条**离线冒烟 seam**（临时）——`createAssembledSessionFactory` 换成 stub + faux provider，让 1 + 3 + 6 能脱离真实凭据跑 | 2 | deferred |
+| 4 | 把冒烟挂进一个 `npm run demo:smoke` 入口，并把「改 demo 必须 GUI 复核受影响的 Tab」写进 AGENTS.md/README | 2 | done |
 
 1 已按用户指示追认；2–4 是「把静态清单变成一条命令」的后续，不属于本计划必须当轮闭环项——在 3（离线 seam）落地前，改 demo 仍需手工启动 + 浏览器复核受影响的 Tab。
 
@@ -68,3 +71,4 @@ related:
 ## 进度记录
 
 - 2026-10-19：追认 5-Tab 扩展（D6 方案①）；登记现状与 7 条冒烟清单。本计划与主计划的关系：主计划归档后，本计划是「demo 回归」唯一仍在 active 的计划。
+- 2026-10-19：步骤 2 落地（`scripts/demo-smoke.mjs`）；步骤 4 落地（`npm run demo:smoke` + AGENTS.md 补充）；步骤 3（离线 seam）延迟（依赖真实凭据才能起，当前保持手工复核）。计划归档。

@@ -38,11 +38,13 @@ npm run typecheck:demo   # demo 类型门禁（依赖 build 产物 dist/），�
 npm test                 # vitest run，全量测试
 npm run build            # ESM / CJS / 类型声明，输出到 dist/
 npm test -- tests/core/store.test.ts  # 单文件验证示例
+npm run demo:smoke       # demo 5-Tab 冒烟（假定 8787 已就绪，不自行启动服务）
 ```
 
 - `npm run pack`：执行门禁、类型检查、测试、构建和消费者冒烟，生成本地 tarball；不等于发布。
 - demo 依赖构建产物；修改库源码后先运行 `npm run build`，再按 demo 配置运行 `npm run demo`。
 - `npm run demo:start` 会终止占用目标端口的进程（默认 8787），不要未经确认启动。它仅在产物缺失或传入 `--build` 时重建，不会自动识别源码是否过时。
+- demo 前端（`demo/public/`）是 vanilla JS，不在类型门禁内；修改 demo 后**必须**先启动服务（`npm run demo:start`，需确认端口），再运行 `npm run demo:smoke` 复核受影响的 Tab 接口；冒烟不覆盖 GUI 交互，前端改动仍需浏览器目视确认。
 - 当前没有 lint 脚本，不要将不存在的命令作为验证结果。
 
 ## 实现约束
@@ -59,7 +61,7 @@ npm test -- tests/core/store.test.ts  # 单文件验证示例
 
 - 行为变更先补充或调整对应测试，再运行相关测试；代码变更完成后运行门禁、类型检查、全量测试与构建。若受环境限制未执行，明确列出原因和未验证范围。
 - pi 测试使用真实 SDK 配合 faux provider，不依赖真实 LLM。保留 `vitest.config.ts` 的 `forks` 隔离及 `TERMUX_VERSION=1` 设置；不要为了通过测试引入真实模型调用或凭据。
-- `typecheck` 覆盖 `src`、`tests`、`scripts`、`examples`；demo 由独立门禁 `typecheck:demo`（`demo/tsconfig.demo.json`，依赖 `build` 产物）覆盖类型，但 `check:imports` 仍仅扫描 `src/`。demo 前端（`demo/public/`）是 vanilla JS，不在类型门禁内；修改 demo 仍需额外验证服务启动及受影响的页面交互，不能只凭类型门禁声称 demo 验证通过。
+- `typecheck` 覆盖 `src`、`tests`、`scripts`、`examples`；demo 由独立门禁 `typecheck:demo`（`demo/tsconfig.demo.json`，依赖 `build` 产物）覆盖类型，但 `check:imports` 仍仅扫描 `src/`。demo 前端（`demo/public/`）是 vanilla JS，不在类型门禁内；修改 demo 后应启动服务并运行 `npm run demo:smoke` 复核受影响 Tab 的后端接口，不能只凭类型门禁声称 demo 验证通过。
 - 仅文档变更时，核对路径、链接、命令与事实，并检查差异；不必为此启动 demo、访问模型或执行全量测试。
 - 结束前检查变更范围与空白错误，简述修改内容、实际验证结果和未解决的问题。未经要求不提交、不推送、不发布。
 

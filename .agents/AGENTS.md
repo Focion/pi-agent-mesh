@@ -21,6 +21,7 @@
   npm run typecheck    # tsc --noEmit
   npm run check:imports# 分层门禁 G1–G4（core 零 pi、禁用 API、词表）
   npm run demo:start   # 起本地 demo（默认 8787）
+  npm run demo:smoke   # demo 冒烟（假定 8787 就绪，7 项断言）
   ```
 
 - 硬约束（改代码前必须知道）：mesh-core 不得 import pi 包；源码不得出现 `sendUserMessage` / `clearQueue` / `forkFrom` / `.prompt(`；不得出现宿主业务词汇（见 `scripts/check-imports.mjs` 词表）。规范里的编号（`M*` 约束、`I*` 不变量、`F*` 已证伪机制、`Q*` 决策）是全项目共用引用体系，写文档时沿用。
@@ -48,7 +49,7 @@
 | 文档 | 说明 |
 | --- | --- |
 | [`notes/tech/2026-09-07-pi-agent-mesh-spec.md`](notes/tech/2026-09-07-pi-agent-mesh-spec.md) | **权威规范（文档版本 1.0.2）**：平台基线、架构、投递语义、存储 schema、API、不变量、决策记录与风险登记。代码里的 `§x.y` 引用都指向它。1.0.1 已按 v0.1.0 实现回填，1.0.2 收口 0.1.0 之后的规范差距（见附录 L.4）。 |
-| [`notes/plan/2026-10-19-demo-5-tab-regression-plan.md`](notes/plan/2026-10-19-demo-5-tab-regression-plan.md) | **当前唯一 active 的计划（demo 回归）**：追认 5-Tab 扩展，定 7 条冒烟口径；改 demo 前看它。 |
+| [`notes/archive/2026-10-19-demo-5-tab-regression-plan.md`](notes/archive/2026-10-19-demo-5-tab-regression-plan.md) | **已归档**：D6 追认 5-Tab 扩展 + 7 条冒烟口径已落地（`scripts/demo-smoke.mjs`），步骤 3（离线 seam）延迟。 |
 | [`notes/archive/2026-10-19-post-0.1.0-open-items-plan.md`](notes/archive/2026-10-19-post-0.1.0-open-items-plan.md) | **已归档**：0.1.0 后悬空的 D1–D6 与 T1–T9 已收口（结论并入规范 1.0.2 与 CHANGELOG），仅作「当时为什么这么做」的历史依据。 |
 | [`notes/archive/2026-10-12-consolidated-open-work-plan.md`](notes/archive/2026-10-12-consolidated-open-work-plan.md) | **已归档，但仍是 v0.1.0 的历史依据**：C01–C10 合同、LD1–LD8 决策、69 项去向，以及 §11 里 W00–W16 逐批的关闭记录（含偏差与剩余风险）。查「当时为什么这么做」来这里；判断当前该做什么不看它。 |
 
