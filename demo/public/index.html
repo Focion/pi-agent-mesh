@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pi Agent Mesh · 群聊</title>
+<title>Pi Agent Mesh · 面板</title>
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -11,69 +11,299 @@
   <div class="brand">
     <span class="logo">⬡</span>
     <h1>Pi Agent Mesh</h1>
-    <span class="sub brand-sub">多智能体群聊 · 真实 MeshHost 驱动</span>
+    <span class="sub brand-sub">多智能体 Mesh · 真实 MeshHost 驱动</span>
     <span id="modeBadge" class="badge">实时 LLM 模式</span>
+  </div>
+  <div class="topbar-right">
+    <div id="healthLine" class="health-line"></div>
+    <button id="btnConfig" class="btn btn--ghost" type="button">配置 ℹ</button>
   </div>
 </header>
 
-<main class="layout">
-  <!-- 左侧：注册 + 花名册 -->
-  <aside class="sidebar">
-    <section class="panel register">
-      <h2>注册 Agent</h2>
-      <input id="agentName" class="inp" placeholder="名字，如 Dave" maxlength="24" />
-      <input id="agentPersona" class="inp" placeholder="人设 / 角色（可选），如 数据分析师" maxlength="40" />
-      <button id="btnRegister" class="btn btn--primary">＋ 注册并加入群聊</button>
-      <p class="hint">注册后该 agent 会出现在右侧群里，并能参与对话。</p>
-    </section>
+<nav class="tabs">
+  <button class="tab-btn is-active" data-tab="chat" type="button">群聊</button>
+  <button class="tab-btn" data-tab="topology" type="button">拓扑与在场</button>
+  <button class="tab-btn" data-tab="lab" type="button">消息实验室</button>
+  <button class="tab-btn" data-tab="shared" type="button">共享空间</button>
+  <button class="tab-btn" data-tab="observer" type="button">观测</button>
+</nav>
 
-    <section class="panel roster">
-      <h2>群成员 <span id="rosterCount" class="count">0</span></h2>
-      <ul id="rosterList" class="roster-list"></ul>
-    </section>
-  </aside>
+<main class="panels">
+  <!-- ══ 群聊 ══════════════════════════════════════════════════════════════ -->
+  <section class="tab-panel is-active" data-tab="chat">
+    <div class="layout">
+      <aside class="sidebar">
+        <section class="panel register">
+          <h2>注册 Agent</h2>
+          <input id="agentName" class="inp" placeholder="名字，如 Dave" maxlength="24" />
+          <input id="agentPersona" class="inp" placeholder="人设 / 角色（可选）" maxlength="40" />
+          <button id="btnRegister" class="btn btn--primary" type="button">＋ 注册并加入群聊</button>
+          <p class="hint">注册后该 agent 会出现在右侧群里，并能参与对话。</p>
+        </section>
+        <section class="panel roster">
+          <h2>群成员 <span id="rosterCount" class="count">0</span></h2>
+          <ul id="rosterList" class="roster-list"></ul>
+        </section>
+      </aside>
 
-  <!-- 中间：群聊 -->
-  <section class="chat">
-    <header class="chat-head">
-      <div class="chat-title" id="chatTitle"># lounge</div>
-      <div class="chat-sub">多 agent 实时通讯 · 在下面发言，群里的其它 agent 会接力回复</div>
-    </header>
-
-    <div class="messages" id="messages">
-      <div class="empty" id="chatEmpty">还没有消息。用左侧身份在下方发一条，大家就开始聊了 ✨</div>
+      <section class="chat">
+        <header class="chat-head">
+          <div class="chat-title" id="chatTitle"># lounge</div>
+          <div class="chat-sub">多 agent 实时通讯 · 发言后群内其它 agent 用真实 LLM 接力回复</div>
+        </header>
+        <div class="messages" id="messages">
+          <div class="empty" id="chatEmpty">还没有消息。用左侧身份在下方发一条，大家就开始聊了 ✨</div>
+        </div>
+        <footer class="composer">
+          <div class="composer-row">
+            <label class="sendas">以 <select id="sendAs" class="inp inp--sm"></select> 身份</label>
+            <label class="rounds">自动接力
+              <select id="rounds" class="inp inp--sm">
+                <option value="0">关</option>
+                <option value="1" selected>1 轮</option>
+                <option value="2">2 轮</option>
+                <option value="3">3 轮</option>
+              </select>
+            </label>
+            <label class="rounds">定向 <select id="replyTo" class="inp inp--sm"><option value="">全体</option></select></label>
+          </div>
+          <div class="composer-row composer-input">
+            <textarea id="msgInput" class="inp" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）" rows="2"></textarea>
+            <button id="btnSend" class="btn btn--primary btn--send" type="button">发送</button>
+          </div>
+        </footer>
+      </section>
     </div>
+  </section>
 
-    <footer class="composer">
-      <div class="composer-row">
-        <label class="sendas">
-          以
-          <select id="sendAs" class="inp inp--sm"></select>
-          身份
-        </label>
-        <label class="rounds">
-          自动接力
-          <select id="rounds" class="inp inp--sm">
-            <option value="0">关</option>
-            <option value="1" selected>1 轮</option>
-            <option value="2">2 轮</option>
-            <option value="3">3 轮</option>
+  <!-- ══ 拓扑与在场 ════════════════════════════════════════════════════════ -->
+  <section class="tab-panel" data-tab="topology">
+    <div id="topoRoot" class="grid-2">
+      <section class="panel">
+        <h2>注册账号 <button id="btnReloadTopo" class="mini" type="button">↻ 刷新</button></h2>
+        <div class="form-grid">
+          <input id="newAccName" class="inp" placeholder="显示名" />
+          <select id="newAccClass" class="inp">
+            <option value="stream">stream</option>
+            <option value="sink">sink</option>
+            <option value="external">external</option>
           </select>
-        </label>
-        <label class="rounds">
-          定向
-          <select id="replyTo" class="inp inp--sm">
-            <option value="">全体</option>
+          <input id="newAccCaps" class="inp" placeholder="capabilities（逗号分隔，可选）" />
+          <input id="newAccInitiate" class="inp" placeholder="initiate（如 chat,event,task）" />
+          <select id="newAccGrade" class="inp">
+            <option value="">defaultGrade —</option>
+            <option value="steer">steer</option>
+            <option value="followUp">followUp</option>
+            <option value="silent">silent</option>
           </select>
-        </label>
-      </div>
-      <div class="composer-row composer-input">
-        <textarea id="msgInput" class="inp" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）" rows="2"></textarea>
-        <button id="btnSend" class="btn btn--primary btn--send">发送</button>
-      </div>
-    </footer>
+          <button id="btnCreateAcc" class="btn btn--primary" type="button">注册账号</button>
+        </div>
+        <h3>端点（unified）</h3>
+        <div class="form-grid form-inline">
+          <select id="epAcct" class="inp"></select>
+          <button id="btnCreateEp" class="btn" type="button">注册端点</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>在场设置</h2>
+        <div class="form-grid">
+          <select id="presAcct" class="inp"></select>
+          <select id="presState" class="inp"></select>
+          <input id="presUntil" class="inp" placeholder="until（ISO，可选）" />
+          <input id="presReason" class="inp" placeholder="reason（可选）" />
+          <button id="btnSetPresence" class="btn btn--primary" type="button">setPresence</button>
+        </div>
+        <h3>当前在场</h3>
+        <div id="presenceList" class="list"></div>
+        <h3>nudge（推自己的 Agent）</h3>
+        <div class="form-grid">
+          <select id="nudgeAcct" class="inp"></select>
+          <input id="nudgeCue" class="inp" placeholder="提示语" />
+          <select id="nudgeDeliverAs" class="inp">
+            <option value="">deliverAs —</option>
+            <option value="steer">steer</option>
+            <option value="followUp">followUp</option>
+          </select>
+          <label class="chk"><input id="nudgeTrigger" type="checkbox" /> triggerTurn</label>
+          <button id="btnNudge" class="btn btn--primary" type="button">nudge</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>账号</h2>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead><tr><th>id</th><th>显示名</th><th>类别</th><th>initiate</th><th>caps</th><th>grade</th><th></th></tr></thead>
+            <tbody id="accBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>端点</h2>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead><tr><th>id</th><th>账号</th><th>状态</th><th>lease</th><th>session</th><th>操作</th></tr></thead>
+            <tbody id="epBody"></tbody>
+          </table>
+        </div>
+        <h3>sink 模式</h3>
+        <div id="sinkList" class="list"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ══ 消息实验室 ════════════════════════════════════════════════════════ -->
+  <section class="tab-panel" data-tab="lab">
+    <div class="grid-2">
+      <section class="panel">
+        <h2>会话</h2>
+        <div class="form-grid">
+          <select id="labConvSel" class="inp"></select>
+          <button id="btnLabReloadConv" class="mini" type="button">↻ 载入历史</button>
+        </div>
+        <h3>创建 direct</h3>
+        <div class="form-grid form-inline">
+          <select id="labDirectA" class="inp"></select>
+          <select id="labDirectB" class="inp"></select>
+          <button id="btnLabDirect" class="btn" type="button">ensureDirect</button>
+        </div>
+        <h3>创建 group / topic / queue</h3>
+        <div class="form-grid">
+          <select id="labConvType" class="inp">
+            <option value="group">group</option>
+            <option value="topic">topic</option>
+            <option value="queue">queue</option>
+          </select>
+          <select id="labConvCreator" class="inp"></select>
+          <input id="labConvMembers" class="inp" placeholder="members（accountId 逗号分隔）" />
+          <input id="labConvTopic" class="inp" placeholder="topic（可选）" />
+          <textarea id="labConvCfg" class="inp" placeholder='config JSON，如 {"historyVisibility":"full","maxHistoryOnJoin":5,"claimTtlMs":60000}' rows="2"></textarea>
+          <button id="btnLabCreateConv" class="btn btn--primary" type="button">createConversation</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>发送 / 应答</h2>
+        <div class="form-grid">
+          <select id="labFrom" class="inp"></select>
+          <select id="labKind" class="inp">
+            <option value="chat">chat</option>
+            <option value="task">task</option>
+            <option value="event">event</option>
+          </select>
+          <select id="labExpect" class="inp">
+            <option value="none">expect: none（send）</option>
+            <option value="ack">expect: ack（request）</option>
+          </select>
+          <textarea id="labText" class="inp" placeholder="消息正文" rows="2"></textarea>
+          <input id="labTo" class="inp" placeholder="to（accountId 逗号分隔，可选）" />
+          <input id="labMentions" class="inp" placeholder="mentions（可选）" />
+          <select id="labPriority" class="inp">
+            <option value="">priority —</option>
+            <option value="urgent">urgent</option>
+            <option value="normal">normal</option>
+            <option value="low">low</option>
+          </select>
+          <button id="btnLabSend" class="btn btn--primary" type="button">发送</button>
+        </div>
+        <div class="kv mono small"><span class="k">结果</span><span id="labLastResult" class="v muted">—</span></div>
+      </section>
+
+      <section class="panel">
+        <h2>会话消息（点「轨迹」看投递）</h2>
+        <div id="labMsgs" class="list list-scroll"></div>
+        <h3>投递轨迹</h3>
+        <div id="labTrace" class="list"></div>
+      </section>
+
+      <section class="panel">
+        <h2>收件箱 / 待应答</h2>
+        <div class="form-grid form-inline">
+          <select id="labInboxAcct" class="inp"></select>
+          <button id="btnLabInbox" class="btn" type="button">inboxOf</button>
+        </div>
+        <div id="labInbox" class="list"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ══ 共享空间 ══════════════════════════════════════════════════════════ -->
+  <section class="tab-panel" data-tab="shared">
+    <div class="grid-2">
+      <section class="panel">
+        <h2>host.shared</h2>
+        <div class="form-grid">
+          <input id="shSpace" class="inp" value="demo" placeholder="spaceId" />
+          <input id="shKey" class="inp" placeholder="key" />
+          <select id="shAs" class="inp"></select>
+          <textarea id="shData" class="inp" placeholder='data / item JSON，如 {"note":"hi"}' rows="2"></textarea>
+          <input id="shExpected" class="inp" placeholder="expectedVersion（CAS，可选）" />
+          <input id="shMaxLen" class="inp" placeholder="maxLen（append 可选）" />
+        </div>
+        <div class="btn-row">
+          <button id="btnShList" class="btn" type="button">list</button>
+          <button id="btnShGet" class="btn" type="button">get</button>
+          <button id="btnShPut" class="btn btn--primary" type="button">put</button>
+          <button id="btnShAppend" class="btn btn--primary" type="button">append</button>
+          <button id="btnShDel" class="btn btn--danger" type="button">del</button>
+        </div>
+        <p class="hint">put 传错的 expectedVersion 会触发 CAS 冲突（reject 会显示错误码）；list 不回填 data。</p>
+      </section>
+      <section class="panel">
+        <h2>对象</h2>
+        <div id="shResult" class="list list-scroll"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ══ 观测 ══════════════════════════════════════════════════════════════ -->
+  <section class="tab-panel" data-tab="observer">
+    <div class="grid-2">
+      <section class="panel">
+        <h2>计数器 <button id="btnObsInvariants" class="mini" type="button">checkInvariants</button></h2>
+        <div id="obsInvariant" class="list"></div>
+        <div id="obsCounters" class="ct-grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>验收比值（§24.2）</h2>
+        <div id="obsAcceptance" class="list"></div>
+        <h3>只读观测</h3>
+        <div class="form-grid form-inline">
+          <input id="obsSearchText" class="inp" placeholder="搜索文本" />
+          <button id="btnObsSearch" class="btn" type="button">search</button>
+        </div>
+        <div class="form-grid form-inline">
+          <select id="obsEpSel" class="inp"></select>
+          <button id="btnObsReplay" class="btn" type="button">replay</button>
+        </div>
+        <div class="form-grid form-inline">
+          <input id="obsStreamSid" class="inp" placeholder="piSessionId" />
+          <button id="btnObsStream" class="btn" type="button">streamEntries</button>
+        </div>
+        <div id="obsResult" class="list"></div>
+      </section>
+
+      <section class="panel panel-wide">
+        <h2>活动流（15 个 MeshEvent + sink/thinking）
+          <select id="obsActFilter" class="inp inp--sm"></select>
+        </h2>
+        <div id="obsActivity" class="list list-scroll"></div>
+      </section>
+    </div>
   </section>
 </main>
+
+<!-- 配置抽屉 -->
+<aside id="configDrawer" class="drawer">
+  <header class="drawer-head">
+    <span>配置 / 健康</span>
+    <button id="btnConfigClose" class="mini" type="button">✕</button>
+  </header>
+  <div id="configBody" class="drawer-body"></div>
+</aside>
 
 <div id="toast" class="toast" hidden></div>
 

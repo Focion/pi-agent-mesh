@@ -149,7 +149,7 @@ policy_degraded    invariant_violated
 
 ## Demo 面板
 
-全真实装配的**群聊面板**（真实 PiStreamPort + 真实 LLM 接力回复），本地 SSE + 静态页。首启预置 Alice / Bob / Carol 三个 agent，可再注册自定义 agent（名字 + 人设）；发一条消息后，群里其余 agent 各自用真实 LLM 接力回复。支持 @定向（点名单个成员）与 1–3 轮并发接龙，模型异常以系统气泡回显。面板聚焦「多 agent 群聊」这一条用户路径，不覆盖 forkAt / 多进程 / request-应答等全部能力面。
+全真实装配的**能力演示面板**（5 Tab：群聊 / 拓扑与在场 / 消息实验室 / 共享空间 / 观测），本地 SSE + 静态页。群聊首启预置 Alice / Bob / Carol 三个 agent，真实 LLM 接力回复；其余 Tab 覆盖 request-应答、queue claim/requeue、shared CAS、observer 计数器/不变量/投递轨迹/replay、presence 七态 (host + derived) 等能力展示。不覆盖 forkAt / 跨机 Transport / 多进程 UI。
 
 ```bash
 npm run demo:start        # 启动 → http://localhost:8787
@@ -188,16 +188,25 @@ npm run demo:start        # 启动 → http://localhost:8787
 
 凭据可由 `llm.apiKey`（仅测试链路）或 `llm.apiKeyEnv`（生产首选，指向环境变量名）提供；无凭据 / 坏模型会 fail-fast 退出。
 
-### 面板功能（群聊）
+### 面板功能
 
-| 区域 | 功能 |
-| --- | --- |
-| 注册 Agent | 名字 + 人设（可选）注册 stream agent，即时入群并 warm |
-| 群成员 | 花名册实时列表（含 3 个 seed：Alice / Bob / Carol） |
-| 群聊消息流 | 首屏历史 + SSE 实时去重推送；系统气泡（入群 / 异常）居中显示 |
-| 发消息 | 以任意成员身份发；`自动接力 1–3 轮`（其余成员并发回复）或关 |
-| @定向 | 点名单个成员（`@名字` 或「定向」下拉）仅该成员回 1 条；否则全体广播 |
-| 模型异常回显 | agent 回复失败 / 超时以系统气泡回显原因，思考气泡撤回 |
+| Tab | 区域 | 功能 |
+| --- | --- | --- |
+| 群聊 | 注册 / 群成员 | 名字+人设注册 stream agent；花名册实时列表 |
+| 群聊 | 消息流 / 发送 | SSE 实时消息、1–3 轮自动接力、@定向、模型异常回显 |
+| 拓扑与在场 | Account / Endpoint | 注册账号(stream/sink/external) 与端点；表格展示 id/类别/state/lease/session |
+| 拓扑与在场 | Presence 七态 | setPresence(available/busy/dnd/away/offline + until/reason)；区分 host vs derived(online/idle) |
+| 拓扑与在场 | 操作 | warm(shared/exclusive) / evict / nudge(deliverAs/triggerTurn) / sinkMode(accept\|refuse) |
+| 消息实验室 | 会话 | 创建 direct/group/topic/queue + config JSON(historyVisibility/claimTtlMs) |
+| 消息实验室 | send / request | chat/event/task + expect:ack 双路径对照；priority/mentions/to |
+| 消息实验室 | Delivery Trace | routed→delivered→consumed/parked/dropped；note/redeliverReason/attempts/grade/path |
+| 消息实验室 | queue & ack | claim/requeue/markConsumed；inboxOf→awaitingMyAck→ack/nack |
+| 共享空间 | host.shared | put/get/append/del/list；CAS(expectedVersion)；shared_object_changed 实时刷新 |
+| 观测 | 计数器网格 | 23 个 REGISTERED_COUNTERS；新增(blind_write/claim_timeout/queue_cleared_detected/delivery_handoff_timeout) 高亮 |
+| 观测 | 验收比值 | §24.2 computeAcceptance + 每秒 tick |
+| 观测 | 只读入口 | checkInvariants / search / replay / streamEntries |
+| 观测 | 活动流 | 15 MeshEvent + delivery/sink 汇聚可筛选时间线 |
+| 配置抽屉 | 健康头 | /api/health 展示 provider/model/thinking/tools/dbPath/port/fingerprint/credentialSource |
 
 ## 测试
 

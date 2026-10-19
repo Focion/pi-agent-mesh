@@ -33,7 +33,8 @@
 
 ```bash
 npm run check:imports    # G1–G4 依赖、分层、禁用 API 与业务词门禁
-npm run typecheck        # tsc --noEmit
+npm run typecheck        # tsc --noEmit（src/tests/scripts/examples）
+npm run typecheck:demo   # demo 类型门禁（依赖 build 产物 dist/），先 build 再跑
 npm test                 # vitest run，全量测试
 npm run build            # ESM / CJS / 类型声明，输出到 dist/
 npm test -- tests/core/store.test.ts  # 单文件验证示例
@@ -58,7 +59,7 @@ npm test -- tests/core/store.test.ts  # 单文件验证示例
 
 - 行为变更先补充或调整对应测试，再运行相关测试；代码变更完成后运行门禁、类型检查、全量测试与构建。若受环境限制未执行，明确列出原因和未验证范围。
 - pi 测试使用真实 SDK 配合 faux provider，不依赖真实 LLM。保留 `vitest.config.ts` 的 `forks` 隔离及 `TERMUX_VERSION=1` 设置；不要为了通过测试引入真实模型调用或凭据。
-- `typecheck` 当前不覆盖 `demo/`，`check:imports` 仅扫描 `src/`。修改 demo 时需额外验证服务启动及受影响的页面交互，不能只凭核心门禁声称 demo 验证通过。
+- `typecheck` 覆盖 `src`、`tests`、`scripts`、`examples`；demo 由独立门禁 `typecheck:demo`（`demo/tsconfig.demo.json`，依赖 `build` 产物）覆盖类型，但 `check:imports` 仍仅扫描 `src/`。demo 前端（`demo/public/`）是 vanilla JS，不在类型门禁内；修改 demo 仍需额外验证服务启动及受影响的页面交互，不能只凭类型门禁声称 demo 验证通过。
 - 仅文档变更时，核对路径、链接、命令与事实，并检查差异；不必为此启动 demo、访问模型或执行全量测试。
 - 结束前检查变更范围与空白错误，简述修改内容、实际验证结果和未解决的问题。未经要求不提交、不推送、不发布。
 

@@ -43,6 +43,8 @@ export const DISPOSITION: DispositionEntry[] = [
   { id: "D04", summary: "topic 保持全 fanout，测 1000 订阅者边界", status: "done", evidence: ["G06"] },
   { id: "D05", summary: "Shared 保持 reject/null，不加 getRaw", status: "done", evidence: ["G03"] },
   { id: "D06", summary: "有界裁剪；purged 元信息模型延期（版本单调/CAS/墓碑仍修）", status: "done", evidence: ["G03"] },
+  // LD8/D07 原文约束「不扩展 UI / 不恢复旧五页」已被后续用户指令有意覆盖：
+  // 0.1.0 后 demo 扩展为 5-Tab 能力面板（群聊/拓扑/消息实验室/共享/观测），不还原旧五页 IA。
   { id: "D07", summary: "定向历史隔离/更多 Floor/queue 优先级/跨拓扑迁移不进本版", status: "done", evidence: ["G03"] },
 
   // ── H：文档一致性（4 项，W16 统一处理）───────────────────────────

@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    // demo 走 Node 原生 type-stripping 直接跑 .ts，且从 ../../dist/*.js 取类型；
+    // 允许 .ts 扩展名导入（noEmit 已由根 tsconfig 提供）。
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src"]
+}

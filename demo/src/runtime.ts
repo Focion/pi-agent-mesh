@@ -67,6 +67,15 @@ export interface ChatEntry {
   to?: string[];
 }
 
+/** 单个账号的在场投影（§15：host 手动设置 vs 端点派生）。 */
+export interface PresenceView {
+  state: PresenceState;
+  source: "host" | "derived";
+  until?: string;
+  reason?: string;
+  at: string;
+}
+
 export class MeshController {
   readonly config: DemoConfig;
   private readonly resolvedLlm: ResolvedLlm;
@@ -77,7 +86,7 @@ export class MeshController {
   accounts = new Map<string, Account>();
   endpoints = new Map<string, Endpoint>();
   conversations = new Map<string, Conversation>();
-  presence = new Map<string, PresenceState>();
+  presence = new Map<string, PresenceView>();
   sinkModes = new Map<string, "accept" | "refuse">();
   private sinkUnsubs = new Map<string, Unsubscribe>();
 
@@ -195,8 +204,14 @@ export class MeshController {
         break;
       }
       case "presence_changed": {
-        const { accountId, to } = p as MeshEvents["presence_changed"];
-        this.presence.set(accountId, to);
+        const { accountId, to, source, until, reason } = p as MeshEvents["presence_changed"];
+        this.presence.set(accountId, {
+          state: to,
+          source: source ?? "host",
+          ...(until ? { until } : {}),
+          ...(reason ? { reason } : {}),
+          at: isoNow(),
+        });
         break;
       }
       case "conversation_changed": {
@@ -292,7 +307,13 @@ export class MeshController {
     opts?: { until?: string; reason?: string },
   ): Promise<void> {
     await this.host.setPresence(accountId, state, opts);
-    this.presence.set(accountId, state);
+    this.presence.set(accountId, {
+      state,
+      source: "host",
+      ...(opts?.until ? { until: opts.until } : {}),
+      ...(opts?.reason ? { reason: opts.reason } : {}),
+      at: isoNow(),
+    });
   }
 
   lookup(q: { query?: string; capabilities?: string[]; limit?: number }): Promise<Account[]> {
@@ -874,10 +895,6 @@ export class MeshController {
       .slice(0, 24);
     return out || "agent";
   }
-}
-
-function sleepMs(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 /** 从 pi 会话消息的 content（string | 分块数组 | 对象）中抽取纯文本。 */

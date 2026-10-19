@@ -165,12 +165,31 @@ const HANDLERS: Record<string, Handler> = {
   replay: (c, a) => c.observer.replay(str(a.endpointId)),
   forkAt: (c, a) => c.observer.forkAt(str(a.endpointId), str(a.entryId)),
 
-  // 共享空间（§18）—— 已接线，委托 host.shared.*
-  sharedGet: (c, a) => c.host.shared.get(str(a.spaceId), str(a.key), { as: str(a.as) }),
-  sharedPut: (c, a) => c.host.shared.put(str(a.spaceId), str(a.key), a.data, { as: str(a.as) }),
-  sharedAppend: (c, a) => c.host.shared.append(str(a.spaceId), str(a.key), a.item, { as: str(a.as) }),
+  // 共享空间（§18）—— 已接线，委托 host.shared.*；opts 与 core 签名对齐。
+  sharedGet: (c, a) =>
+    c.host.shared.get(str(a.spaceId), str(a.key), {
+      as: str(a.as),
+      ...(num(a.version) !== null ? { version: Number(a.version) } : {}),
+    }),
+  sharedPut: (c, a) =>
+    c.host.shared.put(str(a.spaceId), str(a.key), a.data, {
+      as: str(a.as),
+      ...(num(a.expectedVersion) !== null ? { expectedVersion: Number(a.expectedVersion) } : {}),
+      ...(str2(a.contentType) ? { contentType: String(a.contentType) } : {}),
+    }),
+  sharedAppend: (c, a) =>
+    c.host.shared.append(str(a.spaceId), str(a.key), a.item, {
+      as: str(a.as),
+      ...(num(a.maxLen) !== null ? { maxLen: Number(a.maxLen) } : {}),
+    }),
   sharedDel: (c, a) => c.host.shared.del(str(a.spaceId), str(a.key), { as: str(a.as) }),
-  sharedList: (c, a) => c.host.shared.list(str(a.spaceId), { as: str(a.as) }),
+  sharedList: (c, a) =>
+    c.host.shared.list(str(a.spaceId), {
+      as: str(a.as),
+      ...(str2(a.keyPrefix) ? { keyPrefix: String(a.keyPrefix) } : {}),
+      ...(num(a.sinceVersion) !== null ? { sinceVersion: Number(a.sinceVersion) } : {}),
+      ...(num(a.limit) !== null ? { limit: Number(a.limit) } : {}),
+    }),
 
   // 综合
   state: (c) => c.snapshot(),
