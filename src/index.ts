@@ -1800,8 +1800,6 @@ export type {
   LogicalClock,
   Membership,
   MeshErrorCode,
-  MeshEvent,
-  MeshEventMeta,
   MeshEvents,
   MeshHost,
   MeshLease,
@@ -1859,9 +1857,16 @@ export type {
 
 export {
   DEFAULT_LIMITS,
+  DROP_REASONS,
   InvariantViolationError,
   MeshUnsupportedError,
+  PARK_REASONS,
+  REJECT_CODES,
+  TOOL_ERROR_CODES,
 } from "./core/types.js";
+
+export { REGISTERED_COUNTERS } from "./core/store.js";
+export { MESH_TOOL_NAMES } from "./core/tools.js";
 
 export { createPiSessionFactory, createAssembledSessionFactory } from "./pi/session-factory.js";
 export { MESH_ERROR_CODES, MeshConfigError, configFingerprint, resolveLlmConfig } from "./pi/llm-config.js";

@@ -10,7 +10,7 @@ tags: [tech, llm-config, pi-isolation, w00, ld-decision, api, archived]
 related:
   - ../tech/2026-09-07-pi-agent-mesh-spec.md
   - ./2026-10-12-consolidated-open-work-plan.md
-  - ../plan/2026-10-19-post-0.1.0-open-items-plan.md
+  - ./2026-10-19-post-0.1.0-open-items-plan.md
 ---
 
 > **已归档（2026-10-19）**：本文的决策与配置 schema 已落进实现，并已回填到规范
@@ -18,7 +18,7 @@ related:
 > 装配入口见 §12.1（`CreateMeshOptions` / `llm` / `runtime`），配置类型见 §12.6 ⑦，
 > 槽的必填性见 §12.3 与 §20.1，依赖归属见 §29.2。请以规范为准。
 > **唯一未落地的条目是 LD6 的多 profile 与 `Account.profileRef` 解析**，它改由
-> [`notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`](../plan/2026-10-19-post-0.1.0-open-items-plan.md) 的 D4 承接。
+> [`notes/archive/2026-10-19-post-0.1.0-open-items-plan.md`](./2026-10-19-post-0.1.0-open-items-plan.md) 的 D4 承接。
 
 ## 方案概述
 

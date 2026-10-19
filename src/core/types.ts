@@ -685,7 +685,7 @@ export const DEFAULT_LIMITS: Limits = {
   sharedVersionsKept: 10
 };
 
-// ─── ⑦ 事件（§12.5 + §12.6 ⑤）────────────────────────────────────────────
+// ─── ⑦ 事件（§12.5；判别联合已自 0.1.0 移除，见 CHANGELOG 破坏性变更）──
 
 export interface MeshEvents {
   message_routed: { envelope: Envelope };
@@ -729,36 +729,6 @@ export interface MeshEvents {
   policy_degraded: { slot: PolicySlot; reason: PolicyDegradeReason; degradedTo: DegradeTarget };
   invariant_violated: { code: string; detail: unknown };
 }
-
-export interface MeshEventMeta {
-  at: string; // 墙钟 ISO8601
-  endpointId: EndpointId | null; // 归因端点
-}
-
-export type MeshEvent = MeshEventMeta &
-  (
-    | { type: "message_routed"; envelope: Envelope }
-    | { type: "message_delivered"; envelope: Envelope; accountId: AccountId; grade: Grade; woke: boolean; path: ContextPath }
-    | { type: "message_consumed"; envelope: Envelope; accountId: AccountId; partial: boolean; entryId?: EntryId }
-    | { type: "message_parked"; envelope: Envelope; reason: ParkReason }
-    | { type: "message_dropped"; envelope: Envelope; reason: DropReason }
-    | { type: "message_acked"; correlationId: CorrelationId; ok: boolean; detail?: unknown }
-    | {
-        type: "inbox_overflowed";
-        accountId: AccountId;
-        conversationId: ConversationId;
-        foldedCount: number;
-        foldedRange: [number, number];
-      }
-    | { type: "request_timeout"; correlationId: CorrelationId; from: AccountId; to: AccountId; intent?: string }
-    | { type: "conversation_changed"; conversationId: ConversationId; change: ConversationChange }
-    | { type: "membership_caps_changed"; conversationId: ConversationId; accountId: AccountId; caps: Cap[] }
-    | { type: "shared_object_changed"; spaceId: SpaceId; key: string; version: number; by: AccountId }
-    | { type: "presence_changed"; accountId: AccountId; from: PresenceState; to: PresenceState }
-    | { type: "endpoint_state_changed"; endpointId: EndpointId; from: EndpointState; to: EndpointState }
-    | { type: "policy_degraded"; slot: PolicySlot; reason: PolicyDegradeReason; degradedTo: DegradeTarget }
-    | { type: "invariant_violated"; code: string; detail: unknown }
-  );
 
 // ─── ⑧ StreamPort（§2.4：锁定的 10 个方法）────────────────────────────────
 

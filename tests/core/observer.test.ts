@@ -494,12 +494,12 @@ describe("MeshObserver.checkInvariants", () => {
     expect(violationIds(await reportIds())).toContain("C14");
   });
 
-  it("C15 red on bad cap value and group without dissolve holder", async () => {
+  it("C15 red on bad cap value and group without setCaps holder", async () => {
     greenWorld(db);
     store.recomputeInboxCaches();
     db.prepare(
       "UPDATE mesh_memberships SET caps = ? WHERE conversation_id = 'gc' AND account_id = 'a1'",
-    ).run('["speak"]'); // 唯一 dissolve 持有者失去该位
+    ).run('["speak"]'); // 唯一 setCaps 持有者失去该位
     db.prepare(
       "UPDATE mesh_memberships SET caps = ? WHERE conversation_id = 'gc' AND account_id = 'a2'",
     ).run('["speak","admin"]'); // 值域越界

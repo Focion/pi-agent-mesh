@@ -922,10 +922,12 @@ export class MeshObserver implements Observer {
           ),
       },
       {
-        // C15（I8）caps 值域 + 未归档 group 至少一个 dissolve 持有者（在任成员）
+        // C15（I8）caps 值域 + 未归档 group 至少一个 setCaps 持有者（在任成员）。
+        // 注意：这里盯的是「管理能力」setCaps（I8：setCaps = 管理能力），与 §12.2
+        // 的管理员护栏（护最后一个 setCaps 持有者）一致；dissolve 不再是管控位。
         id: "C15",
         assertion:
-          "caps within value domain; every active group has a dissolve holder among current members",
+          "caps within value domain; every active group has a setCaps holder among current members",
         run: () =>
           this.rows(
             "SELECT ms.conversation_id, ms.account_id, j.value AS bad_cap FROM mesh_memberships ms, json_each(ms.caps) j " +
@@ -933,7 +935,7 @@ export class MeshObserver implements Observer {
               "UNION ALL " +
               "SELECT c.id, NULL, 'NO_ADMIN_LEFT' FROM mesh_conversations c WHERE c.type = 'group' AND c.archived_at IS NULL " +
               "AND NOT EXISTS (SELECT 1 FROM mesh_memberships ms2, json_each(ms2.caps) j2 " +
-              "WHERE ms2.conversation_id = c.id AND ms2.left_at IS NULL AND j2.value = 'dissolve')",
+              "WHERE ms2.conversation_id = c.id AND ms2.left_at IS NULL AND j2.value = 'setCaps')",
           ),
       },
       {

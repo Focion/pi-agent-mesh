@@ -18,7 +18,7 @@ import { createMesh, createPiSessionFactory, DEFAULT_LIMITS, PiStreamPort, Endpo
 import type {
   CreateMeshOptions, MeshHost, SessionFactory, ToolDefinition, MeshToolResult,
   ToolContext, AccountId, EndpointId, ConversationId, MessageId, DeliveryId,
-  Envelope, Limits, SendInput, RegisterAccountInput, Unsubscribe, MeshEvent, PortStatus,
+  Envelope, Limits, SendInput, RegisterAccountInput, Unsubscribe, PortStatus,
 } from "@pi/agent-mesh";
 import {
   MeshRejectError, InvariantViolationError, InProcessTransport, SqliteStore,

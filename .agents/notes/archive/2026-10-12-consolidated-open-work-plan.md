@@ -4,7 +4,7 @@ date: 2026-10-12
 status: archived
 archived_date: 2026-10-19
 archived_from: notes/plan/2026-10-12-consolidated-open-work-plan.md
-archived_reason: W00–W16 全部关闭、G01–G09 全绿、M0–M5 全部 done，2026-10-19 复核确认交付面属实；关闭后仍悬空的事项已转入 notes/plan/2026-10-19-post-0.1.0-open-items-plan.md
+archived_reason: W00–W16 全部关闭、G01–G09 全绿、M0–M5 全部 done，2026-10-19 复核确认交付面属实；关闭后仍悬空的事项已转入 notes/archive/2026-10-19-post-0.1.0-open-items-plan.md
 owner: unassigned
 tags: [plan, consolidated, v0.1.0, implementation-gap, llm-config, pi-isolation, archived]
 related:
@@ -12,11 +12,11 @@ related:
   - ./2026-09-29-deferred-capabilities-audit.md
   - ./2026-09-30-samehost-transport-review.md
   - ../tech/2026-09-07-pi-agent-mesh-spec.md
-  - ../plan/2026-10-19-post-0.1.0-open-items-plan.md
+  - ./2026-10-19-post-0.1.0-open-items-plan.md
 ---
 
 > **已归档（2026-10-19）**：本计划的工作已全部完成，**不再是当前的未完成事项清单**。
-> 当前有效的计划是 [`notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`](../plan/2026-10-19-post-0.1.0-open-items-plan.md)。
+> 当前有效的计划是 [`notes/plan/2026-10-19-demo-5-tab-regression-plan.md`](../plan/2026-10-19-demo-5-tab-regression-plan.md)（demo 回归）；原 [`notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`](../archive/2026-10-19-post-0.1.0-open-items-plan.md) 亦已归档。
 >
 > 本文**仍是 v0.1.0「当时为什么这么做」的事实来源**：§4 的 C01–C10 合同、§5 的 LD1–LD8 决策、
 > §6 的 69 项去向登记，以及 §11 里 W00–W16 逐批的关闭记录（含每批的偏差与剩余风险）。
@@ -636,5 +636,5 @@ W01 是硬闸门：其探针结论会复核第 3–7 批的拆分与体量，探
   - **偏差（按计划第 3 条「偏离规范须记录」）**：① 「离线安装」= 隔离真实安装、允许访问 registry（非 `npm --offline`；真 `--offline` 需预置本地 cache/镜像，与本环境联网事实及「不能软链仓库依赖」的原始门槛不符）；② 「无 pi」腿 = 真装后删 `@earendil-works`（pi 是硬依赖，无法在 install 阶段省略），等价 pack 的「不软链 pi」语义但基于真实安装；③ 支持矩阵不声称已验证 Node 22.x（`engines>=22.19.0` 为下限，本机实测 24.19.0）；④ `quickstart.ts` 自引用 `@pi/agent-mesh` 依赖 Node 包自引用解析 + 原生 TS 剥壳，已实测成立（G08 E 腿 exit 0）；⑤ 「全部 examples」= quickstart.ts 一份（`examples/` 无其它文件）。
   - **剩余风险 / 留待**：① G08 全 pi 腿不做真实 LLM turn（零真实模型/凭据约束），以「import 矩阵 + core-only 功能 DB + `createMesh({llm})` 配置解析/fail-fast」作为 pi 已装且可加载的运行时证据，真实 LLM 闭环仅 demo 手工验证；② 升级库件（从 74e20c8 合成基线或历史发布库升级）按计划为「非目标」，未进 G08 矩阵（G09 只做「是否存在」轻量断言）；③ 非 macOS arm64 的 OS 与其它 Node/SDK 版本未验证，支持矩阵只声明 `>=22.19.0` 下限 + 本机 24.19.0 实测。
 
-- 2026-10-19：**复核本计划的交付面，结论：W00–W16 的关闭记录属实，本计划继续保持 `done`，不重开。** 实测（Linux x64 / Node 22.20.0 / pi 1.1.0）：全量测试 **621 passed + 1 skipped（622，70 文件）**、`check:imports`、`typecheck`、`gen-snapshots --check`、`build` 全绿；`verify:local` 的 G01–G05 与 G07 通过（G07 单独跑，exit 0）。**唯一判不了的是 G06**——三个基准的正确性断言每轮都过，但"相对基线退化 ≤20%"与"≥200 任务/秒"是按 §8.2 的 macOS arm64 参考机标定的绝对值，换机即不成立；这不构成退化的证据，也不构成没有退化的证据。关闭之后仍悬空的事项（事件 `endpointId` 未全覆盖、`MeshEvent` 判别联合无生产路径、`wake_per_message_busy` 无自增点、LD6 多 profile 未实现、G06 口径机器绑定、demo 在 `615c1f0` 超出 LD8/D07 范围）以及各工作包"剩余风险 / 留待"里仍无人接的条目，已另立 [`notes/plan/2026-10-19-post-0.1.0-open-items-plan.md`](../plan/2026-10-19-post-0.1.0-open-items-plan.md)，**不在本计划追加**。同日按 v0.1.0 实现回填规范（规范变更记录 1.0.1），W00/W01 的两份技术文档在结论并入规范后归档。
-- 2026-10-19：**本计划归档**（`status: done` → `archived`）。完成判定见 §1 的状态说明，复核证据见上一条。本文此后只作历史依据：C01–C10 合同、LD1–LD8 决策、69 项去向与 §11 的 W00–W16 关闭记录仍可引用，但**不得据此判断当前该做什么**——当前计划与当前契约分别以 `notes/plan/2026-10-19-post-0.1.0-open-items-plan.md` 与规范为准。
+- 2026-10-19：**复核本计划的交付面，结论：W00–W16 的关闭记录属实，本计划继续保持 `done`，不重开。** 实测（Linux x64 / Node 22.20.0 / pi 1.1.0）：全量测试 **621 passed + 1 skipped（622，70 文件）**、`check:imports`、`typecheck`、`gen-snapshots --check`、`build` 全绿；`verify:local` 的 G01–G05 与 G07 通过（G07 单独跑，exit 0）。**唯一判不了的是 G06**——三个基准的正确性断言每轮都过，但"相对基线退化 ≤20%"与"≥200 任务/秒"是按 §8.2 的 macOS arm64 参考机标定的绝对值，换机即不成立；这不构成退化的证据，也不构成没有退化的证据。关闭之后仍悬空的事项（事件 `endpointId` 未全覆盖、`MeshEvent` 判别联合无生产路径、`wake_per_message_busy` 无自增点、LD6 多 profile 未实现、G06 口径机器绑定、demo 在 `615c1f0` 超出 LD8/D07 范围）以及各工作包"剩余风险 / 留待"里仍无人接的条目，已另立 [`notes/archive/2026-10-19-post-0.1.0-open-items-plan.md`](../archive/2026-10-19-post-0.1.0-open-items-plan.md)，**不在本计划追加**。同日按 v0.1.0 实现回填规范（规范变更记录 1.0.1），W00/W01 的两份技术文档在结论并入规范后归档。
+- 2026-10-19：**本计划归档**（`status: done` → `archived`）。完成判定见 §1 的状态说明，复核证据见上一条。本文此后只作历史依据：C01–C10 合同、LD1–LD8 决策、69 项去向与 §11 的 W00–W16 关闭记录仍可引用，但**不得据此判断当前该做什么**——当前契约以规范（1.0.2）为准，当前计划见 `notes/plan/2026-10-19-demo-5-tab-regression-plan.md`（`2026-10-19-post-0.1.0-open-items-plan.md` 亦已归档）。

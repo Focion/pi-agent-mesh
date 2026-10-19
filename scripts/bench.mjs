@@ -13,7 +13,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { arch, cpus, platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -41,6 +41,43 @@ if (record) {
   env.BENCH_BASELINE_PATH = BASELINE;
 }
 
+// ── 环境指纹（D5）：基准数字绑定机器/Node，跨机比较会误报退化 ────────────
+function currentFingerprint() {
+  return {
+    platform: platform(),
+    arch: arch(),
+    node: process.versions.node,
+    cpuModel: cpus()[0]?.model ?? "unknown",
+  };
+}
+function sameFingerprint(a, b) {
+  return (
+    !!a && !!b &&
+    a.platform === b.platform &&
+    a.arch === b.arch &&
+    a.node === b.node &&
+    a.cpuModel === b.cpuModel
+  );
+}
+if (!record && existsSync(BASELINE)) {
+  const baseline = JSON.parse(readFileSync(BASELINE, "utf8"));
+  const fp = baseline.fingerprint;
+  const cur = currentFingerprint();
+  if (!fp) {
+    console.error("✗ 基准基线缺少环境指纹（旧格式）——请 `node scripts/bench.mjs --record` 重录。");
+    process.exit(1);
+  }
+  if (!sameFingerprint(fp, cur)) {
+    console.error(
+      `✗ 基准基线环境指纹不匹配，拒绝跨机比较（会误报退化）：\n` +
+        `  基线 ${JSON.stringify(fp)}\n  当前 ${JSON.stringify(cur)}\n` +
+        `  若本机就是参考机 → node scripts/bench.mjs --record 重录；` +
+        `否则跑 verify:local 时用 --skip-bench 跳过 G06。`,
+    );
+    process.exit(1);
+  }
+}
+
 // G06 与「G05 already filtered tests」无关——这里只跑 packages 里声明要跑的文件集，
 // 由 vitest.bench.config.ts 的 include 收口（A/B/C + scale-v05）。
 const r = spawnSync(process.execPath, [VITEST, "run", "--config", "vitest.bench.config.ts"], {
@@ -53,7 +90,7 @@ if (r.status !== 0) {
 }
 
 if (record) {
-  // 聚合各 benchmark 记录的 JSONL → BASELINE 映射。
+  // 聚合各 benchmark 记录的 JSONL → BASELINE 映射（顶层带环境指纹）。
   const recordPath = env.BENCH_RECORD_PATH;
   const out = {};
   const lines = readFileSync(recordPath, "utf8").split("\n").filter(Boolean);
@@ -61,10 +98,11 @@ if (record) {
     const { id, timeMedianMs, throughputMedian } = JSON.parse(line);
     out[id] = { timeMedianMs, throughputMedian };
   }
+  const baseline = { fingerprint: currentFingerprint(), ...out };
   mkdirSync(join(ROOT, "snapshots"), { recursive: true });
-  writeFileSync(BASELINE, JSON.stringify(out, null, 2) + "\n", "utf8");
+  writeFileSync(BASELINE, JSON.stringify(baseline, null, 2) + "\n", "utf8");
   try {
     rmSync(recordPath, { force: true });
   } catch {}
-  console.log(`✅ 已写入基准基线 ${BASELINE}`);
+  console.log(`✅ 已写入基准基线 ${BASELINE}（fingerprint: ${JSON.stringify(baseline.fingerprint)}）`);
 }

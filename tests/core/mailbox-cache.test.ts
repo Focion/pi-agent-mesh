@@ -390,7 +390,7 @@ describe("W06 I32(b): cursor advance and overflow reset", () => {
 // ─── C01：静音强制 silent 定档（§9.5:1718）──────────────────────────────
 
 describe("W06 C01: mute forces grade = silent", () => {
-  it("muted cold stream: silent + parked, no warm (§7.2 silent×cold)", async () => {
+  it("muted cold stream: silent + queued, no warm (§7.2 silent×cold → 只写 Inbox)", async () => {
     const h = makeHarness();
     await addAcc(h, "A", "available");
     await addAcc(h, "B", "available");
@@ -410,10 +410,11 @@ describe("W06 C01: mute forces grade = silent", () => {
     await h.router.route(msg("A", conv.id, { to: ["B"], clientToken: "m1" }));
 
     const row = h.db
-      .prepare("SELECT grade, state, woke FROM mesh_deliveries WHERE account_id = 'B'")
+      .prepare("SELECT grade, state, woke, parked_reason FROM mesh_deliveries WHERE account_id = 'B'")
       .get() as Record<string, unknown>;
     expect(row.grade).toBe("silent"); // 静音强制 silent（普通消息本应是 followUp/steer）
-    expect(row.state).toBe("parked");
+    expect(row.state).toBe("queued"); // §7.2：silent×cold 只写 Inbox，delivery 留 queued（非终态，warm 后重投）
+    expect(row.parked_reason).toBeNull();
     expect(row.woke).toBe(0);
     expect(h.port.delivered).toHaveLength(0);
     expect(h.port.warmed).toHaveLength(0); // 冷流不因静音消息升温

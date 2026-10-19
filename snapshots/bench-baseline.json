@@ -1,14 +1,20 @@
 {
+  "fingerprint": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "node": "24.19.0",
+    "cpuModel": "Apple M1 Pro"
+  },
   "b-thirty": {
-    "timeMedianMs": 23909.53554099999,
-    "throughputMedian": 20.912158629873915
+    "timeMedianMs": 26497.14045800001,
+    "throughputMedian": 18.869960733783262
   },
   "c-queue": {
-    "timeMedianMs": 2605.6900829999977,
-    "throughputMedian": 383.77549445507134
+    "timeMedianMs": 2718.735250000005,
+    "throughputMedian": 367.8180874728417
   },
   "a-dual": {
-    "timeMedianMs": 269.2502079999995,
-    "throughputMedian": 742.8035115946889
+    "timeMedianMs": 284.8611669999991,
+    "throughputMedian": 702.0964005248234
   }
 }

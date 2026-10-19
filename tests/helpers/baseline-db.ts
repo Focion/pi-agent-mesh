@@ -6,7 +6,7 @@
 // 最后插入一组固定 id 的种子数据——让库处于「早于本次进程已正常跑过迁移的现状」。
 //
 // 种子数据是一棵 C1–C16 全绿的世界（结构与 tests/core/observer.test.ts 的 greenWorld
-// 同源：seq 连续、投递只到成员、caps 值域合规、group 有 dissolve 持有者），并额外
+// 同源：seq 连续、投递只到成员、caps 值域合规、group 有 setCaps 持有者），并额外
 // 覆盖 shared_objects/versions、streams、subscriptions、endpoints 与 queue 投递的 acked
 // 终态，供 g02-baseline-reopen 断言「重开后五类数据行数一致 + 16 条不变量绿」。
 import Database from "better-sqlite3";

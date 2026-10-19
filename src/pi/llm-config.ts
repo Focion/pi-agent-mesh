@@ -67,7 +67,11 @@ export interface RuntimeConfig {
   resources?: RuntimeResources;
 }
 
-/** 按 account.profileRef 选择（LD6）——本轮单 profile 主路径，多 profile 解析后续落地 */
+/**
+ * 按 account.profileRef 选择（LD6）。⚠ 0.1.0 **预留类型**：`profiles` 配置项未落地，
+ * 本版只走单 profile 主路径（default），该类型的解析/选择未实现，仅导出占位。
+ * 不要假设它已被 createMesh 消费——多 profile 解析落地（D4 降级为预留）前只作契约占位。
+ */
 export interface Profile {
   llm?: LlmConfig;
   runtime?: RuntimeConfig;

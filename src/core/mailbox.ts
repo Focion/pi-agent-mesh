@@ -556,11 +556,13 @@ export class MeshMailbox implements Mailbox {
     }
 
     // ── P1 ──
-    // silent + 冷流：不升温，只入 Inbox；§7.2 表规定冷流 silent 落 parked（非终态）
+    // silent + 冷流：不升温，只写 Inbox，delivery 留在 queued（非终态）。§7.2:1440
+    // 「silent 档投递给 cold 流：不唤醒流：只写 mesh_messages + Inbox」；parkDelivery 会让
+    // 预算内（verbatim）正文落入 1h TTL，silent×cold 本不该丢正文，故不 park。warm 后
+    // 由 turn_end 的 drainQueued（§7.6）重投。
     const portState = d.port.status(endpointId);
     if (grade === "silent" && portState.state === "cold") {
       d.store.bumpCounter("cold_hit");
-      this.parkDelivery(live.id, envelope, "ENDPOINT_GONE", endpointId);
       return;
     }
 
@@ -607,6 +609,13 @@ export class MeshMailbox implements Mailbox {
     woke: boolean,
   ): Promise<void> {
     const d = this.d;
+    // D3 canary：正常路径上，忙流合并唤醒会把 woke 降为 false 才到本方法（见
+    // deliverToEndpoint 的 I27 分支），故「woke=true 投向忙流」不该发生；真发生则
+    // 说明合并逻辑被绕过/回归，这里记 wake_per_message_busy（§23.3 恒 0 = 无回归）。
+    // drainQueued 在 turn_end 重投时端点已不忙，不会误报。
+    if (woke && d.port.status(endpointId).busy) {
+      d.store.bumpCounter("wake_per_message_busy");
+    }
     const rendered = this.renderForStream(account, envelope);
     d.store.bumpCounter("verbatim_copies");
     try {

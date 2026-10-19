@@ -30,7 +30,7 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsup",
-    "test": "vitest run",
+    "test": "node scripts/test.mjs",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
     "typecheck:demo": "node node_modules/typescript/bin/tsc -p demo/tsconfig.demo.json",
     "check:imports": "node scripts/check-imports.mjs",

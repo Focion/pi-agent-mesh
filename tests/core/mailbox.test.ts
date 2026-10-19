@@ -570,7 +570,7 @@ describe("mailbox: verbatim budget and paths", () => {
     h.store.close();
   });
 
-  it("silent to a cold stream parks without warming (§7.2 silent×cold → parked)", async () => {
+  it("silent to a cold stream stays queued without warming (§7.2 silent×cold → 只写 Inbox)", async () => {
     const h = makeHarness();
     await addAcc(h, "A", { presence: "available" });
     await addAcc(h, "B", { presence: "available" });
@@ -590,8 +590,8 @@ describe("mailbox: verbatim budget and paths", () => {
       .prepare("SELECT * FROM mesh_deliveries WHERE account_id = 'B'")
       .get() as Record<string, unknown>;
     expect(row.grade).toBe("silent"); // low ⇒ silent（矩阵行 8）
-    expect(row.state).toBe("parked"); // §7.2 表：冷流 silent → parked（非终态，warm 后重投）
-    expect(row.parked_reason).toBe("ENDPOINT_GONE");
+    expect(row.state).toBe("queued"); // §7.2：silent×cold 只写 Inbox，delivery 留 queued（非终态，warm 后重投）
+    expect(row.parked_reason).toBeNull();
     expect(h.port.delivered).toHaveLength(0);
     h.store.close();
   });

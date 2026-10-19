@@ -36,6 +36,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { validateTypesConsumers } from "./lib/consume.mjs";
+import { assertInstalledDepsMatch } from "./lib/deps.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PKG = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
@@ -88,6 +89,13 @@ function requireRun(cmd, argv, label) {
   const below = maj < 22 || (maj === 22 && min < 19);
   if (below) fail(`Node 版本要求 >=22.19.0（C07 engines），当前 ${full}。`);
   process.stdout.write(`[pack] node ${full} · 包 ${PKG.name}@${PKG.version}\n`);
+}
+
+try {
+  assertInstalledDepsMatch();
+  ok("关键依赖实际版本匹配 package.json（T7）");
+} catch (err) {
+  fail(err.message);
 }
 
 // ── 2. 源码门禁 ────────────────────────────────────────────────────────────

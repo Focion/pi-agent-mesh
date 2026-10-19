@@ -24,6 +24,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { validateTypesConsumers } from "./lib/consume.mjs";
+import { assertInstalledDepsMatch } from "./lib/deps.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", "vitest", "vitest.mjs");
@@ -171,6 +172,13 @@ const GATES = {
     fail(`Node 版本要求 >=22.19.0（C07 engines），当前 ${process.versions.node}。`);
   }
   process.stdout.write(`[verify:local] node ${process.versions.node} · suites ${SELECTED.join(",")}\n`);
+}
+
+try {
+  assertInstalledDepsMatch();
+  ok("关键依赖实际版本匹配 package.json（T7）");
+} catch (err) {
+  fail(err.message);
 }
 
 const results = {};

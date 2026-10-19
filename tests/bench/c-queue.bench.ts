@@ -3,7 +3,7 @@
 //   - 每个任务恰好一个成功 ack（queueDepth:acked === 1000）；
 //   - claim 冲突率 ≤15%（无故障下按调度器分派的消费者领取 ⇒ 0 冲突）；
 //   - 超时回收（claim_timeout）为 0；dedup_hit 为 0；
-//   - 纯账本吞吐（claim→ack）≥200 任务/秒，按 5 轮中位数判定。
+//   - 纯账本吞吐（claim→ack）按同机相对基线判定（20% 退化阈值），绝对吞吐只报告。
 // 计划 §6 口径：计数用 host.observer.counters()；通过只读 JOIN 拿到 messageId →
 // 分派消费者/ correlationId（oracle，非直接插入终态行），claim/ack 全走公共 API。
 // 计量真实 createMesh + FakeStreamPort + stub SessionFactory + devMode:false。
@@ -12,7 +12,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, it } from "vitest";
 import Database from "better-sqlite3";
 import { createMesh, type MeshHost, type SessionFactory } from "../../src/index.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
@@ -111,9 +111,9 @@ async function makeScenario(): Promise<Scenario> {
 }
 
 describe("G06 基准 C：8 消费者 1000 任务 claim→ack", () => {
-  it("恰好一次 + 0 冲突 + 吞吐（中位数）≥200/s", async () => {
-    const r = await runBench("c-queue", makeScenario);
-    // 纯账本吞吐按中位数判定（§8.1 测量口径）。
-    expect(r.throughputMedian).toBeGreaterThanOrEqual(200);
+  it("恰好一次 + 0 冲突；吞吐按同机相对基线判定（绝对吞吐仅报告）", async () => {
+    // 正确的硬门槛（恰好一次 / 0 冲突 / 0 超时回收）在 makeScenario().assert() 里逐轮
+    // 钉死；吞吐不再用绝对阈值——由 runBench 按同机相对基线（20% 退化）判定，绝对吞吐只报告。
+    await runBench("c-queue", makeScenario);
   }, 300_000);
 });

@@ -2,6 +2,8 @@
 // G06（本地验收·基准口径，§8.1）：3 预热 + 5 测量、硬门槛每轮必过、吞吐/回归
 // 按中位数、p95 只报告。基线冻结在 snapshots/bench-baseline.json；`--record`
 // （scripts/bench.mjs）首跑生成，非 record 模式把「相对正确基线退化 >20%」当失败。
+// 环境指纹（机器/Node/CPU）由 scripts/bench.mjs 在入口校验：跨机比较直接拒绝，本模块
+// 只做「同机相对基线」的比较，不再对绝对值设门槛。
 //
 // 计量对象一律是真实 createMesh + FakeStreamPort + stub SessionFactory +
 // devMode:false（无 LLM、无网络）；计数用 host.observer.counters() 与
