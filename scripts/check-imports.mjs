@@ -11,7 +11,15 @@ import { join, relative } from "node:path";
 const ROOT = join(import.meta.dirname, "..");
 const SRC = join(ROOT, "src");
 
-const PI_PACKAGES = ["@earendil-works/pi-coding-agent", "@earendil-works/pi-agent-core", "pi-client"];
+const PI_PACKAGES = [
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-agent-core",
+  "pi-client",
+  // R6：迁移到 durable 后，pi 侧的三个新依赖同样要纳入 G1（core 不得 import）门禁
+  "@earendil-works/pi-durable",
+  "@earendil-works/pi-ai",
+  "@earendil-works/chord",
+];
 const CORE_PUBLIC_FOR_PI = new Set(["types.js", "types", "util.js", "util", "contracts.js", "contracts"]);
 const FORBIDDEN_CALLS = [/sendUserMessage\s*\(/, /\.clearQueue\s*\(/, /forkFrom\s*\(/, /\.prompt\s*\(/];
 const BUSINESS_WORDS = [

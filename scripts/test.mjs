@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ═══════════════════════════════════════════════════════════════════════════
 // test —— `npm test` 入口（T6）。在裸 `vitest run` 之上加两道保险：
-//   1. Node 版本守卫：engines 要求 >=22.19.0（C07）。在更低 Node 上，vitest 的
+//   1. Node 版本守卫：engines 要求 >=24.0.0（C07）。在更低 Node 上，vitest 的
 //      fork 池会以 ERR_IPC_CHANNEL_CLOSED 静默退出 0，一个用例都不跑——必须先拦。
 //   2. 用例数兜底：用 vitest 的 json reporter 读回 numTotalTests，即便未来 fork
 //      池再次静默失败，只要实际跑到的用例数为 0 / 缺失，也判失败而非假绿。
@@ -19,9 +19,9 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", "vitest", "vitest.mjs");
 
 const [maj, min] = process.versions.node.split(".").map(Number);
-if (maj < 22 || (maj === 22 && min < 19)) {
+if (maj < 24) {
   process.stderr.write(
-    `\n✗ Node 版本要求 >=22.19.0（C07 engines），当前 ${process.versions.node}。\n` +
+    `\n✗ Node 版本要求 >=24.0.0（C07 engines），当前 ${process.versions.node}。\n` +
       `  在更低 Node 上 vitest fork 池会静默退出 0、一个用例都不跑；请先切换 Node。\n`,
   );
   process.exit(1);
