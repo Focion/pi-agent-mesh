@@ -59,7 +59,7 @@ fi
 
 # 端口合法性
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-  echo "[demo] 非法端口：$PORT（须 1–65535）" >&2
+  echo "[demo] 非法端口：${PORT}（须 1–65535）" >&2
   exit 2
 fi
 
@@ -90,13 +90,15 @@ else
 fi
 
 # ── 4. 端口冲突处理 ──────────────────────────────────────────────────────────
-port_pids() { lsof -ti "tcp:${PORT}" 2>/dev/null || true; }
+# 只取「监听者」：不带 -sTCP:LISTEN 时 lsof 会把已经连上该端口的客户端 socket
+# （IDE/浏览器 helper）也算作占用者，重启时会把它们一起 kill 掉。
+port_pids() { lsof -ti "tcp:${PORT}" -sTCP:LISTEN 2>/dev/null || true; }
 
 if command -v lsof >/dev/null 2>&1; then
   PIDS="$(port_pids)"
   if [[ -n "$PIDS" ]]; then
     if [[ "$NO_KILL" == 1 ]]; then
-      echo "[demo] 端口 ${PORT} 已被占用（PID：$PIDS），--no-kill 已指定，退出。" >&2
+      echo "[demo] 端口 ${PORT} 已被占用（PID：${PIDS}），--no-kill 已指定，退出。" >&2
       exit 1
     fi
     for pid in $PIDS; do

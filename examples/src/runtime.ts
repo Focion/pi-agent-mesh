@@ -617,9 +617,12 @@ export class MeshController {
     this.agentProfiles.set(id, { persona: persona || undefined, isSeed });
     const groupId = await this.ensureChatGroup();
     try {
-      await this.addMember(groupId, id, { by: id });
-    } catch {
-      /* 群成员加入失败不致命 */
+      // 不传 by：groupAddMember 缺省以 @system 邀请（by=自己会先撞 requireMemberCap 的
+      // NOT_A_MEMBER：新成员还没有邀请权，自己把自己加进群本来也说不通）。
+      await this.addMember(groupId, id);
+    } catch (err) {
+      // 入群失败不致命，但不能静默：否则群成员表与花名册不一致，回复会被路由拒。
+      console.warn(`[chat] addMember failed account=${id} group=${groupId}:`, err);
     }
     this.pushSystem(`${acc.displayName} 加入了群聊`);
     return { id, displayName: acc.displayName, persona: persona ?? "", isSeed, state: ep.state };
@@ -792,66 +795,50 @@ export class MeshController {
     );
   }
 
-  /** 用某 agent 的真实 session 生成一句回复（真实 LLM），返回纯文本或 null。 */
   /** 用某 agent 的真实 session 生成一句回复（真实 LLM）。成功回 text，失败回 error（供上层贴系统气泡）。 */
   private async liveReply(responderId: string, prompt: string): Promise<{ text?: string; error?: string }> {
     const ep = this.endpointOfAccount(responderId);
     const session = ep ? (this.sessions.get(ep.id) as LiveReplySession | undefined) : undefined;
-    if (!session) {
+    if (!session?.root || !session.ctx) {
       const reason = `未初始化会话（endpoint=${ep?.id ?? "无"}）`;
       console.warn(`[chat/liveReply] no session for responder=${responderId}`);
       return { error: reason };
     }
-    // 只在 message_end 且 role=assistant 时取「完整」回复：流式增量事件不带 .message，
-    // 早期实现按任意事件覆盖 pending，会把分块残片（如单个「？」）当成回复贴进群。
-    let assistantText: string | null = null;
-    let eventCount = 0;
-    let messageEndCount = 0;
-    let unsub: () => void = () => {};
-    try {
-      unsub = session.subscribe((ev) => {
-        eventCount++;
-        if (ev.type === "message_end") messageEndCount++;
-        if (ev.type === "message_end" && ev.message?.role === "assistant") {
-          const t = contentToText(ev.message.content);
-          if (t && t.trim()) assistantText = t.trim();
-        }
-      });
-    } catch (err) {
-      console.warn(`[chat/liveReply] subscribe threw for ${responderId}:`, err);
-      unsub = () => {};
-    }
     const t0 = Date.now();
     try {
-      // 触发一整轮并等待完成：followUp/steer 只入队（空闲 session 不会起轮，
-      // waitForIdle 会秒退），prompt() 才真正调用 LLM 并 await 到 assistant 落定。
-      await session.prompt(prompt);
-      const reply = (assistantText ?? session.getLastAssistantText?.() ?? "").trim();
+      // durable 语义：input 在空闲时立即起轮，wait() 直到这条提交落定（done/unanswered）。
+      const sub = await session.root.submit({ type: "input", content: prompt }, session.ctx);
+      const settled = await sub.wait(session.ctx);
+      if (settled.status !== "done" || !settled.answer) {
+        const detail = `未得到回答（status=${settled.status}${settled.reason ? `, reason=${settled.reason}` : ""}）`;
+        console.warn(`[chat/liveReply] unanswered responder=${responderId} ms=${Date.now() - t0} ${detail}`);
+        return { error: detail };
+      }
+      // 落定后按 answer entry 精确读本轮助手消息（durable 没有 message_end 事件通道，
+      // 流式增量不属于这里的取数方式：本轮完整文本在 entry.model 里）。
+      const page = await session.root.entries({ maxEntryId: settled.answer }, 1, undefined, session.ctx);
+      const entry = page.items[0];
+      let reply = assistantTextOf(entry);
+      if (!reply) {
+        // 兜底：answer entry 没带 model 时，从模型上下文里取最后一条 assistant 消息。
+        const view = await session.root.context(session.ctx);
+        const msgs = view.messages ?? [];
+        for (let i = msgs.length - 1; i >= 0 && !reply; i--) {
+          if (msgs[i]?.role === "assistant") reply = contentToText(msgs[i]?.content).trim();
+        }
+      }
       const firstPara = reply.split(/\n{2,}/)[0]?.trim() ?? "";
       if (!firstPara) {
-        // prompt() 正常 resolve 但没抓到 assistant 文本 —— 事件流可能压根没走到 message_end，
-        // 或到了但 content 形状不是 {text}。把诊断细节同时打日志和回上层，便于用户看到。
-        const last = session.getLastAssistantText?.();
-        const detail =
-          `空回复（events=${eventCount}, messageEnds=${messageEndCount}, ` +
-          `assistantText=${assistantText ? "有" : "无"}, getLastAssistantText=${last ? "有" : "无"}）`;
+        const detail = `空回复（answer=${settled.answer}, kind=${entry?.kind ?? "无"}, model=${entry?.model?.length ?? 0}）`;
         console.warn(`[chat/liveReply] empty responder=${responderId} ms=${Date.now() - t0} ${detail}`);
         return { error: detail };
       }
+      console.log(`[chat/liveReply] ok responder=${responderId} ms=${Date.now() - t0} chars=${firstPara.length}`);
       return { text: firstPara };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[chat/liveReply] threw responder=${responderId} ms=${Date.now() - t0} events=${eventCount} messageEnds=${messageEndCount}`,
-        err,
-      );
+      console.error(`[chat/liveReply] threw responder=${responderId} ms=${Date.now() - t0}`, err);
       return { error: msg };
-    } finally {
-      try {
-        unsub();
-      } catch {
-        /* ignore */
-      }
     }
   }
 
@@ -915,14 +902,50 @@ function contentToText(content: unknown): string {
 }
 
 /**
- * demo 群聊接龙用到的 pi AgentSession 结构子集（真机由 createAssembledSessionFactory 产出）。
- * 事件与方法的形状对齐 pi-coding-agent/dist/core/agent-session：仅 message_end 事件
- * 携带完整的 event.message；waitForIdle/getLastAssistantText 是取整轮回复的稳定原语。
+ * demo 群聊接龙用到的 durable session 结构子集（真机由 createAssembledSessionFactory 产出）。
+ * 注意：这里的 session 不是 pi AgentSession，而是 { ctx, root, harness, close } 包装 ——
+ * 起轮 / 落定 / 读回复一律走 Conversation（root），与 src/pi/durable-port.ts 同一套原语：
+ * submit({type:"input"}) → Submission.wait() → answer EntryId → EntryRecord.model。
  */
 interface LiveReplySession {
-  subscribe(
-    listener: (event: { type?: string; message?: { role?: string; content?: unknown } }) => void,
-  ): () => void;
-  prompt(text: string, options?: { streamingBehavior?: "steer" | "followUp" }): Promise<void>;
-  getLastAssistantText?(): string | undefined;
+  ctx: unknown;
+  root: {
+    readonly id: string;
+    submit(
+      draft: { type: "input"; content: string },
+      ctx: unknown,
+    ): Promise<{
+      wait(ctx: unknown): Promise<{ status: "done" | "unanswered"; answer?: string; reason?: string }>;
+    }>;
+    entries(
+      query: { maxEntryId?: string },
+      limit: number,
+      cursor: undefined,
+      ctx: unknown,
+    ): Promise<{ items: readonly LiveReplyEntry[] }>;
+    context(ctx: unknown): Promise<{ messages?: readonly LiveReplyMessage[] }>;
+  };
+}
+
+/** durable entry 里与本用例相关的字段。 */
+interface LiveReplyEntry {
+  readonly id: string;
+  readonly kind: string;
+  readonly model?: readonly LiveReplyMessage[];
+}
+
+interface LiveReplyMessage {
+  readonly role?: string;
+  readonly content?: unknown;
+}
+
+/** 从一条 entry 的 model 消息里取最后一条非空 assistant 文本。 */
+function assistantTextOf(entry: LiveReplyEntry | undefined): string {
+  const msgs = entry?.model ?? [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role !== "assistant") continue;
+    const t = contentToText(msgs[i]?.content).trim();
+    if (t) return t;
+  }
+  return "";
 }
