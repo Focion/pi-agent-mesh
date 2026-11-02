@@ -100,7 +100,7 @@ function defaultPolicies(store: SqliteStore, registry: MeshRegistry): Policies {
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
   };
@@ -206,7 +206,7 @@ async function addHotEndpoint(h: MbHarness, id: string): Promise<Endpoint> {
   const ep = await h.registry.registerEndpoint({
     accountId: id,
     topology: { kind: "unified" },
-    piSessionId: "pi-" + id,
+    runtimeRef: "pi-" + id,
   });
   h.registry.updateEndpointState(ep.id, "hot");
   return ep;

@@ -135,7 +135,6 @@ const HANDLERS: Record<string, Handler> = {
       ...(a.triggerTurn === true ? { triggerTurn: true } : {}),
     }),
   injectContext: (c, a) => c.injectContext(str(a.endpointId), str(a.text)),
-  beforeClearQueue: (c, a) => c.beforeClearQueue(str(a.endpointId)),
   toolSet: (c, a) => c.toolSet(str(a.endpointId), arr(a.only).length ? arr(a.only) : undefined),
 
   // Observer（只读）
@@ -157,7 +156,7 @@ const HANDLERS: Record<string, Handler> = {
   inboxOf: (c, a) => c.observer.inboxOf(str(a.accountId)),
   conversationsOf: (c, a) => c.observer.conversationsOf(str(a.accountId)),
   streamEntries: (c, a) =>
-    c.observer.streamEntries(str(a.piSessionId), {
+    c.observer.streamEntries(str(a.runtimeRef), {
       ...(num(a.sinceSeq) !== null ? { sinceSeq: Number(a.sinceSeq) } : {}),
     }),
   counters: (c, a) => c.observer.counters(arr(a.names).length ? arr(a.names) : undefined, str2(a.since)),
@@ -207,10 +206,12 @@ export async function dispatch(
   cmd: string,
   args: Record<string, unknown>,
 ): Promise<RpcResult> {
-  const handler = HANDLERS[cmd];
-  if (!handler) {
+  // A35：hasOwn 判属，防 `POST /api/constructor` / `__proto__` 取到 Object.prototype 上的
+  // 成员（否则 handler(controller) 会对含 LLM 密钥的 controller 跑 `Object(controller)`）。
+  if (!Object.prototype.hasOwnProperty.call(HANDLERS, cmd)) {
     return { ok: false, error: { name: "UnknownCommand", message: `no such command: ${cmd}` } };
   }
+  const handler = HANDLERS[cmd]!;
   try {
     const result = await handler(controller, args ?? {});
     return { ok: true, result };

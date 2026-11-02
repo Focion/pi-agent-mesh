@@ -21,7 +21,7 @@ import { openTestDb } from "../helpers/db.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "sub-test" }),
+  create: async () => ({ session: {}, runtimeRef: "sub-test" }),
   open: async () => ({ session: {} }),
 };
 
@@ -35,7 +35,7 @@ async function makeMesh(extraPolicies: Partial<Policies> = {}): Promise<{
     dbPath: join(dir, "mesh.db"),
     policies: { sessionFactory: stubSessionFactory, ...extraPolicies },
     streamPort: port,
-    limits: { handoffTimeoutMs: 1000 },
+    limits: {},
     devMode: true,
   });
   return { host, port };
@@ -157,6 +157,25 @@ describe("I13/I17: subscription & read authorization", () => {
       expect(history.error).toMatchObject({ code: "HISTORY_FORBIDDEN" });
       const members = await runTool(host, epB, "mesh_members", { conversationId: g.id });
       expect(members.error).toMatchObject({ code: "HISTORY_FORBIDDEN" });
+    } finally {
+      await host.close();
+    }
+  });
+
+  it("mesh_conversation_admin unsubscribe returns ok (no ARG_INVALID fallthrough, A23)", async () => {
+    const { host } = await makeMesh();
+    try {
+      await addToolAccount(host, "P");
+      const epB = await addToolAccount(host, "B");
+      const topic = await host.createConversation({ type: "topic", creator: "P" });
+      await host.subscribe(topic.id, "B");
+      // 修复前：unsubscribe 分支缺 return，落到 default 抛 ARG_INVALID（退订其实已生效）。
+      const res = await runTool(host, epB, "mesh_conversation_admin", {
+        conversationId: topic.id,
+        op: "unsubscribe",
+      });
+      expect(res.error).toBeUndefined();
+      expect(res.ok).toBe(true);
     } finally {
       await host.close();
     }

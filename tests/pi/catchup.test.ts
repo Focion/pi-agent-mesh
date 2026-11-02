@@ -20,37 +20,12 @@ import type {
   SessionFactory,
 } from "../../src/core/types.js";
 import { DefaultRenderer } from "../../src/core/renderer.js";
-import { PiStreamPort } from "../../src/pi/stream-port.js";
-import { loadPiSdk } from "../../src/pi/pi-sdk.js";
-import {
-  createFaux,
-  registerFauxInto,
-  type FauxCore,
-} from "../helpers/pi-session.js";
+import { PiStreamPort } from "../../src/pi/durable-port.js";
+import { createPiSessionFactory } from "../../src/pi/session-factory.js";
+import { createFaux, type Faux } from "../helpers/pi-session.js";
 
-async function createTestFactory(faux: FauxCore, dir: string): Promise<SessionFactory> {
-  const pi = await loadPiSdk();
-  const make = async (id: string) => {
-    const sm = pi.SessionManager.inMemory(join(dir, id));
-    const { session } = await pi.createAgentSession({
-      cwd: dir,
-      agentDir: dir,
-      model: faux.getModel() as never,
-      noTools: "all",
-      sessionManager: sm,
-    });
-    registerFauxInto(session, faux);
-    return { session, piSessionId: `mem:${id}` };
-  };
-  return {
-    async create(ctx) {
-      return make(ctx.endpoint.id);
-    },
-    async open(ctx) {
-      const r = await make(ctx.endpoint.id);
-      return { session: r.session };
-    },
-  };
+async function createTestFactory(faux: Faux, dir: string): Promise<SessionFactory> {
+  return createPiSessionFactory({ stateDir: dir, models: faux.models, model: faux.model });
 }
 
 function makeAccount(id: string): Account {
@@ -63,7 +38,7 @@ function makeEndpoint(id: string, accountId: string): Endpoint {
     accountId,
     topology: { kind: "unified" },
     state: "cold",
-    piSessionId: null,
+    runtimeRef: null,
     lease: "shared",
     leaseUntil: null,
     lastActiveAt: null,
@@ -71,7 +46,7 @@ function makeEndpoint(id: string, accountId: string): Endpoint {
 }
 
 let dir: string;
-let faux: FauxCore;
+let faux: Faux;
 let port: PiStreamPort;
 let accounts: Map<string, Account>;
 let endpoints: Map<string, Endpoint>;
@@ -96,7 +71,7 @@ beforeEach(async () => {
     },
     setEndpointSession: (id, sid) => {
       const e = endpoints.get(id);
-      if (e) e.piSessionId = sid;
+      if (e) e.runtimeRef = sid;
     },
     setEndpointLease: () => {},
     setEndpointLock: () => {},
@@ -118,8 +93,8 @@ function addEndpoint(id = "ep_b", accountId = "acct_b"): Endpoint {
   return ep;
 }
 
-describe("CATCHUP 正文落真实会话（I10）：custom_message 而非 note", () => {
-  it("renderCatchup 产物经 port.deliver 落为持久化 custom_message，含 <<<CATCHUP 包裹体", async () => {
+describe("CATCHUP 正文落真实会话（I10）：mesh.msg 而非 note", () => {
+  it("renderCatchup 产物经 port.deliver 落为持久化 mesh.msg，含 <<<CATCHUP 包裹体", async () => {
     const ep = addEndpoint();
     await port.warm(ep.id, "shared");
 
@@ -146,12 +121,12 @@ describe("CATCHUP 正文落真实会话（I10）：custom_message 而非 note", 
     };
     await port.deliver(ep.id, body, synEnv, "followUp", { triggerTurn: false });
 
-    // 唯一落的是 custom_message（含捕获正文），不是 custom note
+    // 唯一落的是 mesh.msg（含捕获正文），不是 note
     const evt = entries.find((e) => e.envelopeId === "syn-catchup");
     expect(evt).toBeDefined();
-    expect(evt!.entryType).toBe("custom_message");
+    expect(evt!.entryType).toBe("mesh.msg");
     const raw = JSON.parse(evt!.rawJson) as Record<string, unknown>;
-    expect(raw.type).toBe("custom_message");
+    expect(raw.kind).toBe("mesh.msg");
     // 正文以 <<<CATCHUP …>>> 包裹体进入条目（先持久化，再进后续输入）
     expect(evt!.rawJson).toContain("<<<CATCHUP");
     expect(evt!.rawJson).toContain("<<<END CATCHUP>>>");

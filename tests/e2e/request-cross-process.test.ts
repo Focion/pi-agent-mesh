@@ -21,7 +21,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "e2e-session" }),
+  create: async () => ({ session: {}, runtimeRef: "e2e-session" }),
   open: async () => ({ session: {} }),
 };
 
@@ -44,7 +44,7 @@ async function makeHost(
     streamPort: port,
     transport: "sameHost",
     transportOptions,
-    limits: { handoffTimeoutMs: 1000 },
+    limits: {},
     devMode: true,
   });
   await host.registerAccount({

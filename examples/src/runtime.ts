@@ -11,9 +11,9 @@
 // 群聊「接龙」由控制器显式驱动：发消息后，群里其它 agent 各自用真实 session
 // 生成一句回复，再经 host.send 回发到群——全部走真实 LLM，没有任何 canned 文案。
 //
-// MeshHost 没有「列出端点/会话」「读端点 piSessionId」的公开接口，故本控制器：
+// MeshHost 没有「列出端点/会话」「读端点 runtimeRef」的公开接口，故本控制器：
 //  - 自记 accounts/endpoints/conversations/presence/sinkModes 投影；
-//  - 给 sessionFactory 包一层以捕获每端点 piSessionId 与真实 session 对象；
+//  - 给 sessionFactory 包一层以捕获每端点 runtimeRef 与真实 session 对象；
 //  - 用 endpoint_state_changed / presence_changed 事件维持最新投影。
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -109,24 +109,24 @@ export class MeshController {
   async init(): Promise<void> {
     // 本面板需要拿到每个端点的真实 pi AgentSession（群聊接龙由控制器显式驱动
     // session.prompt 生成回复），故走高级路径：用缺省装配的工厂（完全隔离 LD2）
-    // 包一层捕获 piSessionId 与 session 对象，再经 policies.sessionFactory 交给
+    // 包一层捕获 runtimeRef 与 session 对象，再经 policies.sessionFactory 交给
     // createMesh。不直接走 createMesh({ llm, runtime })——那会隐藏 session 内部。
     const base = await createAssembledSessionFactory({
       stateDir: this.config.stateDir,
       llm: this.resolvedLlm,
       runtime: this.config.runtime,
     });
-    // 包一层捕获 piSessionId 与真实 session 对象（接龙回复要用）。
+    // 包一层捕获 runtimeRef 与真实 session 对象（接龙回复要用）。
     const controller = this;
     const sessionFactory: SessionFactory = {
       async create(ctx) {
         const r = await base.create(ctx);
-        controller.captureSession(ctx.endpoint.id, r.piSessionId);
+        controller.captureSession(ctx.endpoint.id, r.runtimeRef);
         controller.sessions.set(ctx.endpoint.id, r.session);
         return r;
       },
       async open(ctx) {
-        controller.captureSession(ctx.endpoint.id, ctx.piSessionId);
+        controller.captureSession(ctx.endpoint.id, ctx.runtimeRef);
         const r = await base.open(ctx);
         controller.sessions.set(ctx.endpoint.id, r.session);
         return r;
@@ -144,9 +144,9 @@ export class MeshController {
     await this.seedChatRoom();
   }
 
-  private captureSession(endpointId: string, piSessionId: string): void {
+  private captureSession(endpointId: string, runtimeRef: string): void {
     const ep = this.endpoints.get(endpointId);
-    if (ep) ep.piSessionId = piSessionId;
+    if (ep) ep.runtimeRef = runtimeRef;
   }
 
   async dispose(): Promise<void> {
@@ -495,10 +495,6 @@ export class MeshController {
     this.host.injectContext(endpointId, text);
   }
 
-  beforeClearQueue(endpointId: string): Promise<void> {
-    return this.host.beforeClearQueue(endpointId);
-  }
-
   toolSet(endpointId: string, only?: string[]): Array<Record<string, unknown>> {
     const defs = this.host.toolSet(endpointId, only as never);
     // ToolDefinition.execute 是函数，不可序列化 —— 只回传元数据。
@@ -545,7 +541,7 @@ export class MeshController {
         accountId: e.accountId,
         state: e.state,
         lease: e.lease,
-        piSessionId: e.piSessionId,
+        runtimeRef: e.runtimeRef,
       })),
     };
   }

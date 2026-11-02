@@ -84,7 +84,7 @@ export interface Registry {
   getEndpoint(id: EndpointId): Endpoint | undefined;
   endpointsOf(accountId: AccountId): Endpoint[];
   updateEndpointState(id: EndpointId, state: EndpointState): void;
-  setEndpointSession(id: EndpointId, piSessionId: string): void;
+  setEndpointSession(id: EndpointId, runtimeRef: string): void;
   setEndpointLease(id: EndpointId, lease: MeshLease, until: string | null): void;
   /** §8.3/§19.4：warm 落库 lock_path 归属，evict 清空（null）。 */
   setEndpointLock(id: EndpointId, lockPath: string | null): void;
@@ -166,14 +166,12 @@ export interface Mailbox {
   }): void;
   /** StreamPort.onTurnEnd 回调：该轮已 delivered 的 → consumed，未读清零 */
   handleTurnEnd(endpointId: EndpointId): void;
-  /** 周期清扫：parked TTL、handoff 超时回退、溢出折叠、seq 缺口超时 */
+  /** 周期清扫：parked TTL、routed 滞留重投、溢出折叠、seq 缺口超时 */
   sweep(nowMs?: number): Promise<void>;
   /** warm 成功后：该端点 parked → queued 并重投 */
   retryEndpoint(endpointId: EndpointId): Promise<void>;
   /** 账号级重投（sink handler 注册晚于投递到达等场景）：该账号 parked → queued 并重投 */
   retryAccount(accountId: AccountId): Promise<void>;
-  /** I22：clearQueue 前把 delivered 未 consumed 回退为 queued */
-  beforeClearQueue(endpointId: EndpointId): Promise<void>;
   /** sink/external 的消费确认（无 turn_end，§12.2 ④） */
   markConsumed(deliveryId: DeliveryId): Promise<void>;
   /** §8.4 崩溃恢复：delivered P1 非 queue 行按 entry_id 对真实 session 双向核对——
@@ -187,8 +185,6 @@ export interface Mailbox {
   /** §7.6：P2 按「实际进入某轮最终输入」确认——该端点注入体被 context_with_system 观测后，
    *  把该端点全部 path='P2' 且 queued 的行推为 delivered（无 entry_id；turn_end 再 consumed）。 */
   confirmInjection(endpointId: EndpointId): void;
-  /** 背压自持计数：该端点 queued+delivered 行数（F3） */
-  inFlightCount(endpointId: EndpointId): number;
 
   // ── queue（§17）：claim / ack / 租约回收 ──
   /** delivered → claimed，claim 归属写入 delivery 列 claimed_by/claimed_at（正文 payload 不变，A1）；
@@ -244,7 +240,7 @@ export interface ToolContext {
   conversations(filter: { type?: ConversationKind; hasUnread?: boolean }): Promise<ConversationSummary[]>;
   members(conversationId: string): Promise<MemberRow[]>;
   contacts(query?: string): Promise<ContactRow[]>;
-  lookup(q: { query?: string; capabilities?: string[]; limit?: number }): Promise<Account[]>;
+  lookup(q: { query?: string; capabilities?: string[]; conversationId?: string; limit?: number }): Promise<Account[]>;
   createConversation(input: Omit<CreateConversationInput, "creator">): Promise<Conversation>;
   conversationAdmin(conversationId: string, op: ConversationAdminOp): Promise<void>;
   /** 应答 / 队列 / 共享空间（ToolContext 面）：拒绝统一 reject，工具层转结构化错误 */

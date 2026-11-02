@@ -1,313 +1,256 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// createPiSessionFactory / createAssembledSessionFactory：SessionFactory 的两种装配。
+// createPiSessionFactory / createAssembledSessionFactory：SessionFactory 的两种装配
+// （durable 后端）。与旧 pi-coding-agent 版同构：宿主可用自己的工厂完全替换，本文件
+// 不是架构假设。
 //
-// 约定（宿主可用自己的工厂完全替换，本文件不是架构假设）：
-//  - 每端点一个 cwd：<stateDir>/endpoints/<endpointId>，session 目录其下 sessions/
-//  - piSessionId 存的是 session 文件路径（对 mesh-core 是不透明字符串，
-//    open 时直接喂给 SessionManager.open）
+// durable 约定（迁移 MD1 / R9）：
+//  - 每端点一个 cwd：<stateDir>/endpoints/<endpointId>，storage 文件 fixed 名 storage.sqlite
+//  - runtimeRef 包装 storage 文件路径 + conversationId（对 mesh-core 是不透明字符串，MD7）
+//  - 端点锁由 PiStreamPort 在 warm 时抢、且先于本工厂的 Harness.open（R9：storage 无
+//    跨进程锁，锁是正确性前提，不再是可选优化）
 //
 // 两种路径（LD1）：
-//  - createPiSessionFactory（高级/低层）——宿主自备 model/agentDir，负责自己的
-//    pi 配置；mesh 只负责 tool 白名单（L5）与 session 装配。
-//  - createAssembledSessionFactory（缺省装配）——由 llm/runtime 配置做完全隔离
-//    （LD2）：内存凭据库 + modelsPath:null + 内存 SettingsManager +
-//    DefaultResourceLoader 全 no*，绝不读 ~/.pi/agent 的 models/auth/settings
-//    与 extension/skill/prompt/theme/context 文件，也不回退 ambient env（LD4）。
+//  - createPiSessionFactory（高级/低层）——宿主自备 pi-ai Models 与 ModelRef，负责自己的
+//    凭据与 provider；mesh 只负责工具桥接（L5 退化为「mesh 工具恒注入」）与 session 装配。
+//  - createAssembledSessionFactory（缺省装配）——由 llm/runtime 配置做完全隔离（LD2）：
+//    buildModels 内存凭据库 seed 显式 key，durable 本身不读任何配置文件，隔离论证比 coding-agent
+//    时代更短（无 models.json / auth.json / settings / extensions / skills / prompts / themes）。
 //
-// 工具白名单语义（L5，实测 pi 1.1.0）：tools 白名单会过滤掉未列名的一切工具，
-// 包括 customTools；noTools:"all" 连 customTools 也禁掉；noTools:"builtin" 仍保留
-// ast_grep/lens/mcp/web_search 等扩展内建。要得到「内建白名单 + mesh 工具」，
-// 唯一正确配方是 tools = [...builtinTools, ...customToolNames]。
+// F-G：durable 没有宿主级缺省模型，模型只在每个 conversation 的 pi.agent 文档；丢了会在
+// 改 mesh 的 llm 配置后对已有端点不生效。故首次 create 走 root(ctx,{agent})，此后每次 open
+// 都对 root configure({model, thinkingLevel, tools, modelTools}) 重应用。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import type { HarnessSettings, ModelRef } from "@earendil-works/pi-durable";
+import type { ModelThinkingLevel, Models } from "@earendil-works/pi-ai";
 import type { Endpoint, SessionFactory, ToolDefinition } from "../core/types.js";
-import { loadPiSdk, type PiSdk } from "./pi-sdk.js";
-import { MeshConfigError, type ResolvedLlm, type RuntimeConfig } from "./llm-config.js";
+import { loadDurableSdk } from "./durable-sdk.js";
+import { buildModels, bridgeTools, type DurableSession } from "./durable-runtime.js";
+import { validateRuntimeConfig, type ResolvedLlm, type RuntimeConfig } from "./llm-config.js";
 
-// ─── 内存凭据库（实现 pi-ai CredentialStore 接口；不依赖 pi-ai 运行时）─────────
-// 空的即可：显式 secret 经 ModelRuntime.setRuntimeApiKey 进 RuntimeCredentials
-// 覆盖层，本库只是挡住「缺省 DefaultAuthStorage 回读 ~/.pi/agent/auth.json」的
-// 隔离漏洞（ModelRuntime.create 缺省 credentials 会去读 authPath 文件）。
-interface MeshCredential {
-  type: "api_key" | "oauth";
-  key?: string;
-  env?: Record<string, string>;
-  [k: string]: unknown;
+/** durable storage 文件名（每端点固定，锁与 reopen 都按它定位）。 */
+const STORAGE_FILENAME = "storage.sqlite";
+
+/** MD7：runtimeRef 是 core 看待的不透明字符串，pack 了 storagePath + conversationId。
+ *  mesh-core 只把它当 key，mesh-pi 在这里编解码；每个端点恒用 root（conversationId=1）。 */
+interface RuntimeRefPayload {
+  storagePath: string;
+  conversationId: number;
 }
 
-class MemoryCredentialStore {
-  private map = new Map<string, MeshCredential>();
-  async read(id: string): Promise<MeshCredential | undefined> {
-    return this.map.get(id);
+function encodeRuntimeRef(storagePath: string, conversationId: number): string {
+  return JSON.stringify({ storagePath, conversationId });
+}
+
+/** 解码 runtimeRef；解不出（损坏 / 旧库裸路径）时把整串当作 storagePath 兜底。 */
+function decodeRuntimeRef(runtimeRef: string | undefined): RuntimeRefPayload | undefined {
+  if (!runtimeRef) return undefined;
+  try {
+    const p = JSON.parse(runtimeRef) as Partial<RuntimeRefPayload>;
+    if (typeof p.storagePath === "string" && typeof p.conversationId === "number") {
+      return p as RuntimeRefPayload;
+    }
+  } catch {
+    // fall through：旧数据可能只是裸路径。
   }
-  async list(): Promise<Array<{ providerId: string; type: "api_key" | "oauth" }>> {
-    return [...this.map.entries()].map(([providerId, c]) => ({ providerId, type: c.type }));
-  }
-  async modify(
-    id: string,
-    fn: (cur: MeshCredential | undefined) => Promise<MeshCredential | undefined>,
-  ): Promise<MeshCredential | undefined> {
-    const next = await fn(this.map.get(id));
-    if (next === undefined) this.map.delete(id);
-    else this.map.set(id, next);
-    return next;
-  }
-  async delete(id: string): Promise<void> {
-    this.map.delete(id);
-  }
+  return { storagePath: runtimeRef, conversationId: 1 };
 }
 
-// ─── 工具白名单（L5）───────────────────────────────────────────────────────
-
-function toolAllowlist(builtinTools: string[] | undefined, customTools: unknown[]): string[] {
-  const meshNames = customTools
-    .map((t) => (t as { name?: unknown } | undefined)?.name)
-    .filter((n): n is string => typeof n === "string" && n !== "");
-  return [...(builtinTools ?? []), ...meshNames];
+/** 端点 storage 文件路径（缺省 cwd 约定：<stateDir>/endpoints/<id>）。 */
+export function endpointStoragePath(opts: {
+  stateDir: string;
+  endpoint: Endpoint;
+  cwdFor?(endpoint: Endpoint): string;
+}): string {
+  const cwd = opts.cwdFor?.(opts.endpoint) ?? join(opts.stateDir, "endpoints", opts.endpoint.id);
+  return join(cwd, STORAGE_FILENAME);
 }
 
-// ─── mesh 工具 → pi 自定义工具桥接（§10.2 / M4）────────────────────────────
-// mesh 的 ToolDefinition.execute 返回 { content: string | Array<{type:"text",text}> }；
-// pi 1.1.0 的 AgentToolResult.content 恒为 (TextContent|ImageContent)[]。把 content 为
-// 字符串时归一为单段文本块数组，使工具结果既能被 pi 运行时的 `.some()` 消费，又不改动
-// mesh 公共契约（host.toolSet / parseToolContent 仍兼容两种形态）。桥接只发生在
-// pi 边界，不回流 core（core-only 用户不加载本模块）。
-function asPiCustomTools(customTools: unknown[]): unknown[] {
-  return customTools.map((raw) => {
-    const t = raw as ToolDefinition;
-    return {
-      ...t,
-      async execute(
-        toolCallId: string,
-        params: Record<string, unknown>,
-        signal: AbortSignal | undefined,
-        onUpdate: undefined,
-        ctx: unknown,
-      ) {
-        const r = await t.execute(toolCallId, params, signal, onUpdate, ctx);
-        return {
-          ...r,
-          content:
-            typeof r.content === "string"
-              ? [{ type: "text", text: r.content }]
-              : r.content,
-        };
-      },
-    };
-  });
-}
-
-/** 资源开关：缺省 false（隔离）；仅显式 true 才继承（LD2） */
-function resourceEnabled(resources: RuntimeConfig["resources"], key: keyof NonNullable<RuntimeConfig["resources"]>): boolean {
-  return resources?.[key] === true;
-}
-
-/** pi SettingsManager 实例（构造器私有，用静态 inMemory 的返回类型取得）。 */
-type PiSettingsManager = ReturnType<PiSdk["SettingsManager"]["inMemory"]>;
-
-/** 内存 SettingsManager：注入 retry/timeout/compaction 白名单，绝不落盘 */
-function buildSettings(
-  pi: PiSdk,
-  runtime: RuntimeConfig | undefined,
-): PiSettingsManager {
-  const retry = runtime?.retry
-    ? {
-        ...(runtime.retry.enabled !== undefined ? { enabled: runtime.retry.enabled } : {}),
-        ...(runtime.retry.maxRetries !== undefined ? { maxRetries: runtime.retry.maxRetries } : {}),
-        ...(runtime.retry.baseDelayMs !== undefined ? { baseDelayMs: runtime.retry.baseDelayMs } : {}),
-        ...(runtime.retry.maxAgentDelayMs !== undefined ? { maxAgentDelayMs: runtime.retry.maxAgentDelayMs } : {}),
-      }
-    : undefined;
-  const retryMerged =
-    retry || runtime?.timeout !== undefined
-      ? { ...(retry ?? {}), ...(runtime?.timeout !== undefined ? { provider: { timeoutMs: runtime.timeout } } : {}) }
-      : undefined;
-  const compaction = runtime?.compaction
-    ? {
-        ...(runtime.compaction.enabled !== undefined ? { enabled: runtime.compaction.enabled } : {}),
-        ...(runtime.compaction.reserveTokens !== undefined ? { reserveTokens: runtime.compaction.reserveTokens } : {}),
-        ...(runtime.compaction.keepRecentTokens !== undefined ? { keepRecentTokens: runtime.compaction.keepRecentTokens } : {}),
-      }
-    : undefined;
-  const settings: Record<string, unknown> = {};
-  if (retryMerged) settings.retry = retryMerged;
-  if (compaction) settings.compaction = compaction;
-  return pi.SettingsManager.inMemory(settings as never);
+/** runtime.retry/timeout/compaction → durable HarnessSettings（settings.{retry,stream,compaction}）。
+ *  HarnessSettings 的字段是 readonly，故整对象用字面量 + 条件展开构造，不先建空对象再逐个赋值。 */
+function buildDurableSettings(runtime: RuntimeConfig | undefined): HarnessSettings | undefined {
+  if (!runtime) return undefined;
+  const retry = runtime.retry;
+  const compaction = runtime.compaction;
+  const timeout = runtime.timeout;
+  if (!retry && !compaction && timeout === undefined) return undefined;
+  return {
+    ...(retry
+      ? {
+          retry: {
+            ...(retry.enabled !== undefined ? { enabled: retry.enabled } : {}),
+            ...(retry.maxRetries !== undefined ? { maxRetries: retry.maxRetries } : {}),
+            ...(retry.baseDelayMs !== undefined ? { baseDelayMs: retry.baseDelayMs } : {}),
+            ...(retry.maxAgentDelayMs !== undefined ? { maxAgentDelayMs: retry.maxAgentDelayMs } : {}),
+          },
+        }
+      : {}),
+    ...(timeout !== undefined ? { stream: { timeoutMs: timeout } } : {}),
+    ...(compaction
+      ? {
+          compaction: {
+            ...(compaction.enabled !== undefined ? { enabled: compaction.enabled } : {}),
+            ...(compaction.reserveTokens !== undefined ? { reserveTokens: compaction.reserveTokens } : {}),
+            ...(compaction.keepRecentTokens !== undefined ? { keepRecentTokens: compaction.keepRecentTokens } : {}),
+          },
+        }
+      : {}),
+  };
 }
 
 /**
- * 缺省装配：由 llm/runtime 配置产出完全隔离的 SessionFactory（W00-L4/L5）。
- * 装配是异步的（惰性加载 pi + 建 ModelRuntime + 解析模型），失败即 fail-fast。
+ * 每端点装配一个 DurableSession：开 storage → Harness.open → resume → root。
+ * create 用 root(ctx,{agent}) 首建；open 用 root(ctx) + configure 重应用（F-G）。
+ * chord Context 只在 src/pi/ 内构造（sdk.BackgroundContext），绝不外泄到 core。
+ */
+async function assemble(
+  sdk: Awaited<ReturnType<typeof loadDurableSdk>>,
+  models: Models,
+  modelRef: ModelRef,
+  thinkingLevel: ModelThinkingLevel | undefined,
+  settings: HarnessSettings | undefined,
+  tools: ToolDefinition[],
+  endpoint: Endpoint,
+  storagePath: string,
+  mode: "create" | "open",
+  onReport?: (error: unknown) => void,
+): Promise<{ session: DurableSession; runtimeRef: string }> {
+  const ctx = sdk.BackgroundContext;
+  const registry = sdk.durable.createRegistry();
+  const bridged = bridgeTools(tools, sdk);
+  if (bridged.length > 0) {
+    registry.install(sdk.durable.defineExtension({ name: "pi-agent-mesh:mesh-tools", tools: bridged }));
+  }
+
+  await mkdir(dirname(storagePath), { recursive: true });
+  const storage = await sdk.openNodeSqliteStorage(storagePath);
+  const harness = await sdk.durable.Harness.open(
+    storage,
+    {
+      models,
+      registry,
+      ...(settings ? { settings } : {}),
+      // MD8：durable 的失败通道（task_faulted / task_parked / extension_error 等非致命失败）。
+      ...(onReport ? { onReport } : {}),
+    },
+    ctx,
+  );
+  harness.resume();
+
+  const agentChange = {
+    model: modelRef,
+    ...(thinkingLevel ? { thinkingLevel } : {}),
+    tools: bridged,
+    modelTools: bridged,
+  };
+
+  let root;
+  if (mode === "create") {
+    root = await harness.root(ctx, { agent: agentChange });
+  } else {
+    root = await harness.root(ctx);
+    // F-G：每次 warm 对 root 重应用当前 mesh 的 llm/工具配置。
+    await root.configure(agentChange, ctx);
+  }
+
+  const session: DurableSession = {
+    endpointId: endpoint.id,
+    ctx,
+    harness,
+    root,
+    registry,
+    async configure(model, level) {
+      await root.configure({ model, ...(level ? { thinkingLevel: level } : {}) }, ctx);
+    },
+    async close() {
+      await harness.close(ctx);
+    },
+  };
+  return { session, runtimeRef: encodeRuntimeRef(storagePath, root.id) };
+}
+
+/**
+ * 缺省装配：由 llm/runtime 配置产出完全隔离的 SessionFactory（LD2）。装配异步（惰性加载
+ * durable + buildModels + 解析模型），失败即 fail-fast。
  */
 export async function createAssembledSessionFactory(opts: {
   stateDir: string;
   llm: ResolvedLlm;
   runtime?: RuntimeConfig;
   cwdFor?(endpoint: Endpoint): string;
+  /** MD8 非致命失败通道（task_faulted / task_parked / extension_error）；可选 */
+  onReport?(error: unknown): void;
 }): Promise<SessionFactory> {
-  const pi = await loadPiSdk();
+  const sdk = await loadDurableSdk();
+  validateRuntimeConfig(opts.runtime);
   const { stateDir, llm, runtime } = opts;
-  const cwdFor = (e: Endpoint) => opts.cwdFor?.(e) ?? join(stateDir, "endpoints", e.id);
-
-  // 私有 agentDir：只作为 DefaultResourceLoader 的无文件空目录，不放任何配置。
-  const agentDir = join(stateDir, "pi-agents");
-  const settings = buildSettings(pi, runtime);
-
-  // ModelRuntime：modelsPath:null（不读 models.json）+ 内存凭据库（不读 auth.json）
-  // + refreshOnCreate:false（不发网络目录刷新）。
-  const rt = await pi.ModelRuntime.create({
-    credentials: new MemoryCredentialStore() as never,
-    modelsPath: null,
-    refreshOnCreate: false,
-  });
-
-  if (llm.custom) {
-    rt.registerProvider(llm.providerId, {
-      baseUrl: llm.custom.baseUrl,
-      api: llm.custom.api,
-      ...(llm.custom.headers ? { headers: llm.custom.headers } : {}),
-      ...(llm.custom.authHeader !== undefined ? { authHeader: llm.custom.authHeader } : {}),
-      models: [
-        {
-          id: llm.modelId,
-          name: llm.modelId,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          reasoning: llm.custom.reasoning,
-          contextWindow: llm.custom.contextWindow,
-          maxTokens: llm.custom.maxTokens,
-        },
-      ],
-    } as never);
-  }
-
-  // 显式 secret 进运行时凭据（不进 memory 库也不落盘；ambient env 被显式 key 遮蔽）。
-  await rt.setRuntimeApiKey(llm.providerId, llm.credential.key);
-
-  const model = rt.getModel(llm.providerId, llm.modelId);
-  if (!model) {
-    const hint = llm.custom
-      ? `自定义 provider "${llm.providerId}" 的 models[] 中无 "${llm.modelId}"（model 字段按 "providerId:modelId" 书写）`
-      : `provider "${llm.providerId}" 不是可解析的内建 provider 或目录无 "${llm.modelId}"`;
-    throw new MeshConfigError("MESH_UNKNOWN_MODEL", hint);
-  }
-
-  async function resourceLoaderFor(cwd: string) {
-    const loader = new pi.DefaultResourceLoader({
-      cwd,
-      agentDir,
-      settingsManager: settings,
-      noExtensions: !resourceEnabled(runtime?.resources, "extensions"),
-      noSkills: !resourceEnabled(runtime?.resources, "skills"),
-      noPromptTemplates: !resourceEnabled(runtime?.resources, "prompts"),
-      noThemes: !resourceEnabled(runtime?.resources, "themes"),
-      noContextFiles: !resourceEnabled(runtime?.resources, "contextFiles"),
-    });
-    await loader.reload();
-    return loader;
-  }
-
-  async function spawn(
-    endpoint: Endpoint,
-    sessionManager: unknown,
-    customTools: unknown[],
-  ): Promise<{ session: unknown; piSessionId: string }> {
-    const cwd = cwdFor(endpoint);
-    await mkdir(cwd, { recursive: true });
-    const { session } = await pi.createAgentSession({
-      cwd,
-      model: model as never,
-      ...(llm.thinkingLevel ? { thinkingLevel: llm.thinkingLevel as never } : {}),
-      modelRuntime: rt as never,
-      settingsManager: settings as never,
-      resourceLoader: await resourceLoaderFor(cwd),
-      tools: toolAllowlist(runtime?.builtinTools, customTools),
-      customTools: asPiCustomTools(customTools) as never,
-      sessionManager: sessionManager as never,
-    });
-    const mgr = session.sessionManager;
-    return { session, piSessionId: mgr.getSessionFile() ?? mgr.getSessionId() };
-  }
+  const models = await buildModels(llm, sdk);
+  const modelRef: ModelRef = { provider: llm.providerId, modelId: llm.modelId };
+  const thinkingLevel = llm.thinkingLevel as ModelThinkingLevel | undefined;
+  const settings = buildDurableSettings(runtime);
 
   return {
     async create(ctx) {
-      const cwd = cwdFor(ctx.endpoint);
-      const sessionDir = join(cwd, "sessions");
-      await mkdir(sessionDir, { recursive: true });
-      const sm = pi.SessionManager.create(cwd, sessionDir);
-      return spawn(ctx.endpoint, sm, ctx.tools as unknown[]);
+      const storagePath = endpointStoragePath({ stateDir, endpoint: ctx.endpoint, cwdFor: opts.cwdFor });
+      return assemble(sdk, models, modelRef, thinkingLevel, settings, ctx.tools, ctx.endpoint, storagePath, "create", opts.onReport);
     },
     async open(ctx) {
-      const cwd = cwdFor(ctx.endpoint);
-      const sessionDir = join(cwd, "sessions");
-      await mkdir(sessionDir, { recursive: true });
-      // piSessionId 即 session 文件路径（本实现的约定，见头注）
-      const sm = pi.SessionManager.open(ctx.piSessionId, sessionDir, cwd);
-      return { session: (await spawn(ctx.endpoint, sm, ctx.tools as unknown[])).session };
+      // MD7：优先从 runtimeRef 解出 storagePath（未来 fork 后未必等于确定路径），解不出回退确定路径。
+      const storagePath =
+        decodeRuntimeRef(ctx.runtimeRef)?.storagePath ??
+        endpointStoragePath({ stateDir, endpoint: ctx.endpoint, cwdFor: opts.cwdFor });
+      const opened = await assemble(sdk, models, modelRef, thinkingLevel, settings, ctx.tools, ctx.endpoint, storagePath, "open", opts.onReport);
+      return { session: opened.session };
     },
   };
 }
 
-// ─── 高级/低层路径：宿主自备 model/agentDir（LD1 保留路径）─────────────────
+// ─── 高级/低层路径：宿主自备 pi-ai Models + ModelRef（LD1 保留路径）─────────────────
 
 export interface PiSessionFactoryOptions {
-  /** 锁文件/端点工作目录的根（与 PiStreamPort 的 stateDir 一致） */
+  /** 端点 storage 文件根目录（与 PiStreamPort 的 stateDir 一致） */
   stateDir: string;
-  /** pi 全局配置目录（默认 ~/.pi/agent；测试给临时目录）。本路径不隔离——宿主自管 */
-  agentDir?: string;
-  /** 宿主选定的模型（pi-ai 的 Model<any>）；缺省由 pi 按 settings 解析 */
-  model?: unknown;
+  /** 宿主预建的 pi-ai Models（含 provider 与凭据）；durable 无缺省模型目录，必填 */
+  models: unknown;
+  /** agent 使用的 provider:modelId（ModelRef 结构体，node 里不强依赖 pi-ai 类型导出） */
+  model: { provider: string; modelId: string };
   thinkingLevel?: string;
-  /** 内建工具白名单（缺省 [] = 全禁内建）；mesh 工具恒经 customTools 注入 */
-  tools?: string[];
+  /** durable HarnessSettings（retry/stream/compaction 等）；可选透传 */
+  settings?: unknown;
+  /** MD8 非致命失败通道（宿主接管 task_faulted / task_parked / extension_error） */
+  onReport?(error: unknown): void;
   /** 端点 cwd 的自定义解析（默认 <stateDir>/endpoints/<id>） */
   cwdFor?(endpoint: Endpoint): string;
 }
 
 export function createPiSessionFactory(opts: PiSessionFactoryOptions): SessionFactory {
-  const cwdFor = (e: Endpoint) => opts.cwdFor?.(e) ?? join(opts.stateDir, "endpoints", e.id);
+  const models = opts.models as Models;
+  const modelRef: ModelRef = { provider: opts.model.provider, modelId: opts.model.modelId };
+  const thinkingLevel = (opts.thinkingLevel as ModelThinkingLevel | undefined) ?? undefined;
+  const settings = opts.settings as HarnessSettings | undefined;
 
-  async function spawn(
+  async function assembleAt(
     endpoint: Endpoint,
-    sessionManager: unknown,
-    customTools: unknown[],
-  ): Promise<{ session: unknown; piSessionId: string }> {
-    const pi = await loadPiSdk();
-    const cwd = cwdFor(endpoint);
-    await mkdir(cwd, { recursive: true });
-    const { session } = await pi.createAgentSession({
-      cwd,
-      ...(opts.agentDir ? { agentDir: opts.agentDir } : {}),
-      ...(opts.model ? { model: opts.model as never } : {}),
-      ...(opts.thinkingLevel ? { thinkingLevel: opts.thinkingLevel as never } : {}),
-      tools: toolAllowlist(opts.tools, customTools),
-      customTools: asPiCustomTools(customTools) as never,
-      sessionManager: sessionManager as never,
-    });
-    const sm = session.sessionManager;
-    return { session, piSessionId: sm.getSessionFile() ?? sm.getSessionId() };
+    tools: ToolDefinition[],
+    mode: "create" | "open",
+    runtimeRef?: string,
+  ): Promise<{ session: DurableSession; runtimeRef: string }> {
+    const sdk = await loadDurableSdk();
+    const storagePath =
+      (mode === "open" ? decodeRuntimeRef(runtimeRef)?.storagePath : undefined) ??
+      endpointStoragePath({ stateDir: opts.stateDir, endpoint, cwdFor: opts.cwdFor });
+    return assemble(sdk, models, modelRef, thinkingLevel, settings as HarnessSettings | undefined, tools, endpoint, storagePath, mode, opts.onReport);
   }
 
   return {
     async create(ctx) {
-      const pi = await loadPiSdk();
-      const cwd = cwdFor(ctx.endpoint);
-      const sessionDir = join(cwd, "sessions");
-      await mkdir(sessionDir, { recursive: true });
-      const sm = pi.SessionManager.create(cwd, sessionDir);
-      return spawn(ctx.endpoint, sm, ctx.tools as unknown[]);
+      return assembleAt(ctx.endpoint, ctx.tools as ToolDefinition[], "create");
     },
-
     async open(ctx) {
-      const pi = await loadPiSdk();
-      const cwd = cwdFor(ctx.endpoint);
-      const sessionDir = join(cwd, "sessions");
-      await mkdir(sessionDir, { recursive: true });
-      // piSessionId 即 session 文件路径（本实现的约定，见头注）
-      const sm = pi.SessionManager.open(ctx.piSessionId, sessionDir, cwd);
-      return { session: (await spawn(ctx.endpoint, sm, ctx.tools as unknown[])).session };
+      const opened = await assembleAt(ctx.endpoint, ctx.tools as ToolDefinition[], "open", ctx.runtimeRef);
+      return { session: opened.session };
     },
   };
 }

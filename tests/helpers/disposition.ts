@@ -49,7 +49,7 @@ export const DISPOSITION: DispositionEntry[] = [
 
   // ── H：文档一致性（4 项，W16 统一处理）───────────────────────────
   { id: "H01", summary: "旧 plan/review 归档保留历史，关闭证据只在本计划追加", status: "done", evidence: [".agents/notes/archive/", ".agents/notes/archive/2026-10-12-consolidated-open-work-plan.md"] },
-  { id: "H02", summary: "README 事实修正：多进程/测试数量/Tab 与群聊面板对齐", status: "done", evidence: ["README.md", "demo/public/app.js"] },
+  { id: "H02", summary: "README 事实修正：多进程/测试数量/Tab 与群聊面板对齐", status: "done", evidence: ["README.md", "examples/public/app.js"] },
   { id: "H03", summary: "规范枚举/事件字段/命名统一（since_join/Presence/附录载荷）", status: "done", evidence: [".agents/notes/tech/2026-09-07-pi-agent-mesh-spec.md"] },
   { id: "H04", summary: "文字承诺标真实边界（非 byte-fidelity/full replay/无强一致性承诺）", status: "done", evidence: ["README.md", ".agents/notes/tech/2026-09-07-pi-agent-mesh-spec.md"] },
 ];

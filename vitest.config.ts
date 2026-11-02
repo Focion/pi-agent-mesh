@@ -15,7 +15,9 @@ export default defineConfig({
     // 四范围分支 ≥95% 由 scripts/coverage-gate.mjs 解析 coverage/coverage-final.json 另行收口。
     coverage: {
       provider: "v8",
-      include: ["src/core/**"],
+      // A41：插桩范围覆盖整个 src（含 src/index.ts 装配桥与 src/pi 适配层），
+      // 不能只统计 src/core 而让 src/pi、src/index 静默免覆盖。
+      include: ["src/**"],
       exclude: ["src/core/index.ts"],
       reporter: ["json", "text-summary"],
       reportsDirectory: "coverage",

@@ -67,7 +67,7 @@ function makeHarness(
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
     ...opts.policies,
@@ -147,7 +147,7 @@ async function addHotEndpoint(h: Harness, id: string): Promise<Endpoint> {
   const ep = await h.registry.registerEndpoint({
     accountId: id,
     topology: { kind: "unified" },
-    piSessionId: "pi-" + id,
+    runtimeRef: "pi-" + id,
   });
   h.registry.updateEndpointState(ep.id, "hot");
   return ep;
@@ -383,6 +383,39 @@ describe("W06 I32(b): cursor advance and overflow reset", () => {
     expect(inbox.overflow_count).toBe(0); // 折叠只在追赶固化时清零
     expect(inbox.overflow_summary).toBeNull();
     expect(inbox.cursor_seq).toBe(spanTo);
+    h.store.close();
+  });
+
+  it("A14: 折叠→追赶→重算后 overflow 不复活（只统计 cursor 之后的折叠行）", async () => {
+    const h = makeHarness({
+      limits: { maxPending: 4, maxPendingBytes: 1_000_000 },
+    });
+    await addAcc(h, "A", "available");
+    await addAcc(h, "B", "available");
+    const conv = await h.registry.createConversation({
+      type: "group",
+      creator: "A",
+      members: ["B"],
+    });
+    await addHotEndpoint(h, "B");
+    // B 未发言 → 5 条 P2 queued → 折叠 3（overflow=3，剩 2 条 queued）
+    for (let i = 0; i < 5; i++) {
+      await h.router.route(msg("A", conv.id, { clientToken: "a14-" + i }));
+    }
+    await h.mailbox.sweep();
+    expect(inboxOf(h, "B", conv.id).overflow_count).toBe(3);
+
+    // B 发言回预算 → 下一条 A 消息触发 CATCHUP：固化摘要、清 overflow、推进 cursor
+    await h.router.route(msg("B", conv.id, { clientToken: "a14-b1" }));
+    await h.router.route(
+      msg("A", conv.id, { to: ["B"], priority: "low", clientToken: "a14-m7" }),
+    );
+    await flush();
+    expect(inboxOf(h, "B", conv.id).overflow_count).toBe(0);
+
+    // 重启等价动作：全量重算缓存。旧实现按全部历史 folded 行重算，overflow 会「复活」为 3。
+    h.store.recomputeInboxCaches();
+    expect(inboxOf(h, "B", conv.id).overflow_count).toBe(0);
     h.store.close();
   });
 });

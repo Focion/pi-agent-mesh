@@ -53,7 +53,11 @@ export function renderAttachmentRefs(env: Envelope): string {
     atts
       .map(
         (a) =>
-          `[attachment ${a.spaceId}/${a.key}${a.version === undefined ? "" : ` v${a.version}`} — read it with mesh_shared_get]`,
+          // 防线 1（§10.3/A34）：附件引用 spaceId/key 是发送方可控外来内容，与正文同样
+          // 转义，防止 `<<<`/`>>>` 逃出 <<<MSG 包裹体（version 是数字，安全）。
+          `[attachment ${escapeDelims(a.spaceId)}/${escapeDelims(a.key)}${
+            a.version === undefined ? "" : ` v${a.version}`
+          } — read it with mesh_shared_get]`,
       )
       .join("\n")
   );

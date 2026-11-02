@@ -115,6 +115,9 @@ export class MeshConfigError extends Error {
   }
 }
 
+// pi-ai 的 ModelThinkingLevel 枚举（镜像 pi-ai MODEL_THINKING_LEVELS；durable 侧用它对 AgentChange 取值）。
+const KNOWN_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
 // pi-ai 已知的 API 适配器（镜像 demo 旧 config 的 KNOWN_APIS；registerProvider 会再校验一次）
 const KNOWN_APIS = [
   "anthropic-messages",
@@ -218,6 +221,17 @@ export function resolveLlmConfig(
     };
   }
 
+  // thinkingLevel 只在 durable 后端被消费（AgentChange.thinkingLevel ∈ pi-ai 枚举）；
+  // resolveLlmConfig 是唯一入口，这里 fail-fast 校验，避免非法档位静默落到 pi-ai。
+  if (llm.thinkingLevel !== undefined && llm.thinkingLevel !== "") {
+    if (!(KNOWN_THINKING_LEVELS as readonly string[]).includes(llm.thinkingLevel)) {
+      throw new MeshConfigError(
+        "MESH_BAD_CONFIG",
+        `llm.thinkingLevel "${llm.thinkingLevel}" 未知。可用: ${KNOWN_THINKING_LEVELS.join(", ")}`,
+      );
+    }
+  }
+
   return {
     providerId,
     modelId,
@@ -225,6 +239,28 @@ export function resolveLlmConfig(
     credential: { key, source },
     ...(custom ? { custom } : {}),
   };
+}
+
+/**
+ * 校验 RuntimeConfig 里 durable 无对等物的字段（LD2 隔离开关）。
+ * `resources` 依赖 pi-coding-agent 的 DefaultResourceLoader（skills/prompts/themes/
+ * contextFiles/第三方 extensions），durable 不读任何配置文件、无对等物。置 true 不再是
+ * 静默失效，而是显式拒绝（破坏性变更进 changelog）。缺省 false（隔离）仍合法。
+ */
+export function validateRuntimeConfig(runtime: RuntimeConfig | undefined): void {
+  const resources = runtime?.resources;
+  if (!resources) return;
+  for (const [key, on] of Object.entries(resources) as Array<
+    [keyof RuntimeResources, boolean | undefined]
+  >) {
+    if (on === true) {
+      throw new MeshConfigError(
+        "MESH_BAD_CONFIG",
+        `runtime.resources.${key} 已废弃：pi-durable 无 skills/prompts/themes/` +
+          `contextFiles/extensions 对等物，置 true 无法生效（破坏性变更，见 changelog）`,
+      );
+    }
+  }
 }
 
 /**

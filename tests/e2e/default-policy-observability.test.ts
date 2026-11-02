@@ -30,7 +30,7 @@ type StorageFaultCodeLike = "not_writable" | "clock_rollback" | "wal_over_thresh
 type DevFaults = { _dev: { injectFault: (c: StorageFaultCodeLike) => void; clearFault: (c: StorageFaultCodeLike) => void } };
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "obs-default" }),
+  create: async () => ({ session: {}, runtimeRef: "obs-default" }),
   open: async () => ({ session: {} }),
 };
 
@@ -50,7 +50,7 @@ describe("G07 默认策略零告警 + 存储故障执行链观测", () => {
       dbPath: join(dir, "mesh.db"),
       policies: { sessionFactory: stubSessionFactory },
       streamPort: port,
-      limits: { sweepIntervalMs: 0, handoffTimeoutMs: 1000 },
+      limits: { sweepIntervalMs: 0 },
       devMode: true,
     });
     const dev = (host as unknown as DevFaults)._dev;

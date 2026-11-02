@@ -15,8 +15,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { Account, Endpoint, Envelope, SessionFactory } from "../../src/core/types.js";
 import { createMesh } from "../../src/index.js";
 import { EndpointLock } from "../../src/pi/lock.js";
-import { PiStreamPort } from "../../src/pi/stream-port.js";
+import { PiStreamPort } from "../../src/pi/durable-port.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
+import { fakeDurableSession } from "../helpers/pi-session.js";
 
 /** 异步轮询：等待条件成立（锁文件读取是异步的，waitFor 只支持同步条件） */
 async function until(cond: () => Promise<boolean>, ms = 10_000): Promise<void> {
@@ -29,30 +30,16 @@ async function until(cond: () => Promise<boolean>, ms = 10_000): Promise<void> {
 }
 
 function fakeSession(): unknown {
-  return {
-    isIdle: true,
-    sessionManager: {
-      getSessionId: () => "s-1",
-      getEntry: () => undefined,
-      getEntries: () => [],
-      appendCustomEntry: () => "e-1",
-    },
-    sendCustomMessage: async () => {},
-    steer: async () => {},
-    followUp: async () => {},
-    waitForIdle: async () => {},
-    subscribe: () => () => {},
-    dispose: () => {},
-  };
+  return fakeDurableSession();
 }
 
 const fastFactory: SessionFactory = {
-  create: async () => ({ session: fakeSession(), piSessionId: "pi-1" }),
+  create: async () => ({ session: fakeSession(), runtimeRef: "pi-1" }),
   open: async () => ({ session: fakeSession() }),
 };
 
 const stubFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "stub" }),
+  create: async () => ({ session: {}, runtimeRef: "stub" }),
   open: async () => ({ session: {} }),
 };
 
@@ -66,7 +53,7 @@ function makeEndpoint(id: string, accountId: string): Endpoint {
     accountId,
     topology: { kind: "unified" },
     state: "cold",
-    piSessionId: null,
+    runtimeRef: null,
     lease: "shared",
     leaseUntil: null,
     lastActiveAt: null,
@@ -182,7 +169,7 @@ describe("I16：close() 遇 dispose 抛错仍释放实例锁并关 DB", () => {
       dbPath,
       policies: { sessionFactory: stubFactory },
       streamPort: port,
-      limits: { handoffTimeoutMs: 1000 },
+      limits: {},
     });
     await host.registerAccount({ id: "A", displayName: "A", endpointClass: "stream", initiate: ["chat"] });
     await host.registerEndpoint({ accountId: "A", topology: { kind: "unified" } });

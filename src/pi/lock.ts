@@ -19,9 +19,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { constants } from "node:fs";
-import { mkdir, open, readFile, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { MeshLease } from "../core/types.js";
 import { isoNow } from "../core/util.js";
@@ -36,6 +37,8 @@ export interface LockInfo {
   leaseUntil: string | null;
   /** 持锁进程的启动时刻（M-R10 的 pid 复用护栏）；取不到 ⇒ 空串 */
   procStartedAt: string;
+  /** single=严格单写者 / multi=多进程附着（A13：锁文件记录 mode，single 与 multi 互斥） */
+  mode: LockMode;
 }
 
 /** 进程存活判据（§27.4）：kill -0 可为 ESRCH（死）/ EPERM（活但无权限）/ 0（活） */
@@ -48,10 +51,14 @@ async function pidAlive(pid: number): Promise<boolean> {
   }
 }
 
-/** 读某 pid 的进程启动时刻（ps -o lstart=，macOS/Linux 一致）；失败 ⇒ undefined */
+/** 读某 pid 的进程启动时刻（ps -o lstart=，macOS/Linux 一致）；失败 ⇒ undefined。
+ *  A20：固定 TZ=UTC + LC_ALL=C，令 `lstart` 输出与调用方时区/语言无关——否则同样一个
+ *  宿主进程在不同 TZ/locale 下会读出不同启动串，ownerIsLive 的字符串比对会误判「死」。 */
 async function procStartedAt(pid: number): Promise<string | undefined> {
   try {
-    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="]);
+    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="], {
+      env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+    });
     const s = stdout.trim();
     return s === "" ? undefined : s;
   } catch {
@@ -68,6 +75,8 @@ function normalizeLockInfo(parsed: Partial<LockInfo>): LockInfo {
     acquiredAt: typeof parsed.acquiredAt === "string" ? parsed.acquiredAt : "",
     leaseUntil: typeof parsed.leaseUntil === "string" ? parsed.leaseUntil : null,
     procStartedAt: typeof parsed.procStartedAt === "string" ? parsed.procStartedAt : "",
+    // 旧锁（single 时代）没有 mode ⇒ 按 single 归因；multi 只见于实例锁。
+    mode: parsed.mode === "multi" ? "multi" : "single",
   };
 }
 
@@ -122,8 +131,10 @@ export class EndpointLock {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") {
         // 仅 multi 模式（实例锁）允许 shared-shared 共存：N 进程共享同一 dbPath。
+        // A13：还要核对 existing.mode 也是 "multi" —— 一个 single 写者（哪怕 lease=shared）
+        // 不能与 multi 写者共用同一锁文件，single/multi 互斥。
         const existing = await EndpointLock.readInfo(lockPath);
-        if (mode === "multi" && lease === "shared" && existing?.lease === "shared") {
+        if (mode === "multi" && lease === "shared" && existing?.mode === "multi" && existing?.lease === "shared") {
           return lock;
         }
         throw new LockHeldError(lockPath, existing);
@@ -190,6 +201,56 @@ export class EndpointLock {
     await unlink(lockPath).catch(() => {});
   }
 
+  /**
+   * 原子接管陈旧锁（A12/A13）：rename 抢占 + 抢到后再判活，替代「先 ownerIsLive 再
+   * forceRelease」的 check-then-delete 序列——两个进程同时回收时，后 check 者会删掉先抢
+   * 到的新锁，出现两个写者。rename 是原子操作：只有一个回收者能移走文件，移走后独占读取
+   * 判据，成立才清、不成立原子放回，绝不删活锁/坏锁。
+   *
+   * 返回：
+   * - "reclaimed"：文件缺失（无主）或遗留持有者确已死 → 已清除，可安全抢锁。
+   * - "held"：遗留持有者仍活（或该锁是 multi，见 A13）→ 锁文件已还原，不可接管。
+   * - "unknown"：判据取不齐（pid 活但启动时刻未知、文件损坏/不可读）→ 保守还原，拒绝接管（§19.6）。
+   */
+  static async reclaim(lockPath: string): Promise<"reclaimed" | "held" | "unknown"> {
+    const tmp = `${lockPath}.reclaim-${process.pid}-${randomUUID()}`;
+    try {
+      await rename(lockPath, tmp);
+    } catch (err) {
+      // 文件已不在：要么本就无主，要么被别的回收者抢走。返回 reclaimed 无妨——
+      // 后续抢锁靠 O_EXCL 兜底（实例锁 acquire / 端点 warm 抢锁）。
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "reclaimed";
+      throw err;
+    }
+
+    // A13：multi（实例锁）不按单个死 pid 判活回收——首写者退出后同一 dbPath 可能仍有
+    // 其他 sameHost 进程附着。single 才走单写者 liveness。
+    const heldBy = await EndpointLock.readInfo(tmp);
+    if (heldBy?.mode === "multi") {
+      await EndpointLock.restore(tmp, lockPath);
+      return "held";
+    }
+
+    const verdict = await EndpointLock.ownerIsLive(tmp);
+    if (verdict === "dead") {
+      await unlink(tmp).catch(() => {});
+      return "reclaimed";
+    }
+    // alive / unknown / 损坏锁：还回去。
+    await EndpointLock.restore(tmp, lockPath);
+    return verdict === "alive" ? "held" : "unknown";
+  }
+
+  /** 把移走的锁文件原子放回 lockPath（link 不覆盖：他人已重建 lockPath 则保留他人锁）。 */
+  private static async restore(tmp: string, lockPath: string): Promise<void> {
+    try {
+      await link(tmp, lockPath);
+    } catch {
+      // lockPath 已被他人重建：保留他人锁文件，丢弃 tmp（我们移走的旧锁已过时）。
+    }
+    await unlink(tmp).catch(() => {});
+  }
+
   private info(): LockInfo {
     return {
       writerId: this.writerId,
@@ -198,6 +259,7 @@ export class EndpointLock {
       acquiredAt: isoNow(),
       leaseUntil: this.leaseUntilMs === null ? null : new Date(this.leaseUntilMs).toISOString(),
       procStartedAt: this.procStartedAt,
+      mode: this.mode,
     };
   }
 
@@ -220,9 +282,18 @@ export class EndpointLock {
     }
   }
 
+  /** 本进程是否仍是锁文件的持有者（writerId+pid 匹配；文件缺失/损坏/不可读 ⇒ 否，绝不猜）。 */
+  private async holdsCurrentFile(): Promise<boolean> {
+    const heldBy = await EndpointLock.readInfo(this.lockPath);
+    if (!heldBy) return false;
+    return heldBy.writerId === this.writerId && heldBy.pid === process.pid;
+  }
+
   /** 续租（exclusive 窗口需要延长时；重写锁文件里的 leaseUntil） */
   async refresh(leaseTtlMs: number): Promise<void> {
     if (this.released) return;
+    // A12：续租前校验持有者——若锁已被他人接管，绝不覆盖他人锁文件。
+    if (!(await this.holdsCurrentFile())) return;
     if (this.lease === "exclusive") this.leaseUntilMs = Date.now() + leaseTtlMs;
     await writeFile(this.lockPath, JSON.stringify(this.info(), null, 2)).catch(() => {});
   }
@@ -230,6 +301,8 @@ export class EndpointLock {
   /** 改写持有租约（I16：exclusive 升降级后锁文件与内存租约同步；重写 lease / leaseUntil） */
   async setLease(lease: MeshLease, leaseTtlMs?: number): Promise<void> {
     if (this.released) return;
+    // A12：改写前校验持有者，绝不覆盖他人锁。
+    if (!(await this.holdsCurrentFile())) return;
     this.lease = lease;
     this.leaseUntilMs = lease === "exclusive" ? Date.now() + (leaseTtlMs ?? 60_000) : null;
     await writeFile(this.lockPath, JSON.stringify(this.info(), null, 2)).catch(() => {});
@@ -242,7 +315,10 @@ export class EndpointLock {
     // single（endpoint 锁）恒删文件：单写者释放即让位，下次 warm 可重新抢。
     // multi（实例锁）不删：多进程共享标记，退出方留下文件无害，他人以共存路径附着。
     if (this.mode === "single") {
-      await unlink(this.lockPath).catch(() => {});
+      // A12：删除前校验仍是本进程的锁文件，绝不误删他人（陈旧锁靠 reclaim 显式接管）。
+      if (await this.holdsCurrentFile()) {
+        await unlink(this.lockPath).catch(() => {});
+      }
     }
   }
 }

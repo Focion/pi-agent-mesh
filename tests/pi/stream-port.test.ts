@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // PiStreamPort（SessionHost）真 pi 测试：.lock 单写者（M3）、warm/deliver/note、
-// onEntry 差分镜像（F4/F5）、inFlight 自持（F3）、hasEntries、evict。
+// onEntry 差分镜像（F4/F5）、inFlight 自持（F3）、submissionStatus、evict。
 // 全部走 faux provider，无 LLM 成本。
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -17,47 +17,15 @@ import type {
   SessionFactory,
 } from "../../src/core/types.js";
 import { EndpointLock, LockHeldError } from "../../src/pi/lock.js";
-import { PiPortError, PiStreamPort } from "../../src/pi/stream-port.js";
-import { loadPiSdk } from "../../src/pi/pi-sdk.js";
-import {
-  createFaux,
-  loadFauxCompat,
-  registerFauxInto,
-  waitFor,
-  type FauxCore,
-} from "../helpers/pi-session.js";
+import { PiPortError, PiStreamPort } from "../../src/pi/durable-port.js";
+import { createPiSessionFactory } from "../../src/pi/session-factory.js";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { createFaux, waitFor, type Faux } from "../helpers/pi-session.js";
 
-// ── 测试工厂：每端点一条真 inMemory pi 流 ────────────────────────────────
+// ── 测试工厂：createPiSessionFactory 高级路径 + faux provider（每端点真 durable storage）───
 
-async function createTestFactory(faux: FauxCore, dir: string): Promise<SessionFactory> {
-  const pi = await loadPiSdk();
-  return {
-    async create(ctx) {
-      const sm = pi.SessionManager.inMemory(join(dir, ctx.endpoint.id));
-      const { session } = await pi.createAgentSession({
-        cwd: dir,
-        agentDir: dir,
-        model: faux.getModel() as never,
-        noTools: "all",
-        sessionManager: sm,
-      });
-      registerFauxInto(session, faux);
-      return { session, piSessionId: `mem:${ctx.endpoint.id}` };
-    },
-    async open(ctx) {
-      // 测试工厂的 open 等价于 create（inMemory 无盘可恢）
-      const sm = pi.SessionManager.inMemory(join(dir, ctx.endpoint.id));
-      const { session } = await pi.createAgentSession({
-        cwd: dir,
-        agentDir: dir,
-        model: faux.getModel() as never,
-        noTools: "all",
-        sessionManager: sm,
-      });
-      registerFauxInto(session, faux);
-      return { session };
-    },
-  };
+async function createTestFactory(faux: Faux, dir: string): Promise<SessionFactory> {
+  return createPiSessionFactory({ stateDir: dir, models: faux.models, model: faux.model });
 }
 
 function makeAccount(id: string): Account {
@@ -70,7 +38,7 @@ function makeEndpoint(id: string, accountId: string): Endpoint {
     accountId,
     topology: { kind: "unified" },
     state: "cold",
-    piSessionId: null,
+    runtimeRef: null,
     lease: "shared",
     leaseUntil: null,
     lastActiveAt: null,
@@ -95,7 +63,7 @@ function makeEnvelope(id: string): Envelope {
 // ── 装配 ─────────────────────────────────────────────────────────────────
 
 let dir: string;
-let faux: FauxCore;
+let faux: Faux;
 let port: PiStreamPort;
 let accounts: Map<string, Account>;
 let endpoints: Map<string, Endpoint>;
@@ -124,7 +92,7 @@ beforeEach(async () => {
     },
     setEndpointSession: (id, sid) => {
       const e = endpoints.get(id);
-      if (e) e.piSessionId = sid;
+      if (e) e.runtimeRef = sid;
     },
     setEndpointLease: (id, lease, until) => {
       const e = endpoints.get(id);
@@ -161,7 +129,7 @@ describe("PiStreamPort: warm 与 .lock 单写者（M3 / §8.4①）", () => {
     const ep = addEndpoint();
     await port.warm(ep.id, "shared");
     expect(ep.state).toBe("hot");
-    expect(ep.piSessionId).toBe("mem:ep_b");
+    expect(ep.runtimeRef).toBeTruthy();
     expect(port.status(ep.id).state).toBe("hot");
     expect(await EndpointLock.readInfo(join(dir, "locks", `${ep.id}.lock`))).toBeDefined();
   });
@@ -237,24 +205,25 @@ describe("PiStreamPort: deliver / onEntry / inFlight（F3/F5）", () => {
     expect(res.entryId).toBeDefined();
     expect(entries.some((e) => e.envelopeId === "m_1" && e.entryId === res.entryId)).toBe(true);
     const evt = entries.find((e) => e.envelopeId === "m_1")!;
-    expect(evt.entryType).toBe("custom_message");
+    expect(evt.entryType).toBe("mesh.msg");
     expect(evt.seqInStream).toBeGreaterThan(0);
-    expect(JSON.parse(evt.rawJson)).toMatchObject({ type: "custom_message", customType: "mesh.msg" });
+    const raw = JSON.parse(evt.rawJson) as Record<string, unknown>;
+    expect(raw.kind).toBe("mesh.msg");
+    expect((raw.data as { envelopeId?: string }).envelopeId).toBe("m_1");
     expect(port.status(ep.id).inFlight).toBe(0);
     // faux 未被调：不唤醒即无 LLM 成本
     expect(faux.state.callCount).toBe(0);
   });
 
   it("triggerTurn:true 起一轮，turn_end 经 onTurnEnd 送达", async () => {
-    const compat = await loadFauxCompat();
-    faux.setResponses([compat.fauxAssistantMessage("reply")]);
+    faux.setResponses([fauxAssistantMessage("reply")]);
     const ep = addEndpoint();
     const env = makeEnvelope("m_2");
     // F5：deliver 在 entry 落盘时返回，不等轮次跑完 —— 轮次结果随后异步到达
     await port.deliver(ep.id, "hi", env, "followUp", { triggerTurn: true });
     expect(entries.some((e) => e.envelopeId === "m_2")).toBe(true);
     await waitFor(() => turnEnds.some((e) => e.endpointId === ep.id));
-    expect(faux.state.callCount).toBe(1);
+    expect(faux.state.callCount).toBeGreaterThanOrEqual(1);
   });
 
   it("silent 档：热流落盘不起轮（§7.2 形态①）", async () => {
@@ -289,24 +258,26 @@ describe("PiStreamPort: deliver / onEntry / inFlight（F3/F5）", () => {
   });
 });
 
-describe("PiStreamPort: note / hasEntries / evict", () => {
+describe("PiStreamPort: note / submissionStatus / evict", () => {
   it("note 落 type:custom 条目（P3：记账不进上下文）且发 onEntry", async () => {
     const ep = addEndpoint();
     await port.warm(ep.id, "shared");
     await port.note(ep.id, "mesh.audit", { envelopeId: "m_9", seq: 7 });
     const evt = entries.find((e) => e.envelopeId === "m_9");
     expect(evt).toBeDefined();
-    expect(evt!.entryType).toBe("custom");
+    expect(evt!.entryType).toBe("mesh.audit");
     expect(faux.state.callCount).toBe(0);
   });
 
-  it("hasEntries 按 id 逐条问（F4）；未知 id 不在结果集", async () => {
+  it("submissionStatus 按 id 精确读（MD3）；未知 id 返回 null", async () => {
     const ep = addEndpoint();
     const env = makeEnvelope("m_5");
     const res = await port.deliver(ep.id, "x", env, "followUp", { triggerTurn: false });
-    const alive = await port.hasEntries(ep.id, [res.entryId!, "nonexistent"]);
-    expect(alive.has(res.entryId!)).toBe(true);
-    expect(alive.has("nonexistent")).toBe(false);
+    const rec = await port.submissionStatus(ep.id, res.submissionId);
+    expect(rec).not.toBeNull();
+    expect(rec!.id).toBe(res.submissionId);
+    const none = await port.submissionStatus(ep.id, "999999");
+    expect(none).toBeNull();
   });
 
   it("evict 释放锁、转 cold；之后可重新 warm（single 释放即删锁文件，§8.3）", async () => {

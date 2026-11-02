@@ -11,15 +11,15 @@
 //     （根 = src/index.ts；core = src/core/index.ts；经 TS compiler API 枚举，
 //       value 与 type-only 分开，均排序，确定性输出）
 //   snapshots/migrations/000_init.sha256  migrations/000_init.sql 的 sha256
-//     （DDL 每次失败应改走增量迁移，基线文件本身只读）
+//     （DDL 基线，含全部 schema 列与索引——不再有增量迁移）
 //
 // 语义：这是「基线」。改名/增删导出、改 DDL 都算漂移——要么是有意契约变更（此时
 // 重新生成并 commit），要么是误改（此时修复）。不做自动「更新通过」。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
@@ -99,7 +99,7 @@ if (CHECK) {
     drift = 1;
   }
   if (drift) process.exit(1);
-  console.log("✓ 快照一致：API 面 + migrations/000_init.sql 均未漂移。");
+  console.log("✓ 快照一致：API 面 + migrations 均未漂移。");
   process.exit(0);
 }
 

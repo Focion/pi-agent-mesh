@@ -10,7 +10,7 @@ import { MeshMailbox } from "../../src/core/mailbox.js";
 import { createDefaultPolicies } from "../../src/core/policies.js";
 import { MeshRegistry } from "../../src/core/registry.js";
 import { MeshRouter } from "../../src/core/router.js";
-import { computeSealToken, sealFieldsFromRow } from "../../src/core/seal.js";
+import { computeSealToken, sealFieldsFromRow, sealValid } from "../../src/core/seal.js";
 import type { MessageRow } from "../../src/core/envelope.js";
 import { SqliteStore } from "../../src/core/store.js";
 import { InProcessTransport } from "../../src/core/transport.js";
@@ -46,7 +46,7 @@ function makeHarness(sealKey?: string): Harness {
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
   };
@@ -203,5 +203,48 @@ describe("seal: NULL 历史行放行（不补签）", () => {
     await h.mailbox.retryAccount("bob");
     expect(violations.filter((v) => v.code === "seal_mismatch")).toHaveLength(0);
     h.store.close();
+  });
+});
+describe("seal: 畸形 hex 不抛异常（A34）", () => {
+  const row = (over: Partial<MessageRow>): MessageRow => ({
+    id: "m1",
+    conversation_id: "c1",
+    seq: 1,
+    from_account: "alice",
+    from_endpoint: null,
+    kind: "chat",
+    expect: "none",
+    priority: null,
+    to_accounts: "[]",
+    mentions: "[]",
+    reply_to: null,
+    correlation_id: null,
+    intent: null,
+    late: 0,
+    logical_ts: null,
+    routed_at: "2026-01-01T00:00:00.000Z",
+    payload: "{}",
+    idempotency_key: "k",
+    seal: null,
+    tombstoned_by: null,
+    ext: null,
+    ...over,
+  });
+
+  it("sealValid 对同长度但含非法 hex 字符的 seal 返回 false，而不是抛异常", () => {
+    const base = row({});
+    const expected = computeSealToken(KEY, sealFieldsFromRow(base));
+    // 长度一致（64 hex），但内容含非法字符：Buffer.from(seal, "hex") 会提前截断，
+    // 修复前 timingSafeEqual 抛“Buffer lengths must match”。现在应平稳返回 false。
+    const malformed = "Z".repeat(expected.length);
+    expect(() => sealValid(KEY, row({ seal: malformed }))).not.toThrow();
+    expect(sealValid(KEY, row({ seal: malformed }))).toBe(false);
+  });
+
+  it("sealValid 对奇数长度的 seal 返回 false，不抛异常", () => {
+    const base = row({});
+    const expected = computeSealToken(KEY, sealFieldsFromRow(base));
+    expect(() => sealValid(KEY, row({ seal: expected.slice(0, -1) }))).not.toThrow();
+    expect(sealValid(KEY, row({ seal: expected.slice(0, -1) }))).toBe(false);
   });
 });

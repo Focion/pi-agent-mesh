@@ -30,7 +30,7 @@ function allMembers(): string[] {
 }
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "bench-b" }),
+  create: async () => ({ session: {}, runtimeRef: "bench-b" }),
   open: async () => ({ session: {} }),
 };
 
@@ -43,7 +43,7 @@ async function makeScenario(): Promise<Scenario> {
     dbPath: join(dir, "mesh.db"),
     policies: { sessionFactory: stubSessionFactory },
     streamPort: port,
-    limits: { sweepIntervalMs: 0, handoffTimeoutMs: 1000 },
+    limits: { sweepIntervalMs: 0 },
     devMode: false,
   });
 

@@ -22,7 +22,7 @@ import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "e2e-session" }),
+  create: async () => ({ session: {}, runtimeRef: "e2e-session" }),
   open: async () => ({ session: {} }),
 };
 
@@ -43,7 +43,7 @@ async function makeMesh(extraLimits: Record<string, unknown> = {}): Promise<Mesh
     dbPath,
     policies: { sessionFactory: stubSessionFactory },
     streamPort: port,
-    limits: { handoffTimeoutMs: 1000, ...extraLimits },
+    limits: { ...extraLimits },
     devMode: true,
   });
   return { host, port, dbPath };

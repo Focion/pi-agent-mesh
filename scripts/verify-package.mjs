@@ -26,6 +26,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -125,9 +126,13 @@ f(root, "createMesh", "root"); f(root, "createPiSessionFactory", "root");
 f(root, "PiStreamPort", "root"); f(root, "EndpointLock", "root");
 f(root, "LockHeldError", "root"); f(root, "PiPortError", "root");
 f(root, "MeshUnsupportedError", "root"); f(root, "InvariantViolationError", "root");
+// R3（A25）：MeshRejectError 是公开错误契约，根入口必须值导出（不再是 type-only）
+f(root, "MeshRejectError", "root");
 if (typeof root.DEFAULT_LIMITS !== "object") throw new Error("root.DEFAULT_LIMITS 缺失");
-if ("MeshRejectError" in root) throw new Error("root 不应暴露 MeshRejectError(type-only)，出现即边界泄漏");
 f(core, "MeshRejectError", "core"); f(core, "MeshUnsupportedError", "core"); f(core, "InvariantViolationError", "core");
+// R3（A25）：跨入口 instanceof / 类身份统一（splitting 让两入口共享同一错误类模块）
+if (!(new root.MeshRejectError("NOT_A_MEMBER") instanceof core.MeshRejectError)) throw new Error("MeshRejectError 跨入口 instanceof 判不中——splitting 未生效");
+if (root.InvariantViolationError !== core.InvariantViolationError) throw new Error("InvariantViolationError 跨入口不是同一类");
 f(core, "InProcessTransport", "core"); f(core, "SqliteStore", "core"); f(core, "MeshRouter", "core"); f(core, "createDefaultPolicies", "core");
 if (typeof core.DEFAULT_LIMITS !== "object") throw new Error("core.DEFAULT_LIMITS 缺失");
 console.log("ESM ok: root + core 均可用，pi 未静态加载");
@@ -137,6 +142,7 @@ const CONSUMER_CJS = `
 const root = require("@pi/agent-mesh");
 const core = require("@pi/agent-mesh/core");
 if (typeof root.createMesh !== "function") throw new Error("cjs root.createMesh 缺失");
+if (typeof root.MeshRejectError !== "function") throw new Error("cjs root.MeshRejectError 缺失");
 if (typeof core.MeshRejectError !== "function") throw new Error("cjs core.MeshRejectError 缺失");
 console.log("CJS ok: require 双入口均可用");
 `;
@@ -336,6 +342,11 @@ async function gateG09() {
   const ls = run("tar", ["-tzf", TARBALL], { cwd: ROOT });
   if (ls.status !== 0) fail(`列出 tarball 失败：${ls.stderr || ls.stdout}`);
   const paths = ls.stdout.split("\n").map((s) => s.replace(/^\.\//, "")).filter(Boolean);
+  // A44：必含清单按目录比对——全部 migrations/*.sql 都要在 tarball 里，不只 000_init.sql。
+  const migrationFiles = readdirSync(join(ROOT, "migrations"))
+    .filter((f) => f.endsWith(".sql"))
+    .sort()
+    .map((f) => `package/migrations/${f}`);
   const REQUIRED = [
     "package/package.json",
     "package/dist/index.js",
@@ -346,12 +357,12 @@ async function gateG09() {
     "package/dist/core/index.cjs",
     "package/dist/core/index.d.ts",
     "package/dist/core/index.d.cts",
-    "package/migrations/000_init.sql",
+    ...migrationFiles,
   ];
   for (const p of REQUIRED) {
     if (!paths.includes(p)) fail(`tarball 缺关键文件：${p}`);
   }
-  const FORBIDDEN_PREFIX = ["package/src/", "package/demo/", "package/tests/", "package/docs/"];
+  const FORBIDDEN_PREFIX = ["package/src/", "package/examples/", "package/tests/", "package/docs/"];
   for (const p of paths) {
     if (FORBIDDEN_PREFIX.some((f) => p.startsWith(f))) fail(`tarball 不应含源码/目录：${p}`);
   }

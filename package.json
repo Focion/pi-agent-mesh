@@ -1,6 +1,6 @@
 {
   "name": "@pi/agent-mesh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Multi-agent messaging and shared-state layer on top of the pi SDK",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -32,10 +32,10 @@
     "build": "tsup",
     "test": "node scripts/test.mjs",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
-    "typecheck:demo": "node node_modules/typescript/bin/tsc -p demo/tsconfig.demo.json",
+    "typecheck:demo": "node node_modules/typescript/bin/tsc -p examples/tsconfig.demo.json",
     "check:imports": "node scripts/check-imports.mjs",
-    "demo": "node demo/src/server.ts",
-    "demo:start": "bash scripts/start-demo.sh",
+    "demo": "node examples/src/server.ts",
+    "demo:start": "bash examples/start.sh",
     "demo:smoke": "node scripts/demo-smoke.mjs",
     "pack": "node scripts/pack.mjs",
     "verify:local": "node scripts/verify-local.mjs",
@@ -43,10 +43,9 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.3.0",
-    "@earendil-works/pi-ai": "1.3.0",
-    "@earendil-works/pi-coding-agent": "^1.1.0",
-    "@earendil-works/pi-durable": "1.3.0",
+    "@earendil-works/chord": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-durable": "1.4.0",
     "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {

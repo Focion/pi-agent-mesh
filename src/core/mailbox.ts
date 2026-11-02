@@ -47,6 +47,7 @@ import type {
   PresenceState,
   SinkHandler,
   StreamPort,
+  SubmissionRecord,
   Transport,
   Unsubscribe,
   VerbatimBudget,
@@ -79,6 +80,9 @@ export interface MailboxDeps {
   isEndpointLocal?: (endpointId: EndpointId) => boolean | Promise<boolean>;
   /** StreamPort：装配层必须已接线（FakeStreamPort 或 mesh-pi 的 PiStreamPort） */
   port: StreamPort;
+  /** A10：跨进程 P2 收件后，通知装配层刷新该端点注入文本（warm/onRouted 之外的第三个触发点）。
+   *  装配层据此重算 inboxInjection 并 injectContext；未接则跨进程 P2 不刷新注入体。 */
+  onInjectionRefresh?: (endpointId: EndpointId) => void;
   /** sink/external 账号的宿主处理器（MeshHost.registerSinkHandler 注册） */
   sinkHandlers: Map<AccountId, SinkHandler>;
   /** §14：该账号是否有开集 pending_acks（矩阵行 1 与唤醒规则①） */
@@ -125,11 +129,12 @@ interface DeliveryRow {
   woke: number;
   note: string | null;
   attempts: number;
-  handoff_at: string | null;
   queued_at: string | null;
   parked_at: string | null;
   parked_reason: string | null;
   entry_id: string | null;
+  submission_id: string | null;
+  attempt: number;
   claim_until: string | null;
   claimed_by: string | null;
   claimed_at: string | null;
@@ -167,13 +172,19 @@ export class MeshMailbox implements Mailbox {
   private readonly builtinRenderer: DefaultRenderer;
   /** entryId → deliveryId：entry_appended 归因（handleEntryAppended 用） */
   private entryIndex = new Map<string, DeliveryId>();
+  /** 本进程启动时刻（A04：sweep 对账只核对 parked 行或本进程启动前已 delivered 的崩溃残骸） */
+  private readonly bootIso: string;
   /** §7.4 降级留痕：已写过「转入摘要模式」note 的 (account, conv)（一次/跃迁） */
   private verbatimExitNoted = new Set<string>();
   /** §15.4 派生 presence 变迁去重：accountId → 上次记录的有效态（host/derived 共用） */
   private lastPresence = new Map<string, PresenceState>();
+  /** A10：inboxInjection 计算注入体时快照的「本端点 queued P2 行 id 集」；confirmInjection
+   *  只确认快照内这批，不扩到注入体计算之后新到的行（消除 deliverOne 中间 await 竞态）。 */
+  private readonly injectionIds = new Map<EndpointId, Set<string>>();
 
   constructor(deps: MailboxDeps) {
     this.d = deps;
+    this.bootIso = isoNow();
     this.rateLimiter = new WakeRateLimiter(deps.limits);
     this.builtinRenderer = new DefaultRenderer(
       deps.clock ?? new WallClockLogicalClock(),
@@ -189,7 +200,23 @@ export class MeshMailbox implements Mailbox {
       )
       .all(envelope.id) as DeliveryRow[];
     for (const row of rows) {
-      await this.deliverOne(envelope, row);
+      // A02：单个收件人的 deliverOne 抛错不中止其余收件人扇出。抛错行若已定档则停在
+      // queued、由常规续投/turn_end 恢复；尚未定档的（罕见）与崩溃残留的 routed 行由
+      // sweep ①.5 与启动 reconcileRouted 兜底。只有库真正偏离正常态才报警：
+      // invariant_violated 是必订的「库偏离」信号（§12.5 末），不是扇出失败的常规路径。
+      try {
+        await this.deliverOne(envelope, row);
+      } catch (err) {
+        this.d.events.emit("invariant_violated", {
+          code: "fanout_delivery_failed",
+          detail: {
+            deliveryId: row.id,
+            accountId: row.account_id,
+            ...(err instanceof Error ? { message: err.message } : {}),
+          },
+        });
+        this.d.store.bumpCounter("invariant_violated");
+      }
     }
   }
 
@@ -227,39 +254,49 @@ export class MeshMailbox implements Mailbox {
     }
 
     // ── 选端（§8.1）：超时/抛错 → parked(ENDPOINT_GONE)（I21）──
-    const topology =
-      d.registry.endpointsOf(row.account_id)[0]?.topology ?? { kind: "unified" };
-    const selected = await withPolicyTimeout(
-      this.guardDeps("endpointSelector"),
-      () =>
-        d.policies.endpointSelector.select({
-          accountId: row.account_id,
-          conversationId: envelope.conversationId,
-          envelope,
-          topology,
-        }),
-      null,
-      (v) =>
-        v === null ||
-        typeof v === "string" ||
-        (Array.isArray(v) && v.every((x) => typeof x === "string")),
-    );
-    // I15：selector 结果归一为数组（§8.1 多端点投递）；逐条校验「存在且属于本账号」，
-    // 未知端点/他账号端点剔除并留痕（policy_degraded），全空才 park。
-    const rawSelected: EndpointId[] =
-      selected === null ? [] : Array.isArray(selected) ? selected : [selected];
-    const endpointIds: EndpointId[] = [];
-    for (const id of rawSelected) {
-      const ep = d.registry.getEndpoint(id);
-      if (ep && ep.accountId === row.account_id) {
-        endpointIds.push(id);
-      } else {
-        d.store.bumpCounter("policy_degraded");
+    // A01：重投（行已绑定 endpoint）只投原行，不重新选端、不扩多端行。否则 ep2 的既有行
+    // 会被下方 insExtra 撞 UNIQUE(message_id, endpoint_id)，整轮 sweep/park 抛错。
+    // 首次扇出（endpoint_id 为 NULL）才走选端 + 多端扩行；ENDPOINT_GONE 挂起行 endpoint_id
+    // 为 NULL，重试时照常重新选端（端点出现后按账号认领）。
+    const isRetry = row.endpoint_id !== null;
+    let endpointIds: EndpointId[];
+    if (!isRetry) {
+      const topology =
+        d.registry.endpointsOf(row.account_id)[0]?.topology ?? { kind: "unified" };
+      const selected = await withPolicyTimeout(
+        this.guardDeps("endpointSelector"),
+        () =>
+          d.policies.endpointSelector.select({
+            accountId: row.account_id,
+            conversationId: envelope.conversationId,
+            envelope,
+            topology,
+          }),
+        null,
+        (v) =>
+          v === null ||
+          typeof v === "string" ||
+          (Array.isArray(v) && v.every((x) => typeof x === "string")),
+      );
+      // I15：selector 结果归一为数组（§8.1 多端点投递）；逐条校验「存在且属于本账号」，
+      // 未知端点/他账号端点剔除并留痕（policy_degraded），全空才 park。
+      const rawSelected: EndpointId[] =
+        selected === null ? [] : Array.isArray(selected) ? selected : [selected];
+      endpointIds = [];
+      for (const id of rawSelected) {
+        const ep = d.registry.getEndpoint(id);
+        if (ep && ep.accountId === row.account_id) {
+          endpointIds.push(id);
+        } else {
+          d.store.bumpCounter("policy_degraded");
+        }
       }
-    }
-    if (endpointIds.length === 0) {
-      this.parkDelivery(row.id, envelope, "ENDPOINT_GONE");
-      return;
+      if (endpointIds.length === 0) {
+        this.parkDelivery(row.id, envelope, "ENDPOINT_GONE");
+        return;
+      }
+    } else {
+      endpointIds = [row.endpoint_id!];
     }
     const endpointId = endpointIds[0]!;
     const endpoint = d.registry.getEndpoint(endpointId);
@@ -350,8 +387,8 @@ export class MeshMailbox implements Mailbox {
     // 唤醒压制与冷流 silent→park（§9.5:1724），冷流不因静音消息升温。静音是显式关闭：urgent 也不破。
     if (muted) grade = "silent";
 
-    // ── 背压（§7.8 扇出时层）：库自持 inFlight，不读 SDK 计数（F3）──
-    const inFlight = this.inFlightCount(endpointId);
+    // ── 背压（§7.8 扇出时层）：inFlight 读端口真值（pi.inbox 深度，F3 退役）──
+    const inFlight = this.d.port.status(endpointId).inFlight;
     let note: string | null = null;
     if (grade !== "silent" && inFlight >= this.d.limits.maxInFlight) {
       grade = "silent";
@@ -621,14 +658,21 @@ export class MeshMailbox implements Mailbox {
     try {
       const res = await d.port.deliver(endpointId, rendered, envelope, grade, {
         triggerTurn: woke,
+        deliveryId: row.id,
+        attempt: row.attempt,
       });
-      // 留 queued + handoff_at 诊断戳；entry_appended 到达才推进（handleEntryAppended）
+      // 留 queued + submission_id 权威投影；entry 与 delivered 由 submission 状态投影（MD3）。
       d.store.db
         .prepare(
-          "UPDATE mesh_deliveries SET handoff_at = ?, entry_id = ? WHERE id = ?",
+          "UPDATE mesh_deliveries SET entry_id = ?, submission_id = ? WHERE id = ?",
         )
-        .run(isoNow(), res.entryId ?? null, row.id);
+        .run(res.entryId ?? null, res.submissionId, row.id);
       if (res.entryId) this.entryIndex.set(res.entryId, row.id);
+      // delivered 的判据是 submission 状态（F5/MD3），不是 deliver() 的 resolve：placed/done
+      // 才推进 delivered；queued 仍留 queued 等 watch 镜像或对账补齐。
+      if (res.status === "placed" || res.status === "done") {
+        this.markDelivered(row.id, res.entryId ?? null);
+      }
     } catch (err) {
       // I16：端口错误归因映射，不丢失错误归因（NO_SESSION/ENDPOINT_GONE/LOCK_HELD/NOT_HOT）
       this.parkDelivery(row.id, envelope, parkReasonForPortError(err), endpointId);
@@ -999,10 +1043,15 @@ export class MeshMailbox implements Mailbox {
       .get(accountId, envelope.conversationId);
     if (!inbox || (inbox.overflow_count <= 0 && inbox.pending_count <= 0)) return;
 
-    // 待固化的未读（不含本条）：此前留在 queued 的 P2 投递
+    // 待固化的未读（不含本条）：此前留在 queued 的 P2 投递。A19：一并取回
+    // id/message_id/endpoint_id，供 deliver 前快照内用于 consumed 标记——不再在 await 后
+    // 重新查询，避免把 await 期间新进 queued 的行（未进摘要）误标记为 consumed。
     const items = this.d.store.db
-      .prepare<[string, string, number], { seq: number; from_account: string; text: string | null }>(
-        "SELECT m.seq, m.from_account, json_extract(m.payload, '$.text') AS text " +
+      .prepare<
+        [string, string, number],
+        { seq: number; from_account: string; text: string | null; id: string; message_id: string; endpoint_id: string | null }
+      >(
+        "SELECT m.seq, m.from_account, json_extract(m.payload, '$.text') AS text, d.id, d.message_id, d.endpoint_id " +
           "FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
           "WHERE d.account_id = ? AND m.conversation_id = ? AND d.state = 'queued' " +
           "AND m.seq < ? ORDER BY m.seq",
@@ -1011,6 +1060,9 @@ export class MeshMailbox implements Mailbox {
       seq: number;
       from_account: string;
       text: string | null;
+      id: string;
+      message_id: string;
+      endpoint_id: string | null;
     }>;
     if (items.length === 0 && inbox.overflow_count <= 0) return;
 
@@ -1042,26 +1094,14 @@ export class MeshMailbox implements Mailbox {
     } catch {
       return; // 固化失败不阻塞本条投递；下一条跃迁时再试
     }
-    // 未读清零：被固化的 queued 投递直接 consumed（进过历史，摘要形态）
-    const ids = this.d.store.db
-      .prepare<
-        [string, string, number],
-        { id: string; message_id: string; endpoint_id: string | null }
-      >(
-        "SELECT d.id, d.message_id, d.endpoint_id FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
-          "WHERE d.account_id = ? AND m.conversation_id = ? AND d.state = 'queued' " +
-          "AND m.seq < ? ORDER BY m.seq",
-      )
-      .all(accountId, envelope.conversationId, envelope.seq) as Array<{
-      id: string;
-      message_id: string;
-      endpoint_id: string | null;
-    }>;
+    // 未读清零：被固化的 queued 投递直接 consumed（进过历史，摘要形态）。
+    // A19：用 deliver 前快照（items）内同为 queued 的行作 id 集，而非 await 后重查。
     this.d.store.tx(() => {
       const upd = this.d.store.db.prepare(
-        "UPDATE mesh_deliveries SET state = 'consumed', consumed_at = ?, partial = 1, state_changed_at = ? WHERE id = ?",
+        "UPDATE mesh_deliveries SET state = 'consumed', consumed_at = ?, partial = 1, state_changed_at = ? " +
+          "WHERE id = ? AND state = 'queued'",
       );
-      for (const r of ids) upd.run(isoNow(), isoNow(), r.id);
+      for (const r of items) upd.run(isoNow(), isoNow(), r.id);
       this.resetInboxPending(accountId, envelope.conversationId);
       // I32(b)/(c)：追赶摘要固化是唯一「清折叠」的复位点——游标推进到 spanTo、overflow 清零
       this.d.store.db
@@ -1073,7 +1113,7 @@ export class MeshMailbox implements Mailbox {
     });
     // I26：catchup 固化补发 message_consumed——这些行只以摘要形态进过历史，partial=true
     // （「摘要内折叠」，非全文读毕），与 markConsumedPartial 同口径。
-    for (const r of ids) {
+    for (const r of items) {
       const env = this.envelopeOf(r.message_id);
       if (env) {
         this.d.events.emit("message_consumed", {
@@ -1144,17 +1184,17 @@ export class MeshMailbox implements Mailbox {
   }): void {
     const d = this.d;
     const endpoint = d.registry.getEndpoint(e.endpointId);
-    // 镜像入库（§8.5）：raw_json byte-fidelity；piSessionId 缺失时跳过镜像
+    // 镜像入库（§8.5）：raw_json byte-fidelity；runtimeRef 缺失时跳过镜像
     // （崩溃恢复不以镜像为权威，缺条目只影响回放，§8.4）
-    if (endpoint?.piSessionId) {
+    if (endpoint?.runtimeRef) {
       // 流表行可能在 warm 之前就有 entry 到达（宿主 open 已有 session）：惰性补一行，
       // 否则镜像的外键会炸（镜像不是权威，允许后补流记录）
       d.store.db
         .prepare(
-          "INSERT OR IGNORE INTO mesh_streams (pi_session_id, endpoint_id, account_id, created_at) VALUES (?,?,?,?)",
+          "INSERT OR IGNORE INTO mesh_streams (runtime_ref, endpoint_id, account_id, created_at) VALUES (?,?,?,?)",
         )
         .run(
-          endpoint.piSessionId,
+          endpoint.runtimeRef,
           e.endpointId,
           endpoint.accountId,
           isoNow(),
@@ -1163,13 +1203,13 @@ export class MeshMailbox implements Mailbox {
       // 的 entry 带 envelopeId 但不在 mesh_messages——标量子查询落 NULL，外键安全（镜像非权威）。
       d.store.db
         .prepare(
-          "INSERT OR IGNORE INTO mesh_stream_entries (entry_id, pi_session_id, parent_id, seq_in_stream, " +
+          "INSERT OR IGNORE INTO mesh_stream_entries (entry_id, runtime_ref, parent_id, seq_in_stream, " +
             "entry_type, raw_json, mesh_message_id, created_at) " +
             "SELECT ?,?,?,?,?,?, (SELECT id FROM mesh_messages WHERE id = ?), ?",
         )
         .run(
           e.entryId,
-          endpoint.piSessionId,
+          endpoint.runtimeRef,
           e.parentId ?? null,
           e.seqInStream,
           e.entryType,
@@ -1178,43 +1218,73 @@ export class MeshMailbox implements Mailbox {
           isoNow(),
         );
       const stmt = d.store.db.prepare(
-        "UPDATE mesh_streams SET last_entry_at = ?, entry_count = entry_count + 1, leaf_entry_id = ? WHERE pi_session_id = ?",
+        "UPDATE mesh_streams SET last_entry_at = ?, entry_count = entry_count + 1, leaf_entry_id = ? WHERE runtime_ref = ?",
       );
-      stmt.run(isoNow(), e.entryId, endpoint.piSessionId);
+      stmt.run(isoNow(), e.entryId, endpoint.runtimeRef);
     }
 
     if (!e.envelopeId) return;
-    // envelopeId → 该端点账号的 delivery 推进 delivered（§7.9①）
+    // envelopeId → 该端点的 delivery 推进 delivered。判据是 submission 状态（§9 F-A），不是
+    // entry 出现（F2「entry 差分镜像」退役）：忙流 followUp/write 的 submission 此刻才 placed/done，
+    // entry 落盘只作为「去读 submission」的触发信号。
+    // A01：反查必须落到「本端点」的行——多端点投递下同一 message_id+account_id 有多行，
+    // 只按 message_id+account_id 取会错认到 ep1 的行（ep2 的 entry 认到 ep1 上）。
     const row = d.store.db
       .prepare<[string, string], DeliveryRow>(
-        "SELECT d.* FROM mesh_deliveries d WHERE d.message_id = ? AND d.account_id = " +
-          "(SELECT account_id FROM mesh_endpoints WHERE id = ?)",
+        "SELECT * FROM mesh_deliveries WHERE message_id = ? AND endpoint_id = ?",
       )
       .get(e.envelopeId, e.endpointId) as DeliveryRow | undefined;
-    if (row && (row.state === "queued" || row.state === "routed")) {
-      this.markDelivered(row.id, e.entryId);
+    if (
+      row &&
+      (row.state === "queued" || row.state === "routed") &&
+      row.submission_id
+    ) {
+      void this.confirmEntryDelivery(e.endpointId, row.id, row.submission_id, e.entryId);
+    }
+  }
+
+  /** busy 路径的 delivered 归因：entry 落盘后按 submission 状态投影推进（§9 F-A，F2 退役）。
+   *  entry 出现只作为「该去读 submission」的触发信号，判据是 placed/done 而非 entry 本身。 */
+  private async confirmEntryDelivery(
+    endpointId: EndpointId,
+    deliveryId: DeliveryId,
+    submissionId: string,
+    entryId: string,
+  ): Promise<void> {
+    const d = this.d;
+    let sub: SubmissionRecord | null = null;
+    try {
+      sub = await d.port.submissionStatus(endpointId, submissionId);
+    } catch {
+      sub = null; // 端口读取抛错：判未进转录，交给 reconcile 兜底
+    }
+    if (sub && (sub.status === "placed" || sub.status === "done")) {
+      this.markDelivered(deliveryId, sub.entryId ?? entryId);
     }
   }
 
   handleTurnEnd(endpointId: EndpointId): void {
     const d = this.d;
-    const rows = d.store.db
-      .prepare<[string], DeliveryRow & { seq: number }>(
-        "SELECT d.*, m.seq AS seq FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
-          "JOIN mesh_conversations c ON c.id = m.conversation_id " +
-          "WHERE d.endpoint_id = ? AND d.state = 'delivered' AND c.type != 'queue'",
-      )
-      .all(endpointId) as Array<DeliveryRow & { seq: number }>;
-    if (rows.length === 0) return;
-    const now = isoNow();
-    d.store.tx(() => {
+    // A19：SELECT 移进事务 + UPDATE 带原状态条件（state='delivered'），避免把已被他进程
+    // 终态化/重投的行按陈旧 snapshot 覆盖回 consumed，并让 cursorSeq 推进基于一致快照。
+    const rows = d.store.tx(() => {
+      const rs = d.store.db
+        .prepare<[string], DeliveryRow & { seq: number }>(
+          "SELECT d.*, m.seq AS seq FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
+            "JOIN mesh_conversations c ON c.id = m.conversation_id " +
+            "WHERE d.endpoint_id = ? AND d.state = 'delivered' AND c.type != 'queue'",
+        )
+        .all(endpointId) as Array<DeliveryRow & { seq: number }>;
+      if (rs.length === 0) return [] as Array<DeliveryRow & { seq: number }>;
+      const now = isoNow();
       const upd = d.store.db.prepare(
-        "UPDATE mesh_deliveries SET state = 'consumed', consumed_at = ?, state_changed_at = ? WHERE id = ?",
+        "UPDATE mesh_deliveries SET state = 'consumed', consumed_at = ?, state_changed_at = ? " +
+          "WHERE id = ? AND state = 'delivered'",
       );
-      for (const r of rows) upd.run(now, now, r.id);
+      for (const r of rs) upd.run(now, now, r.id);
       // 按会话分组清未读 + 前移 cursorSeq
       const byConv = new Map<string, number>();
-      for (const r of rows) {
+      for (const r of rs) {
         const conv = this.convOfMessage(r.message_id);
         byConv.set(
           conv,
@@ -1222,7 +1292,7 @@ export class MeshMailbox implements Mailbox {
         );
       }
       for (const [convId, seq] of byConv) {
-        const acct = rows.find((r) => this.convOfMessage(r.message_id) === convId);
+        const acct = rs.find((r) => this.convOfMessage(r.message_id) === convId);
         const accountId = acct?.account_id;
         if (!accountId) continue;
         this.resetInboxPending(accountId, convId);
@@ -1232,7 +1302,9 @@ export class MeshMailbox implements Mailbox {
           )
           .run(seq, accountId, convId);
       }
+      return rs;
     });
+    if (rows.length === 0) return;
     for (const r of rows) {
       const env = this.envelopeOf(r.message_id);
       if (env) {
@@ -1253,6 +1325,22 @@ export class MeshMailbox implements Mailbox {
    *  定档/唤醒判定已在发端完成（deliverOne 落库到 mesh_deliveries）；这里只负责
    *  stream 入流 → entry_appended 推进状态机（F5）。 */
   async handleOutboxDelivery(d: PendingDelivery): Promise<void> {
+    // A11：投递前复核投递行状态——同机 outbox 载体可能在发布后被撤回（tombstone→dropped）
+    // 或已被另一轮认领投递过（claimTtl 回收后重投）。只看 account 会把这些行重新注入流，
+    // 产生「对已撤回消息进流」或「重复进流」。只有「queued/routed 且尚未提交 submission」的行可注入，
+    // 其余一律 ack done 停止重试（终态/已投行的恢复走 submission 对账或 park 重试，不经 outbox）。
+    const row = this.d.store.db
+      .prepare<[string], DeliveryRow>("SELECT * FROM mesh_deliveries WHERE id = ?")
+      .get(d.deliveryId) as DeliveryRow | undefined;
+    if (
+      !row ||
+      (row.state !== "queued" && row.state !== "routed") ||
+      row.submission_id !== null
+    ) {
+      await this.d.transport.ack(d.deliveryId, "delivered");
+      return;
+    }
+
     const account = this.d.registry.getAccount(d.accountId);
     if (!account) {
       throw new Error(
@@ -1261,20 +1349,31 @@ export class MeshMailbox implements Mailbox {
     }
     const path = (d.path ?? "P1") as ContextPath;
 
+    // A33：跨进程 outbox 载体的 payload 不可信——按 message_id 回源 mesh_messages 并走
+    // envelopeOf（§22.4 验签），绝不用 outbox 里可能被篡改的 envelope 渲染。回源失败
+    // （缺行 / seal 不匹配，envelopeOf 已发 invariant_violated）→ 拒绝投递：不渲染、落
+    // dropped、停重试，防篡改 payload 入流。
+    const env = this.envelopeOf(row.message_id);
+    if (!env) {
+      this.dropDelivery(d.deliveryId, null, "TRANSPORT_FAILED");
+      await this.d.transport.ack(d.deliveryId, "delivered");
+      return;
+    }
+
     if (path === "P3") {
       // P3 只记账（§7.6）：note() 完成即 delivered（§7.9 表）= 确认点
       try {
         await this.d.port.note(d.endpointId ?? "", "mesh.audit", {
-          envelopeId: d.envelope.id,
-          seq: d.envelope.seq,
-          conv: d.envelope.conversationId,
-          from: d.envelope.from,
+          envelopeId: env.id,
+          seq: env.seq,
+          conv: env.conversationId,
+          from: env.from,
         });
         this.markDelivered(d.deliveryId, null);
       } catch (err) {
         this.parkDelivery(
           d.deliveryId,
-          d.envelope,
+          env,
           parkReasonForPortError(err),
           d.endpointId ?? undefined,
         );
@@ -1286,7 +1385,22 @@ export class MeshMailbox implements Mailbox {
       // P2 超预算（§7.6）：不全文入流，只写降级留痕 note（§7.4）；delivery 留 queued 交 W08。
       // note 是 outbox 载体的唯一副作用 → 写妥即 ack done，避免 claimTtl 回收后重复留痕。
       try {
-        await this.noteVerbatimExit(d.envelope, d.accountId, d.endpointId ?? "");
+        await this.noteVerbatimExit(env, d.accountId, d.endpointId ?? "");
+        // A10：跨进程 P2 也要让接收方刷新注入文本（本进程无 onRouted 触发），并按先在发端
+        // 定稿的 woke 决定是否以极简 cue 起一轮（I14：档位与唤醒正交）——与本地 P2 分支一致。
+        this.d.onInjectionRefresh?.(d.endpointId ?? "");
+        if (d.woke) {
+          const st = this.d.port.status(d.endpointId ?? "");
+          if (st.state === "hot" && !st.busy) {
+            try {
+              await this.d.port.nudge(d.endpointId ?? "", "该会话有新未读", {
+                triggerTurn: true,
+              });
+            } catch {
+              // nudge 失败不改变 P2 queued 的事实；留待下轮注入确认或下次 warm。
+            }
+          }
+        }
         await this.d.transport.ack(d.deliveryId, "delivered");
       } catch {
         // 降级留痕失败：不回 ack，outbox 行留 claimed 由 poller 回收窗口再试
@@ -1294,29 +1408,32 @@ export class MeshMailbox implements Mailbox {
       return;
     }
 
-    const rendered = this.renderForStream(account, d.envelope);
+    const rendered = this.renderForStream(account, env);
     try {
       const res = await this.d.port.deliver(
         d.endpointId ?? "",
         rendered,
-        d.envelope,
+        env,
         d.grade,
-        { triggerTurn: !!d.woke }, // 唤醒判定已在发端定稿（P1 才按 woke 醒）
+        { triggerTurn: !!d.woke, deliveryId: d.deliveryId, attempt: row.attempt }, // 唤醒判定已在发端定稿（P1 才按 woke 醒）
       );
       this.d.store.db
         .prepare(
-          "UPDATE mesh_deliveries SET handoff_at = ?, entry_id = ? WHERE id = ?",
+          "UPDATE mesh_deliveries SET entry_id = ?, submission_id = ? WHERE id = ?",
         )
-        .run(isoNow(), res.entryId ?? null, d.deliveryId);
+        .run(res.entryId ?? null, res.submissionId, d.deliveryId);
       if (res.entryId) this.entryIndex.set(res.entryId, d.deliveryId);
-      // I02：deliver resolve ≠ delivered（F5）。这里不回 ack——ack 由 markDelivered
-      // 在 entry_appended 到达后的确认点统一发出（SameHostTransport 才落 done）。
+      if (res.status === "placed" || res.status === "done") {
+        this.markDelivered(d.deliveryId, res.entryId ?? null);
+      }
+      // I02：deliver resolve ≠ delivered（§9 F-A）。这里不回 ack——ack 由 markDelivered
+      // 在 submission placed/done 确认点统一发出（SameHostTransport 才落 done）。
     } catch (err) {
       // I16：失败 park 对应 delivery 行并归还原因（归因映射）；不回 ack，
       // 留 outbox claim 由 poller 回收窗口重试。
       this.parkDelivery(
         d.deliveryId,
-        d.envelope,
+        env,
         parkReasonForPortError(err),
         d.endpointId ?? undefined,
       );
@@ -1324,6 +1441,25 @@ export class MeshMailbox implements Mailbox {
   }
 
   // ── 周期清扫（§8.4 ③ 的运行时形态）──────────────────────────────────
+
+  /** A02：重投「滞留在 routed」的行（提交后崩溃/扇出中断时行被永久停在 routed）。
+   *  `beforeIso` 是 state_changed_at 的门槛：sweep 用「超过 seqGapTimeoutMs」避免与
+   *  进行中的扇出竞态；启动 reconcileRouted 用「现在」——单进程启动意味着所有 routed 行都
+   *  是上一进程留下的残骸，可立即重投。 */
+  private async retryRouted(beforeIso: string): Promise<void> {
+    const d = this.d;
+    const stuck = d.store.db
+      .prepare<[string], DeliveryRow>(
+        "SELECT * FROM mesh_deliveries WHERE state = 'routed' AND state_changed_at < ?",
+      )
+      .all(beforeIso) as DeliveryRow[];
+    for (const row of stuck) {
+      const env = this.envelopeOf(row.message_id);
+      if (!env) continue;
+      d.store.bumpCounter("routed_retry");
+      await this.deliverOne(env, row);
+    }
+  }
 
   async sweep(nowMs = Date.now()): Promise<void> {
     const d = this.d;
@@ -1342,23 +1478,10 @@ export class MeshMailbox implements Mailbox {
       d.store.bumpCounter("park_expired");
     }
 
-    // ② handoff 超时（§7.9①）：deliver 已返回但 entry_appended 一直不来
-    const staleHandoff = d.store.db
-      .prepare<[string], DeliveryRow>(
-        "SELECT * FROM mesh_deliveries WHERE state = 'queued' AND handoff_at IS NOT NULL AND handoff_at < ?",
-      )
-      .all(isoFromMs(nowMs - d.limits.handoffTimeoutMs)) as DeliveryRow[];
-    if (staleHandoff.length > 0) {
-      d.store.bumpCounter("delivery_handoff_timeout");
-      const upd = d.store.db.prepare(
-        "UPDATE mesh_deliveries SET handoff_at = NULL, attempts = attempts + 1, redeliver_reason = 'handoff_timeout', state_changed_at = ? WHERE id = ?",
-      );
-      for (const row of staleHandoff) {
-        upd.run(isoNow(), row.id);
-        const env = this.envelopeOf(row.message_id);
-        if (env && row.endpoint_id) await this.deliverOne(env, { ...row, state: "queued", handoff_at: null });
-      }
-    }
+    // ①.5 routed 滞留重投（A02）：消息事务提交后、扇出完成前崩溃/收件人投递抛错会让行
+    // 永久停在 routed——sweep/reconcile/TTL 原本都不覆盖该状态。正常扇出在策略超时（~50ms）内
+    // 把 routed 推进为 queued/终态，阈值沿用 seqGapTimeoutMs 远大于该窗口，不会与进行中的扇出竞态。
+    await this.retryRouted(isoFromMs(nowMs - d.limits.seqGapTimeoutMs));
 
     // ③ 溢出折叠（§7.5）：两个上限，任一触发即折最旧一半
     this.foldOverflow();
@@ -1367,7 +1490,7 @@ export class MeshMailbox implements Mailbox {
     const gapRows = d.store.db
       .prepare<[string], DeliveryRow & { seq: number }>(
         "SELECT d.*, m.seq FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
-          "WHERE d.state = 'queued' AND d.path = 'P1' AND d.handoff_at IS NULL AND d.endpoint_id IS NOT NULL " +
+          "WHERE d.state = 'queued' AND d.path = 'P1' AND d.submission_id IS NULL AND d.endpoint_id IS NOT NULL " +
           "AND d.queued_at < ? ORDER BY m.seq",
       )
       .all(isoFromMs(nowMs - d.limits.seqGapTimeoutMs)) as Array<DeliveryRow & { seq: number }>;
@@ -1377,6 +1500,12 @@ export class MeshMailbox implements Mailbox {
       if (this.isNextInSegment(env, row.account_id, row)) continue; // 缺口已关：留给 drainQueued 保序
       const account = d.registry.getAccount(row.account_id);
       if (!account) continue;
+      // A06：缺口超时强投只对「本进程持有且已热的端点」执行——冷流不得经此升温（违反
+      // §7.2 冷流不升温，silent×cold 与一般冷流都只写 Inbox 留 queued），非本地端点不得
+      // 直接调 port.deliver（应留给持锁进程）。被跳过的行留在 queued，warm/turn_end 后续投。
+      const local = await (this.d.isEndpointLocal?.(row.endpoint_id) ?? true);
+      if (!local) continue;
+      if (d.port.status(row.endpoint_id).state !== "hot") continue;
       d.store.bumpCounter("seq_gap");
       await this.renderAndDeliver(
         env,
@@ -1472,6 +1601,11 @@ export class MeshMailbox implements Mailbox {
     const orphan = d.store.db
       .prepare<[], DeliveryRow>(
         "SELECT d.* FROM mesh_deliveries d WHERE d.state = 'queued' AND d.endpoint_id IS NOT NULL " +
+          // A17：只重建真正的 P1 孤儿（publish 抛错 / publish 前崩溃）。P2 是「超预算只记账、
+          // 按设计常驻 queued」——其 outbox 载体 done 后被保留期修剪，若按「无 outbox 行」当
+          // 孤儿重发，会周期性重写降级 note（mesh.verbatim_exit）。已提交 submission 的 P1 行交给
+          // submission 对账（§8.4）收敛（busy write/input 迟到场景），不在此重建。
+          "AND (d.path IS NULL OR d.path = 'P1') AND d.submission_id IS NULL " +
           "AND NOT EXISTS (SELECT 1 FROM mesh_outbox o WHERE o.delivery_id = d.id)",
       )
       .all() as DeliveryRow[];
@@ -1554,102 +1688,124 @@ export class MeshMailbox implements Mailbox {
   /** 溢出折叠（§7.5）：cursorSeq 前移 + dropped(folded) 两件事必须同时做 */
   private foldOverflow(): void {
     const d = this.d;
-    const over = d.store.db
-      .prepare<
-        [number, number, number, number, number, number, number, number],
-        {
-          account_id: string;
-          conversation_id: string;
-          pending_count: number;
-          pending_bytes: number;
-          maxPending: number;
-          maxPendingBytes: number;
-        }
-      >(
-        "SELECT i.account_id, i.conversation_id, i.pending_count, i.pending_bytes, " +
-          "MIN(COALESCE(json_extract(c.config, '$.maxPending'), ?), ?) AS maxPending, " +
-          "MIN(COALESCE(json_extract(c.config, '$.maxPendingBytes'), ?), ?) AS maxPendingBytes " +
-          "FROM mesh_inboxes i JOIN mesh_conversations c ON c.id = i.conversation_id " +
-          "WHERE i.pending_count > MIN(COALESCE(json_extract(c.config, '$.maxPending'), ?), ?) " +
-          "OR i.pending_bytes > MIN(COALESCE(json_extract(c.config, '$.maxPendingBytes'), ?), ?)",
-      )
-      .all(
-        d.limits.maxPending,
-        d.limits.maxPending,
-        d.limits.maxPendingBytes,
-        d.limits.maxPendingBytes,
-        d.limits.maxPending,
-        d.limits.maxPending,
-        d.limits.maxPendingBytes,
-        d.limits.maxPendingBytes,
-      ) as Array<{
-      account_id: string;
-      conversation_id: string;
-      pending_count: number;
-      maxPending: number;
-      maxPendingBytes: number;
-    }>;
-    for (const o of over) {
-      const foldN = Math.max(1, Math.ceil(o.pending_count / 2));
-      const victims = d.store.db
+    // A19：把「选超限 inbox + 选受害行」与折叠 UPDATE 放进同一事务（IMMEDIATE 写锁），
+    // 并使 UPDATE 带原状态条件，杜绝陈旧 snapshot 下覆盖终态或 pending 双扣。
+    const folded = d.store.tx(() => {
+      const over = d.store.db
         .prepare<
-          [string, string, number],
-          { id: string; seq: number; from_account: string; text: string | null; bytes: number }
+          [number, number, number, number, number, number, number, number],
+          {
+            account_id: string;
+            conversation_id: string;
+            pending_count: number;
+            pending_bytes: number;
+            maxPending: number;
+            maxPendingBytes: number;
+          }
         >(
-          "SELECT d.id, m.seq, m.from_account, json_extract(m.payload, '$.text') AS text, " +
-            "LENGTH(CAST(m.payload AS BLOB)) AS bytes " +
-            "FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
-            "WHERE d.account_id = ? AND m.conversation_id = ? AND d.state IN " +
-            "('queued','parked','delivered') ORDER BY m.seq LIMIT ?",
+          "SELECT i.account_id, i.conversation_id, i.pending_count, i.pending_bytes, " +
+            "MIN(COALESCE(json_extract(c.config, '$.maxPending'), ?), ?) AS maxPending, " +
+            "MIN(COALESCE(json_extract(c.config, '$.maxPendingBytes'), ?), ?) AS maxPendingBytes " +
+            "FROM mesh_inboxes i JOIN mesh_conversations c ON c.id = i.conversation_id " +
+            "WHERE i.pending_count > MIN(COALESCE(json_extract(c.config, '$.maxPending'), ?), ?) " +
+            "OR i.pending_bytes > MIN(COALESCE(json_extract(c.config, '$.maxPendingBytes'), ?), ?)",
         )
-        .all(o.account_id, o.conversation_id, foldN) as Array<{
-        id: string;
-        seq: number;
-        from_account: string;
-        text: string | null;
-        bytes: number;
+        .all(
+          d.limits.maxPending,
+          d.limits.maxPending,
+          d.limits.maxPendingBytes,
+          d.limits.maxPendingBytes,
+          d.limits.maxPending,
+          d.limits.maxPending,
+          d.limits.maxPendingBytes,
+          d.limits.maxPendingBytes,
+        ) as Array<{
+        account_id: string;
+        conversation_id: string;
+        pending_count: number;
+        maxPending: number;
+        maxPendingBytes: number;
       }>;
-      if (victims.length === 0) continue;
-      const digest = mechanicalDigest(
-        victims.map((v) => ({
-          from: v.from_account,
-          name: this.nameOf(v.from_account),
-          seq: v.seq,
-          text: v.text ?? "",
-        })),
-      );
-      const lastSeq = victims[victims.length - 1]!.seq;
-      // 被折叠行离开 pending 集合（C5 口径），pending 计数必须同事务扣减
-      const foldedBytes = victims.reduce((s, v) => s + v.bytes, 0);
-      const now = isoNow();
-      d.store.tx(() => {
+      const results: Array<{
+        accountId: string;
+        conversationId: string;
+        foldedCount: number;
+        fromSeq: number;
+        toSeq: number;
+      }> = [];
+      for (const o of over) {
+        const foldN = Math.max(1, Math.ceil(o.pending_count / 2));
+        const victims = d.store.db
+          .prepare<
+            [string, string, number],
+            { id: string; seq: number; from_account: string; text: string | null; bytes: number }
+          >(
+            "SELECT d.id, m.seq, m.from_account, json_extract(m.payload, '$.text') AS text, " +
+              "LENGTH(CAST(m.payload AS BLOB)) AS bytes " +
+              "FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
+              "WHERE d.account_id = ? AND m.conversation_id = ? AND d.state IN " +
+              "('queued','parked','delivered') ORDER BY m.seq LIMIT ?",
+          )
+          .all(o.account_id, o.conversation_id, foldN) as Array<{
+          id: string;
+          seq: number;
+          from_account: string;
+          text: string | null;
+          bytes: number;
+        }>;
+        if (victims.length === 0) continue;
+        const digest = mechanicalDigest(
+          victims.map((v) => ({
+            from: v.from_account,
+            name: this.nameOf(v.from_account),
+            seq: v.seq,
+            text: v.text ?? "",
+          })),
+        );
+        const lastSeq = victims[victims.length - 1]!.seq;
+        // 被折叠行离开 pending 集合（C5 口径），pending 计数必须同事务扣减。
+        // A19：UPDATE 带原状态条件，只折叠仍在可折叠态的行。
+        const foldedBytes = victims.reduce((s, v) => s + v.bytes, 0);
+        const now = isoNow();
         const upd = d.store.db.prepare(
-          "UPDATE mesh_deliveries SET state = 'dropped', drop_reason = 'folded', state_changed_at = ? WHERE id = ?",
+          "UPDATE mesh_deliveries SET state = 'dropped', drop_reason = 'folded', state_changed_at = ? " +
+            "WHERE id = ? AND state IN ('queued','parked','delivered')",
         );
         for (const v of victims) upd.run(now, v.id);
         d.store.db
           .prepare(
             "UPDATE mesh_inboxes SET overflow_count = overflow_count + ?, overflow_summary = COALESCE(overflow_summary, '') || ?, " +
-              "cursor_seq = MAX(cursor_seq, ?), pending_count = pending_count - ?, " +
+              "cursor_seq = MAX(cursor_seq, ?), folded_to_seq = MAX(folded_to_seq, ?), pending_count = pending_count - ?, " +
               "pending_bytes = MAX(0, pending_bytes - ?) WHERE account_id = ? AND conversation_id = ?",
           )
           .run(
             victims.length,
             digest,
             lastSeq,
+            lastSeq,
             victims.length,
             foldedBytes,
             o.account_id,
             o.conversation_id,
           );
-      });
+        results.push({
+          accountId: o.account_id,
+          conversationId: o.conversation_id,
+          foldedCount: victims.length,
+          fromSeq: victims[0]!.seq,
+          toSeq: lastSeq,
+        });
+      }
+      return results;
+    });
+    for (const r of folded) {
       d.store.bumpCounter("inbox_overflowed");
       d.store.bumpCounter("fold_events"); // 附录 E ③：与 inbox_overflowed 1:1 成对（每次折叠 +1）
       d.events.emit("inbox_overflowed", {
-        accountId: o.account_id,
-        conversationId: o.conversation_id,
-        foldedCount: victims.length,
-        foldedRange: [victims[0]!.seq, lastSeq],
+        accountId: r.accountId,
+        conversationId: r.conversationId,
+        foldedCount: r.foldedCount,
+        foldedRange: [r.fromSeq, r.toSeq],
       });
     }
   }
@@ -1737,25 +1893,20 @@ export class MeshMailbox implements Mailbox {
   }
 
   private async requeueParked(row: DeliveryRow): Promise<void> {
+    const d = this.d;
+    // A03：已带 submission_id 的 parked 行（核对阶段 warm 失败而 park、但 submission 可能仍
+    // 已 placed/done）不能盲重投——同一条目会在 session 里出现两次（违反 I5）。留给 reconcile
+    // 按 submission id 精确读（done / unanswered 带 entry → consumed(partial)，绝不重投）。
+    if (row.submission_id) return;
     // I28：重投原因落库（旧 parked_reason，如 NO_SESSION/LEASE_HELD/SINK_REFUSED）。SQLite
     // 的 SET 子句以旧行快照求值，故 redeliver_reason=parked_reason 取到的是清空前的值。
-    this.d.store.db
+    d.store.db
       .prepare(
         "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, parked_reason = NULL, parked_at = NULL, redeliver_reason = parked_reason, state_changed_at = ? WHERE id = ?",
       )
       .run(isoNow(), isoNow(), row.id);
     const env = this.envelopeOf(row.message_id);
     if (env) await this.deliverOne(env, { ...row, state: "queued" });
-  }
-
-  /** I22：clearQueue 前把 delivered 未 consumed 回退为 queued（清空后重投） */
-  async beforeClearQueue(endpointId: EndpointId): Promise<void> {
-    this.d.store.db
-      .prepare(
-        "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, consumed_at = NULL, entry_id = NULL, state_changed_at = ? " +
-          "WHERE endpoint_id = ? AND state = 'delivered'",
-      )
-      .run(isoNow(), isoNow(), endpointId);
   }
 
   /** sink/external 的消费确认（无 turn_end，§12.2 ④） */
@@ -1773,7 +1924,8 @@ export class MeshMailbox implements Mailbox {
     d.store.tx(() => {
       d.store.db
         .prepare(
-          "UPDATE mesh_deliveries SET state = 'consumed', consumed_at = ?, state_changed_at = ? WHERE id = ?",
+          "UPDATE mesh_deliveries SET state = 'consumed', consumed_at = ?, state_changed_at = ? " +
+            "WHERE id = ? AND state IN ('delivered','queued')",
         )
         .run(now, now, deliveryId);
       this.resetInboxPending(row.account_id, conv);
@@ -1798,20 +1950,31 @@ export class MeshMailbox implements Mailbox {
 
   // ── §8.4 崩溃恢复：delivered ↔ session 双向核对（权威是 pi session，非镜像）────
 
-  /** 对账全部「已投但未确认」的 P1 行（state ∈ {delivered, parked}、带 entry_id、非 queue），
-   *  按 entry_id 问真实 session：在 → consumed(partial)；不在 → queued 重投（幂等键防重）；
-   *  拿不到 session → park 并保留 entry_id（下次 warm 成功再对账；NO_SESSION 自带告警，§23.6）。 */
+  /** A02 启动对账：上一进程崩溃时停在 `routed` 的投递行不会被 sweep（有阈值）/TTL/常规
+   *  reconcile 覆盖，启动即重投（阈值取「现在」——单进程启动，所有 routed 行都是残骸）。
+   *  重投复用 deliverOne 的完整判据，幂等由状态机保证（回到 queued/终态）。 */
+  async reconcileRouted(): Promise<void> {
+    await this.retryRouted(isoNow());
+  }
+
+  /** 对账全部「已投但未确认」的 P1 行（state ∈ {delivered, parked}、带 submission_id、非 queue），
+   *  按 submission id 问真实 session：done/unanswered 带 entry → consumed(partial)；unanswered
+   *  无 entry/记录不存在 → attempt+1 回 queued 重投；拿不到 session → park 并保留 submission_id
+   *  （下次 warm 成功再对账；NO_SESSION 自带告警，§23.6）。
+   *  A04：sweep 只核对 parked 行或本进程启动前已 delivered 的崩溃残骸，运行中端点的 delivered
+   *  行交给 turn_end（consumed 只能由 turn_end 归因，§7.9）。 */
   async reconcileDelivered(): Promise<void> {
     const d = this.d;
     const rows = d.store.db
-      .prepare<[], ReconcileRow>(
+      .prepare<[string], ReconcileRow>(
         "SELECT d.*, m.seq, m.conversation_id FROM mesh_deliveries d " +
           "JOIN mesh_messages m ON m.id = d.message_id " +
           "JOIN mesh_conversations c ON c.id = m.conversation_id " +
-          "WHERE d.state IN ('delivered','parked') AND d.entry_id IS NOT NULL " +
-          "AND d.endpoint_id IS NOT NULL AND c.type != 'queue'",
+          "WHERE d.endpoint_id IS NOT NULL AND d.submission_id IS NOT NULL " +
+          "AND c.type != 'queue' " +
+          "AND (d.state = 'parked' OR (d.state = 'delivered' AND d.delivered_at < ?))",
       )
-      .all() as ReconcileRow[];
+      .all(this.bootIso) as ReconcileRow[];
     if (rows.length === 0) return;
     const byEndpoint = new Map<EndpointId, ReconcileRow[]>();
     for (const row of rows) {
@@ -1832,7 +1995,7 @@ export class MeshMailbox implements Mailbox {
         "SELECT d.*, m.seq, m.conversation_id FROM mesh_deliveries d " +
           "JOIN mesh_messages m ON m.id = d.message_id " +
           "JOIN mesh_conversations c ON c.id = m.conversation_id " +
-          "WHERE d.endpoint_id = ? AND d.state IN ('delivered','parked') AND d.entry_id IS NOT NULL " +
+          "WHERE d.endpoint_id = ? AND d.state IN ('delivered','parked') AND d.submission_id IS NOT NULL " +
           "AND c.type != 'queue'",
       )
       .all(endpointId) as ReconcileRow[];
@@ -1874,32 +2037,29 @@ export class MeshMailbox implements Mailbox {
     } else if (status.busy) {
       return; // turn 进行中：交给 turn_end 消费（§8.4 窗口只针对进程已死的空闲态）
     }
-    let alive: Set<string>;
-    try {
-      alive = await d.port.hasEntries(
-        endpointId,
-        rows.map((r) => r.entry_id!),
-      );
-    } catch (err) {
-      for (const row of rows) {
-        if (row.state === "parked") continue;
-        this.parkDelivery(
-          row.id,
-          this.envelopeOf(row.message_id),
-          parkReasonForPortError(err),
-          endpointId,
-        );
-      }
-      return;
-    }
     for (const row of rows) {
-      if (alive.has(row.entry_id!)) this.markConsumedPartial(row);
-      else await this.requeueForRedelivery(row);
+      // §8.4：按 submission id 精确读（取代 hasEntries 的 entry 存在性模糊判定，MD3）。
+      let sub: SubmissionRecord | null = null;
+      if (row.submission_id) {
+        try {
+          sub = await d.port.submissionStatus(endpointId, row.submission_id);
+        } catch {
+          sub = null; // 端口读取抛错：按记录不存在处理，回 queued 重投（re-deliver 失败再 park）
+        }
+      }
+      if (sub && (sub.status === "done" || (sub.status === "unanswered" && sub.entryId !== undefined))) {
+        // 已进转录（done / unanswered 带 entry）：consumed(partial)，不得重投（§9 F-A）。
+        this.markConsumedPartial(row, sub.entryId ?? row.entry_id);
+      } else {
+        // 未进转录（unanswered 无 entry / 记录不存在 / queued 或 placed 但进程已死）→ 重投。
+        await this.requeueForRedelivery(row);
+      }
     }
   }
 
-  /** 已进过上下文但没确认跑完：delivered/parked → consumed(partial)，前移 cursor（不进镜像） */
-  private markConsumedPartial(row: ReconcileRow): void {
+  /** 已进过上下文但没确认跑完：delivered/parked → consumed(partial)，前移 cursor（不进镜像）。
+   *  entryId 以 submission 权威投影为准（row.entry_id 可能是旧缓存）。 */
+  private markConsumedPartial(row: ReconcileRow, entryId: string | null): void {
     const d = this.d;
     const now = isoNow();
     d.store.tx(() => {
@@ -1925,28 +2085,37 @@ export class MeshMailbox implements Mailbox {
         endpointId: row.endpoint_id ?? "",
         accountId: row.account_id,
         partial: true,
-        entryId: row.entry_id!,
+        ...(entryId ? { entryId } : {}),
       });
     }
   }
 
-  /** entry 未落进 session（崩在 pi 落盘前）：回 queued 重投，entry_id 清空（幂等键防重） */
+  /** 未进转录（submission unanswered 不带 entry / 记录不存在）→ 回 queued 重投：attempt+1 换新
+   *  requestId（MD3），清 submission_id/entry_id（幂等键防重）。 */
   private async requeueForRedelivery(row: ReconcileRow): Promise<void> {
     const d = this.d;
     const now = isoNow();
-    d.store.tx(() => {
-      d.store.db
+    const moved = d.store.tx(() => {
+      const res = d.store.db
         .prepare(
-          "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, entry_id = NULL, " +
-            "handoff_at = NULL, parked_reason = NULL, parked_at = NULL, redeliver_reason = 'entry_vanished', " +
-            "state_changed_at = ? WHERE id = ? AND state IN ('delivered','parked')",
+          "UPDATE mesh_deliveries SET state = 'queued', queued_at = ?, submission_id = NULL, " +
+            "entry_id = NULL, attempt = attempt + 1, parked_reason = NULL, " +
+            "parked_at = NULL, redeliver_reason = 'entry_vanished', state_changed_at = ? " +
+            "WHERE id = ? AND state IN ('delivered','parked')",
         )
         .run(now, now, row.id);
-      this.resetInboxPending(row.account_id, row.conversation_id);
-      // I27（§7481）：hasEntries 声明仍在、但 entry 早已不在 session —— 判定为「队列被
-      // 清过/entry 旁落」，是 W11 的 W13-reconcile 咽喉，单独计数以便观察清队列回归。
-      d.store.bumpCounter("queue_cleared_detected");
+      if (res.changes > 0) {
+        this.resetInboxPending(row.account_id, row.conversation_id);
+        // I27（§7481）：submission 未进转录（unanswered 无 entry / 记录不存在）——判定为「条目
+        // 旁落」，是 W11 的 W13-reconcile 咽喉，单独计数以便观察清队列/旁落回归。
+        d.store.bumpCounter("queue_cleared_detected");
+      }
+      return res.changes > 0;
     });
+    // A04 并发守卫：对账循环内，先前重投的 woke turn 可能已把本行 consumed（终态）。此时
+    // guarded UPDATE 落 0 行——不可再 deliverOne（其无条件落 queued 会把终态行复活为
+    // delivered，既违反「终态不可复活」又让 pending_count 漂移，见 C5）。
+    if (!moved) return;
     const env = this.envelopeOf(row.message_id);
     const live = d.store.db
       .prepare<[string], DeliveryRow>("SELECT * FROM mesh_deliveries WHERE id = ?")
@@ -1957,23 +2126,36 @@ export class MeshMailbox implements Mailbox {
   }
 
   /** I09：P2 注入确认（§7.6）——该端点注入体进入真实 LLM 调用最终输入（context_with_system
-   *  观测）后，把该端点全部 `path='P2' AND state='queued'` 行推为 delivered（无 entry_id）；
-   *  turn_end 再 consumed 并前移 cursorSeq。endpoint 级（双端点不互相确认），不再按 account 全量。 */
+   *  观测）后，把**注入体计算时快照内的** `path='P2' AND state='queued'` 行推为 delivered（无
+   *  entry_id）；turn_end 再 consumed 并前移 cursorSeq。endpoint 级（双端点不互相确认），不再
+   *  按 account 全量。A10：只确认快照内那批 id，注入体计算之后新到、未进注入体的行不确认。 */
   confirmInjection(endpointId: EndpointId): void {
     const d = this.d;
-    const rows = d.store.db
-      .prepare<[string], DeliveryRow>(
-        "SELECT * FROM mesh_deliveries WHERE endpoint_id = ? AND path = 'P2' AND state = 'queued'",
-      )
-      .all(endpointId) as DeliveryRow[];
-    if (rows.length === 0) return;
-    const now = isoNow();
-    const upd = d.store.db.prepare(
-      "UPDATE mesh_deliveries SET state = 'delivered', delivered_at = ?, entry_id = NULL, handoff_at = NULL, state_changed_at = ? WHERE id = ?",
-    );
-    d.store.tx(() => {
-      for (const r of rows) upd.run(now, now, r.id);
+    const ids = this.injectionIds.get(endpointId);
+    if (!ids || ids.size === 0) return;
+    // A19 + A10：把 SELECT 移进同一事务，UPDATE 带原状态条件（state='queued' && path='P2'）
+    // 且只限快照内的 id——避免 sameHost 下读到陈旧 queued 后把已被他进程终态化的行覆盖回
+    // delivered，也避免把注入体计算之后才到达的行误标 delivered。
+    const rows = d.store.tx(() => {
+      const rs = d.store.db
+        .prepare<[string], DeliveryRow>(
+          "SELECT * FROM mesh_deliveries WHERE endpoint_id = ? AND path = 'P2' AND state = 'queued'",
+        )
+        .all(endpointId) as DeliveryRow[];
+      const inSnapshot = rs.filter((r) => ids.has(r.id));
+      if (inSnapshot.length === 0) return [] as DeliveryRow[];
+      const now = isoNow();
+      const upd = d.store.db.prepare(
+        "UPDATE mesh_deliveries SET state = 'delivered', delivered_at = ?, entry_id = NULL, state_changed_at = ? " +
+          "WHERE id = ? AND state = 'queued' AND path = 'P2'",
+      );
+      for (const r of inSnapshot) upd.run(now, now, r.id);
+      return inSnapshot;
     });
+    // 快照一经确认即清空：同一注入体再次进入后续轮不应重确认（行已 delivered，state 守卫兜底），
+    // 也确保下一轮 refreshInjection 重算后取到的是新的快照。
+    this.injectionIds.delete(endpointId);
+    if (rows.length === 0) return;
     for (const r of rows) {
       const env = this.envelopeOf(r.message_id);
       if (!env) continue;
@@ -1994,7 +2176,7 @@ export class MeshMailbox implements Mailbox {
     const rows = d.store.db
       .prepare<[string], DeliveryRow>(
         "SELECT d.* FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id " +
-          "WHERE d.endpoint_id = ? AND d.state = 'queued' AND d.path = 'P1' AND d.handoff_at IS NULL " +
+          "WHERE d.endpoint_id = ? AND d.state = 'queued' AND d.path = 'P1' AND d.submission_id IS NULL " +
           "ORDER BY m.seq",
       )
       .all(endpointId) as DeliveryRow[];
@@ -2090,7 +2272,18 @@ export class MeshMailbox implements Mailbox {
    *  审计 note（P3）不泄进注入体。inboxOf 的 pending_count 口径（全路径）不变。 */
   inboxInjection(endpointId: EndpointId): string | null {
     const endpoint = this.d.registry.getEndpoint(endpointId);
-    if (!endpoint) return null;
+    if (!endpoint) {
+      this.injectionIds.delete(endpointId);
+      return null;
+    }
+    // A10：注入体计算时快照本端点此刻 queued 的 P2 行 id（与 confirmInjection 同口径：
+    // endpoint_id=? AND path='P2' AND state='queued'）。确认只认这批，注入体计算之后新到的
+    // 未读行不在此快照里，不会被误确认。返回非空时写入 this.injectionIds，返回空时清空。
+    const queuedP2 = this.d.store.db
+      .prepare<[string], { id: string }>(
+        "SELECT id FROM mesh_deliveries WHERE endpoint_id = ? AND path = 'P2' AND state = 'queued'",
+      )
+      .all(endpointId) as Array<{ id: string }>;
     const convRows = this.d.store.db
       .prepare<
         [string],
@@ -2139,29 +2332,27 @@ export class MeshMailbox implements Mailbox {
       if (recent.length > 0) {
         lines.push("[recent]");
         for (const r of recent) {
+          // A34/防线 1：原文预览的属性值同样转义——from_account 是发送方可控 id，
+          // 与 renderInbox 的 attrs() 同口径（清定界符再清引号），不靠外层二次解析兜底。
+          const from = escapeDelims(r.from_account).replaceAll('"', "'");
           lines.push(
-            `  <<<MSG seq="${r.seq}" from="${r.from_account}">>> ${escapeDelims(truncate(r.text ?? "", 40))} <<<END MSG>>>`,
+            `  <<<MSG seq="${r.seq}" from="${from}">>> ${escapeDelims(truncate(r.text ?? "", 40))} <<<END MSG>>>`,
           );
         }
       }
+      const convId = escapeDelims(conv.conversation_id).replaceAll('"', "'");
       blocks.push(
-        `<<<INBOX conv="${conv.conversation_id}" unread="${conv.unread}" overflow="${conv.overflow_count}">>>\n` +
+        `<<<INBOX conv="${convId}" unread="${conv.unread}" overflow="${conv.overflow_count}">>>\n` +
           lines.join("\n") +
           "\n<<<END INBOX>>>",
       );
     }
-    if (blocks.length === 0) return null;
+    if (blocks.length === 0) {
+      this.injectionIds.delete(endpointId);
+      return null;
+    }
+    this.injectionIds.set(endpointId, new Set(queuedP2.map((r) => r.id)));
     return blocks.join("\n\n");
-  }
-
-  /** 背压自持计数（F3/§7.8）：queued+delivered 行数，不读 SDK 字段 */
-  inFlightCount(endpointId: EndpointId): number {
-    const row = this.d.store.db
-      .prepare<[string], { n: number }>(
-        "SELECT COUNT(*) AS n FROM mesh_deliveries WHERE endpoint_id = ? AND state IN ('queued','delivered')",
-      )
-      .get(endpointId);
-    return row?.n ?? 0;
   }
 
   // ── queue（§17）：claim / ack / 租约回收 ────────────────────────────────
@@ -2442,7 +2633,7 @@ export class MeshMailbox implements Mailbox {
       : null;
     const res = d.store.db
       .prepare(
-        "UPDATE mesh_deliveries SET state = 'delivered', delivered_at = ?, entry_id = ?, handoff_at = NULL, state_changed_at = ?, " +
+        "UPDATE mesh_deliveries SET state = 'delivered', delivered_at = ?, entry_id = ?, state_changed_at = ?, " +
           "claim_until = COALESCE(?, claim_until) " +
           "WHERE id = ? AND state IN ('queued','routed')",
       )
@@ -2485,7 +2676,8 @@ export class MeshMailbox implements Mailbox {
     d.store.db
       .prepare(
         "UPDATE mesh_deliveries SET state = 'parked', parked_reason = ?, parked_at = ?, " +
-          "state_changed_at = ?, endpoint_id = COALESCE(?, endpoint_id) WHERE id = ?",
+          "state_changed_at = ?, endpoint_id = COALESCE(?, endpoint_id) WHERE id = ? " +
+          "AND state NOT IN ('dropped','consumed')", // A05：终态行不可被改回 parked（否则被重投/复活）；delivered→parked 由 reconcile 走（A03 移交迁移步骤 8）
       )
       .run(reason, now, now, endpointId ?? null, deliveryId);
     d.store.bumpCounter("parked_total");
@@ -2532,7 +2724,8 @@ export class MeshMailbox implements Mailbox {
     const now = isoNow();
     d.store.db
       .prepare(
-        "UPDATE mesh_deliveries SET state = 'dropped', drop_reason = ?, state_changed_at = ? WHERE id = ?",
+        "UPDATE mesh_deliveries SET state = 'dropped', drop_reason = ?, state_changed_at = ? WHERE id = ? " +
+          "AND state IN ('routed','queued','parked')", // A05：drop 同样只从非终态跃迁，不覆盖 delivered/consumed/dropped
       )
       .run(reason, now, deliveryId);
     if (prev) d.store.recomputeInbox(prev.account_id, prev.conversation_id);

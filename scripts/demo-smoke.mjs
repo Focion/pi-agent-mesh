@@ -171,10 +171,14 @@ try {
   if (res.ok !== true) {
     fail("6/invariants", `ok=false: ${res.error?.message}`);
   } else {
-    const violations = res.result?.violations ?? res.result;
-    const hasViolation = Array.isArray(violations) ? violations.length > 0 : false;
-    assert(!hasViolation, "6/invariants.clean",
-      `存在 violation: ${JSON.stringify(violations)}`);
+    // A45：violations 必须是数组——缺失（结果形状不符 / 字段改名）不得当作「干净」。
+    const violations = res.result?.violations;
+    if (!Array.isArray(violations)) {
+      fail("6/invariants.clean", `响应缺少 violations 数组: ${JSON.stringify(res.result)}`);
+    } else {
+      assert(violations.length === 0, "6/invariants.clean",
+        `存在 violation: ${JSON.stringify(violations)}`);
+    }
   }
 } catch (err) {
   fail("6/invariants", err.message);

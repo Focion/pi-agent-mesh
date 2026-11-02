@@ -23,7 +23,7 @@ const FIXTURE = fileURLToPath(
 );
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "dual-lock" }),
+  create: async () => ({ session: {}, runtimeRef: "dual-lock" }),
   open: async () => ({ session: {} }),
 };
 

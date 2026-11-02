@@ -131,8 +131,9 @@ describe("W01 投递状态域冻结", () => {
 // ─── ③ 状态转换表（§7.9）：自洽 + 终态无出边 ────────────────────────────────
 
 // 冻结的合法迁移（from → to）。routed→delivered 是 markDelivered 的 WHERE 守卫
-// `state IN ('queued','routed')` 兼容的容错边；delivered→queued 是 beforeClearQueue(I22)
-// 补偿边；delivered→claimed 是 queue 竞争消费（claim 要求 row.state==='delivered'）。
+// `state IN ('queued','routed')` 兼容的容错边；delivered→queued 是 submission 对账
+// 重投（unanswered 无 entry，取代 beforeClearQueue/I22）补偿边；
+// delivered→claimed 是 queue 竞争消费（claim 要求 row.state==='delivered'）。
 const LEGAL_TRANSITIONS: Record<string, readonly string[]> = {
   routed: ["queued", "parked", "delivered", "dropped"],
   queued: ["delivered", "parked", "dropped"],

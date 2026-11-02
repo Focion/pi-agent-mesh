@@ -9,6 +9,14 @@ import type { PendingDelivery } from "../../src/core/types.js";
 import { openTestDb } from "../helpers/db.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const waitFor = async (cond: () => boolean, ms = 2000): Promise<void> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise<void>((r) => setTimeout(r, 10));
+  }
+  throw new Error("waitFor: condition not met within " + ms + "ms");
+};
 
 /** 构造一条最小 PendingDelivery */
 function mkDelivery(
@@ -229,8 +237,8 @@ describe("SameHostTransport", () => {
     t.start();
     await t.publish(d);
 
-    // 等待至少一轮轮询
-    await sleep(150);
+    // 等待至少一轮轮询（pollIntervalMs=50）
+    await waitFor(() => delivered > 0);
     expect(delivered).toBeGreaterThanOrEqual(1);
 
     // 停掉 poller

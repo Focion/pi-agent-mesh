@@ -6,11 +6,13 @@
 // 外国锁文件）；这里两个真 OS 进程各自 createMesh（transport:"sameHost"）+ 真实
 // PiStreamPort + createPiSessionFactory(faux)，warm 各自端点后由 PiStreamPort 以
 // 自身 pid/writerId 写真实端点锁。alice 发 bob 的消息因 bob 端点锁异主进 outbox，
-// 由 B 进程 poller 认领 → PiStreamPort.deliver → bob 真实磁盘 session JSONL。
+// 由 B 进程 poller 认领 → PiStreamPort.deliver → bob 真实 durable storage。
 //
-// 握手全用共享 tmpdir 的文件（ready/result）+ 环境变量传参，避免 vitest 的 `--`
-// arg 转发差异；断言「跨进程正文进 session + 端点锁归属 + dedup_hit===0 + 两端
-// 16 条不变量」分别落在拥有 session 的一方。
+// 握手全用共享 tmpdir 的文件（ready/result）+ 环境变量传参；断言「跨进程正文进
+// session + 端点锁归属 + dedup_hit===0 + 两端 16 条不变量」分别落在拥有 session 的一方。
+//
+// durable 后端：createPiSessionFactory({stateDir,models,model}) 直接吃 faux 的
+// models+model，无 registerFauxInto 包装。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -19,9 +21,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { createMesh, type MeshHost, type SessionFactory } from "../../src/index.js";
+import { createMesh, type MeshHost } from "../../src/index.js";
 import { createPiSessionFactory } from "../../src/pi/session-factory.js";
-import { createFaux, registerFauxInto, waitFor, type FauxCore } from "../helpers/pi-session.js";
+import { createFaux, waitFor } from "../helpers/pi-session.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
 const ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -29,23 +31,6 @@ const VITEST_CLI = join(ROOT, "node_modules", "vitest", "vitest.mjs");
 const AGENT_FILE = join(ROOT, "tests", "e2e", "two-process-agent.test.ts");
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-/** 用真 faux 包一层 SessionFactory（alice 侧：起真 pi 会话、暖端点写锁但不跑轮）。 */
-function fauxFactory(stateDir: string, agentDir: string, faux: FauxCore): SessionFactory {
-  const inner = createPiSessionFactory({ stateDir, agentDir, model: faux.getModel(), tools: [] });
-  return {
-    async create(ctx) {
-      const r = await inner.create(ctx);
-      registerFauxInto(r.session, faux);
-      return r;
-    },
-    async open(ctx) {
-      const r = await inner.open(ctx);
-      registerFauxInto(r.session, faux);
-      return r;
-    },
-  };
-}
 
 function spawnRoleB(
   dbPath: string,
@@ -83,7 +68,7 @@ describe("G05: 真实双 OS 进程 + 真实 Pi 端口跨进程投递（§19.3 + 
     live.length = 0;
   });
 
-  it("A→B 跨进程投递落进 bob 真实 session JSONL，两端 16 绿 + dedup_hit===0", async () => {
+  it("A→B 跨进程投递落进 bob 真实 session storage，两端 16 绿 + dedup_hit===0", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mesh-2proc-"));
     const dbPath = join(dir, "mesh.db");
     const readyPath = join(dir, "ready");
@@ -96,8 +81,10 @@ describe("G05: 真实双 OS 进程 + 真实 Pi 端口跨进程投递（§19.3 + 
       dbPath,
       transport: "sameHost",
       transportOptions: { pollIntervalMs: 50, claimTtlMs: 5000 },
-      policies: { sessionFactory: fauxFactory(stateDir, dir, fauxA) },
-      limits: { handoffTimeoutMs: 1000 },
+      policies: {
+        sessionFactory: createPiSessionFactory({ stateDir, models: fauxA.models, model: fauxA.model }),
+      },
+      limits: {},
       devMode: true,
     });
     await hostA.registerAccount({
@@ -119,7 +106,7 @@ describe("G05: 真实双 OS 进程 + 真实 Pi 端口跨进程投递（§19.3 + 
 
       // alice —组会话→ bob。用 group + expect:"ack"（同 samehost.test.ts）：ack 使 bob 进入
       // 原文预算内（§7.4 P1 全文），真正走 outbox→PiStreamPort.deliver→磁盘 session 的
-      // 跨进程全文路径；全文以 custom_message 条目落进 bob session，供子进程断言。
+      // 跨进程全文路径；全文以 mesh.msg 条目落进 bob session，供子进程断言。
       const conv = await hostA.createConversation({
         type: "group",
         creator: "alice",

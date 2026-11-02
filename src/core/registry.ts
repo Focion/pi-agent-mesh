@@ -91,7 +91,7 @@ interface EndpointRow {
   pool_slot: number | null;
   pool_size: number | null;
   pool_affinity: string | null;
-  pi_session_id: string | null;
+  runtime_ref: string | null;
   lease_mode: string;
   lease_until: string | null;
   lock_path: string | null;
@@ -161,7 +161,7 @@ function rowToEndpoint(r: EndpointRow): Endpoint {
     accountId: r.account_id,
     topology,
     state: r.state as EndpointState,
-    piSessionId: r.pi_session_id,
+    runtimeRef: r.runtime_ref,
     lease: r.lease_mode as MeshLease,
     leaseUntil: r.lease_until,
     lastActiveAt: r.last_active_at,
@@ -184,6 +184,18 @@ function rowToConversation(r: ConversationRow, limits: Limits): Conversation {
   };
 }
 
+// A32（§9.4/附录 F.3）：mentionAllPerHour 值域 0–100；maxHistoryOnJoin 注入是成本，
+// 无界注水会一次性灌入上千条，故夹到 [0, 500]。历史可见性只有三个合法取值。
+const MENTION_ALL_PER_HOUR_MAX = 100;
+const MAX_HISTORY_ON_JOIN_MAX = 500;
+
+/** A32：把配置里的数字夹成 [min,max] 的整数；非有限数/非法类型回落到 fallback。 */
+function clampInt(v: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : NaN;
+  if (Number.isNaN(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
 /** §9.4：单会话配置只允许收紧；未给的项取全局 Limits；groupSizeHardCap 夹到全局值 */
 function normalizeConfig(
   type: string,
@@ -197,9 +209,14 @@ function normalizeConfig(
           limits.groupSizeHardCap,
         )
       : undefined;
+  const vis = c.historyVisibility;
   return {
-    historyVisibility: c.historyVisibility ?? "since_join",
-    maxHistoryOnJoin: c.maxHistoryOnJoin ?? 0,
+    // A32：historyVisibility 只认三个合法值，非法回落默认 "since_join"（只收紧不放宽）
+    historyVisibility:
+      vis === "none" || vis === "since_join" || vis === "full"
+        ? vis
+        : "since_join",
+    maxHistoryOnJoin: clampInt(c.maxHistoryOnJoin, 0, 0, MAX_HISTORY_ON_JOIN_MAX),
     openJoin: c.openJoin ?? false,
     groupSizeHardCap: hardCap,
     // I30：claimTtlMs 只允许在 [1000, 全局上限] 内收紧/放宽到合理范围
@@ -207,7 +224,7 @@ function normalizeConfig(
       Math.max(c.claimTtlMs ?? limits.claimTtlMs, 1000),
       limits.claimTtlMs,
     ),
-    mentionAllPerHour: c.mentionAllPerHour ?? 3,
+    mentionAllPerHour: clampInt(c.mentionAllPerHour, 3, 0, MENTION_ALL_PER_HOUR_MAX),
     maxPending: Math.min(c.maxPending ?? limits.maxPending, limits.maxPending),
     maxPendingBytes: Math.min(
       c.maxPendingBytes ?? limits.maxPendingBytes,
@@ -226,6 +243,8 @@ export class MeshRegistry implements Registry {
     busy: boolean;
     idleMs?: number;
   };
+  /** A20：事务执行器（装配层注入 Store.tx，IMMEDIATE + 时钟检测）；缺省退化为 BEGIN IMMEDIATE。 */
+  private txFn?: <T>(fn: () => T) => T;
 
   constructor(
     db: Database.Database,
@@ -235,11 +254,31 @@ export class MeshRegistry implements Registry {
         busy: boolean;
         idleMs?: number;
       };
+      tx?: <T>(fn: () => T) => T;
     },
   ) {
     this.db = db;
     this.limits = limits;
     this.deriveStatus = opts?.deriveStatus;
+    this.txFn = opts?.tx;
+  }
+
+  /** A20：成员/会话写事务统一走 IMMEDIATE；无注入时退化为 BEGIN IMMEDIATE（测试/最小装配）。 */
+  private tx<T>(fn: () => T): T {
+    if (this.txFn) return this.txFn(fn);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const out = fn();
+      this.db.exec("COMMIT");
+      return out;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // rollback 失败不掩盖原错误。
+      }
+      throw err;
+    }
   }
 
   /**
@@ -287,29 +326,51 @@ export class MeshRegistry implements Registry {
   lookupAccounts(q: {
     query?: string;
     capabilities?: string[];
+    conversationId?: string;
     limit?: number;
   }): Account[] {
     const limit = Math.min(Math.max(q.limit ?? 20, 1), 100);
-    const rows = this.db
-      .prepare<[number], AccountRow>(
-        "SELECT * FROM mesh_accounts WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT ?",
-      )
-      .all(limit) as AccountRow[];
-    let accounts = rows.map(rowToAccount);
+    // A34：先 LIMIT 再过滤会漏结果（先取前 N 条再筛，匹配项排第 N 之后就被漏掉），
+    // 因此把 query/capabilities/会话成员全部压进 WHERE 再 LIMIT。
+    let sql = "SELECT * FROM mesh_accounts WHERE archived_at IS NULL";
+    const args: unknown[] = [];
     if (q.query) {
-      const needle = q.query.toLowerCase();
-      accounts = accounts.filter(
-        (a) =>
-          a.id.toLowerCase().includes(needle) ||
-          a.displayName.toLowerCase().includes(needle),
-      );
+      sql += " AND (id LIKE ? OR display_name LIKE ?)";
+      args.push(`%${q.query}%`, `%${q.query}%`); // SQLite LIKE 对 ASCII 大小写不敏感
     }
     if (q.capabilities && q.capabilities.length > 0) {
-      accounts = accounts.filter((a) =>
-        q.capabilities!.every((c) => (a.capabilities ?? []).includes(c)),
-      );
+      sql +=
+        " AND (" +
+        q.capabilities
+          .map(
+            () =>
+              "EXISTS (SELECT 1 FROM json_each(capabilities) WHERE value = ?)",
+          )
+          .join(" AND ") +
+        ")";
+      args.push(...q.capabilities);
     }
-    return accounts;
+    if (q.conversationId !== undefined) {
+      const conv = this.getConversation(q.conversationId);
+      if (!conv) {
+        throw new MeshRejectError(
+          "NOT_A_MEMBER",
+          "no such conversation: " + q.conversationId,
+        );
+      }
+      // 与 ToolContext.members 同口径：topic 按订阅者，group/direct/queue 按成员。
+      sql +=
+        conv.kind === "topic"
+          ? " AND EXISTS (SELECT 1 FROM mesh_subscriptions s WHERE s.conversation_id = ? " +
+            "AND s.account_id = mesh_accounts.id AND s.unsubscribed_at IS NULL)"
+          : " AND EXISTS (SELECT 1 FROM mesh_memberships m WHERE m.conversation_id = ? " +
+            "AND m.account_id = mesh_accounts.id AND m.left_at IS NULL)";
+      args.push(q.conversationId);
+    }
+    sql += " ORDER BY created_at DESC LIMIT ?";
+    args.push(limit);
+    const rows = this.db.prepare(sql).all(...args) as AccountRow[];
+    return rows.map(rowToAccount);
   }
 
   /**
@@ -461,7 +522,7 @@ export class MeshRegistry implements Registry {
     this.db
       .prepare(
         "INSERT INTO mesh_endpoints (id, account_id, topology, scope, scope_key, pool_slot, " +
-          "pool_size, pool_affinity, pi_session_id, state, last_active_at) " +
+          "pool_size, pool_affinity, runtime_ref, state, last_active_at) " +
           "VALUES (?,?,?,?,?, CASE WHEN ? THEN (SELECT COUNT(*) FROM mesh_endpoints " +
           "WHERE account_id = ? AND topology = 'pooled') ELSE NULL END, ?,?,?,?,?)",
       )
@@ -475,7 +536,7 @@ export class MeshRegistry implements Registry {
         e.accountId,
         pooled ? (t as { size: number }).size : null,
         pooled ? ((t as { affinity?: string }).affinity ?? "none") : null,
-        e.piSessionId ?? null,
+        e.runtimeRef ?? null,
         "cold",
         null,
       );
@@ -508,10 +569,10 @@ export class MeshRegistry implements Registry {
       .run(state, state === "cold" ? null : isoNow(), id);
   }
 
-  setEndpointSession(id: EndpointId, piSessionId: string): void {
+  setEndpointSession(id: EndpointId, runtimeRef: string): void {
     this.db
-      .prepare("UPDATE mesh_endpoints SET pi_session_id = ? WHERE id = ?")
-      .run(piSessionId, id);
+      .prepare("UPDATE mesh_endpoints SET runtime_ref = ? WHERE id = ?")
+      .run(runtimeRef, id);
   }
 
   setEndpointLease(
@@ -538,7 +599,7 @@ export class MeshRegistry implements Registry {
     accountId: AccountId,
     size: number,
     affinity: "none" | "conversation" | "sender" = "none",
-    piSessionIds?: string[],
+    runtimeRefs?: string[],
   ): Promise<Endpoint[]> {
     const out: Endpoint[] = [];
     for (let i = 0; i < size; i++) {
@@ -546,9 +607,9 @@ export class MeshRegistry implements Registry {
       this.db
         .prepare(
           "INSERT INTO mesh_endpoints (id, account_id, topology, pool_slot, pool_size, " +
-            "pool_affinity, pi_session_id, state) VALUES (?,?,?,?,?,?,?,?)",
+            "pool_affinity, runtime_ref, state) VALUES (?,?,?,?,?,?,?,?)",
         )
-        .run(id, accountId, "pooled", i, size, affinity, piSessionIds?.[i] ?? null, "cold");
+        .run(id, accountId, "pooled", i, size, affinity, runtimeRefs?.[i] ?? null, "cold");
       out.push(this.getEndpoint(id)!);
     }
     return Promise.resolve(out);
@@ -564,7 +625,7 @@ export class MeshRegistry implements Registry {
     const config = jsonText(
       normalizeConfig("direct", { historyVisibility: "full" }, this.limits),
     )!;
-    const tx = this.db.transaction(() => {
+    this.tx(() => {
       const now = isoNow();
       this.db
         .prepare(
@@ -583,7 +644,6 @@ export class MeshRegistry implements Registry {
       this.ensureInboxRow(a, id);
       this.ensureInboxRow(b, id);
     });
-    tx();
     return Promise.resolve(this.getConversation(id)!);
   }
 
@@ -607,7 +667,7 @@ export class MeshRegistry implements Registry {
       }
     }
     const id = ulid();
-    const tx = this.db.transaction(() => {
+    this.tx(() => {
       const now = isoNow();
       this.db
         .prepare(
@@ -645,7 +705,6 @@ export class MeshRegistry implements Registry {
         }
       }
     });
-    tx();
     return Promise.resolve(this.getConversation(id)!);
   }
 
@@ -675,7 +734,7 @@ export class MeshRegistry implements Registry {
   // ── 成员 ──
 
   addMember(conv: ConversationId, account: AccountId, caps: Cap[]): void {
-    const tx = this.db.transaction(() => {
+    this.tx(() => {
       const joinedSeq = this.currentSeq(conv);
       const existing = this.db
         .prepare<[string, string], { n: number }>(
@@ -699,16 +758,18 @@ export class MeshRegistry implements Registry {
       this.ensureInboxRow(account, conv);
       this.refreshMemberCount(conv);
     });
-    tx();
   }
 
   removeMember(conv: ConversationId, account: AccountId): void {
-    this.db
-      .prepare(
-        "UPDATE mesh_memberships SET left_at = ? WHERE conversation_id = ? AND account_id = ?",
-      )
-      .run(isoNow(), conv, account);
-    this.refreshMemberCount(conv);
+    // A20：退群 + 成员数刷新必须同一事务，避免中途崩溃留下 left_at 与 member_count 不一致。
+    this.tx(() => {
+      this.db
+        .prepare(
+          "UPDATE mesh_memberships SET left_at = ? WHERE conversation_id = ? AND account_id = ?",
+        )
+        .run(isoNow(), conv, account);
+      this.refreshMemberCount(conv);
+    });
   }
 
   getMembership(

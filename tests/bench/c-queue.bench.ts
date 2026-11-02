@@ -26,7 +26,7 @@ function consumers(): string[] {
 }
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "bench-c" }),
+  create: async () => ({ session: {}, runtimeRef: "bench-c" }),
   open: async () => ({ session: {} }),
 };
 
@@ -45,7 +45,7 @@ async function makeScenario(): Promise<Scenario> {
     dbPath,
     policies: { sessionFactory: stubSessionFactory },
     streamPort: new FakeStreamPort(),
-    limits: { sweepIntervalMs: 0, handoffTimeoutMs: 1000 },
+    limits: { sweepIntervalMs: 0 },
     devMode: false,
   });
 

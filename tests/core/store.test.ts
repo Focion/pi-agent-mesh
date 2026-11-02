@@ -46,6 +46,16 @@ describe("SqliteStore meta keys & migration guard", () => {
     // 旧库不得打开新 DB：migrate() 在版本闸上抛错
     expect(() => SqliteStore.open(path)).toThrow(/newer than library/);
   });
+
+  it("rejects a DB carrying an unknown, newer migration stamp (§28.3 / ruling R2)", () => {
+    const path = tmpDbPath();
+    const first = SqliteStore.open(path);
+    // SCHEMA_VERSION 固定为 1 不再推进：模拟「库比程序新」——DB 里出现本构建不认识的
+    // 更大序号迁移戳（006 超出内置最大 005），重开必须拒绝而非静默继续打开。
+    first.setMeta("migration:006_future.sql", new Date().toISOString());
+    first.close();
+    expect(() => SqliteStore.open(path)).toThrow(/newer library/);
+  });
 });
 
 describe("recomputeInboxCaches (§8.4④)", () => {
@@ -79,8 +89,8 @@ describe("recomputeInboxCaches (§8.4④)", () => {
       db.prepare(
         "INSERT INTO mesh_inboxes (account_id, conversation_id, pending_count, pending_bytes, verbatim_bytes, overflow_count, overflow_summary, cursor_seq, folded_to_seq) " +
           "VALUES (?,?,?,?,?,?,?,?,?)",
-      ).run("a1", "dc", 9, 999, 0, 0, "STALE", 42, 7);
-      // 一条对 a1 的溢出折叠投递（dropped/folded）
+      ).run("a1", "dc", 9, 999, 0, 0, "STALE", 0, 7);
+      // 一条对 a1 的溢出折叠投递（dropped/folded，seq=1 位于 cursor_seq=0 之后 ⇒ 计入）
       db.prepare(
         "INSERT INTO mesh_deliveries (id, message_id, account_id, state, drop_reason, queued_at, state_changed_at) " +
           "VALUES (?,?,?,?,?,?,?)",
@@ -105,7 +115,7 @@ describe("recomputeInboxCaches (§8.4④)", () => {
       expect(row.verbatim_bytes).toBe(Buffer.byteLength(pay1, "utf8"));
       expect(row.overflow_count).toBe(1);
       expect(row.overflow_summary).toBeNull();
-      expect(row.cursor_seq).toBe(42); // 权威：不动
+      expect(row.cursor_seq).toBe(0); // 权威：不动
       expect(row.folded_to_seq).toBe(7); // 权威：不动
       expect(row.pending_count).toBe(0); // dropped 不计未读
       expect(row.pending_bytes).toBe(0);

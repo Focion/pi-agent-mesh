@@ -16,7 +16,7 @@ import type { Cap, MeshHost, SessionFactory } from "../../src/index.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "grp-test" }),
+  create: async () => ({ session: {}, runtimeRef: "grp-test" }),
   open: async () => ({ session: {} }),
 };
 
@@ -27,7 +27,7 @@ async function makeMesh(): Promise<{ host: MeshHost; port: FakeStreamPort }> {
     dbPath: join(dir, "mesh.db"),
     policies: { sessionFactory: stubSessionFactory },
     streamPort: port,
-    limits: { handoffTimeoutMs: 1000 },
+    limits: {},
     devMode: true,
   });
   return { host, port };

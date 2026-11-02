@@ -37,7 +37,7 @@ import { assertInvariants } from "../helpers/invariants.js";
 import { bernoulli, mulberry32, pick, range, type Prng } from "../helpers/prng.js";
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "crash-session" }),
+  create: async () => ({ session: {}, runtimeRef: "crash-session" }),
   open: async () => ({ session: {} }),
 };
 
@@ -86,7 +86,7 @@ describe("G05: 崩溃恢复性质（100 seed · FakeStreamPort）", () => {
           dbPath,
           policies: { sessionFactory: stubSessionFactory },
           streamPort: new FakeStreamPort(),
-          limits: { sweepIntervalMs: 0, maxPending: 8, maxPendingBytes: 4096, handoffTimeoutMs: 1000 },
+          limits: { sweepIntervalMs: 0, maxPending: 8, maxPendingBytes: 4096 },
           devMode: true,
         });
 
@@ -258,7 +258,7 @@ describe("G05: 崩溃恢复性质（100 seed · FakeStreamPort）", () => {
           dbPath,
           policies: { sessionFactory: stubSessionFactory },
           streamPort: new FakeStreamPort(),
-          limits: { sweepIntervalMs: 0, maxPending: 8, maxPendingBytes: 4096, handoffTimeoutMs: 1000 },
+          limits: { sweepIntervalMs: 0, maxPending: 8, maxPendingBytes: 4096 },
           devMode: true,
         });
         await flush();

@@ -268,6 +268,12 @@ function makeCtx(o: StubOptions = {}): { ctx: ToolContext; rec: Recorded } {
     },
     async lookup(q) {
       rec.lookups.push(q);
+      // 模拟 registry.lookupAccounts：成员过滤已下沉到 SQL（先过滤后 LIMIT）；
+      // 工具只转发 conversationId，这里按 members 收窄结果，保持旧断言语义。
+      if (q.conversationId !== undefined) {
+        const memberIds = new Set(members(q.conversationId).map((m) => m.accountId));
+        return accounts.filter((a) => memberIds.has(a.id));
+      }
       return accounts;
     },
     async createConversation(input) {
@@ -501,6 +507,72 @@ describe("mesh_send", () => {
     ).toMatchObject({ code: "ARG_INVALID" });
   });
 
+  it("enforces size limits on data/ext/to/mentions/attachments (A34)", async () => {
+    const { ctx, rec } = makeCtx();
+    const send = byName(buildToolSet(ctx), "mesh_send");
+    const big = "x".repeat(70000); // > SEND_DATA_MAX_BYTES(65536)
+    // data 超限
+    expect(
+      (await run(send, "tc", { conversationId: "c_group", data: { big } }))
+        .error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    // ext 超限
+    expect(
+      (
+        await run(send, "tc", {
+          conversationId: "c_group",
+          text: "hi",
+          ext: { big },
+        })
+      ).error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    // to 超限
+    expect(
+      (
+        await run(send, "tc", {
+          conversationId: "c_group",
+          text: "hi",
+          to: Array.from({ length: 257 }, (_, i) => `a${i}`),
+        })
+      ).error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    // mentions 超限
+    expect(
+      (
+        await run(send, "tc", {
+          conversationId: "c_group",
+          text: "hi",
+          mentions: Array.from({ length: 257 }, (_, i) => `a${i}`),
+        })
+      ).error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    // attachments 数量超限
+    expect(
+      (
+        await run(send, "tc", {
+          conversationId: "c_group",
+          text: "hi",
+          attachments: Array.from({ length: 33 }, (_, i) => ({
+            spaceId: "global",
+            key: `k${i}`,
+          })),
+        })
+      ).error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    // attachment spaceId/key 单串超限
+    expect(
+      (
+        await run(send, "tc", {
+          conversationId: "c_group",
+          text: "hi",
+          attachments: [{ spaceId: "y".repeat(257), key: "k" }],
+        })
+      ).error,
+    ).toMatchObject({ code: "ARG_INVALID" });
+    // 全部越界请求都未实际 send
+    expect(rec.sent).toHaveLength(0);
+  });
+
   it("maps MeshRejectError from the router to a structured error", async () => {
     const { ctx } = makeCtx({
       sendThrows: () => new MeshRejectError("NO_SPEAK_CAP"),
@@ -553,14 +625,39 @@ describe("read-only tools", () => {
     });
     const accounts = body.accounts as Account[];
     expect(accounts.map((a) => a.id)).toEqual(["acct_alice"]);
+    // conversationId 被下传给 ctx.lookup（成员过滤已下沉到 registry 的 SQL 层）
     expect(rec.lookups[0]).toMatchObject({
       limit: 5,
       capabilities: ["translate"],
+      conversationId: "c_group",
     });
     const bad = await run(byName(buildToolSet(ctx), "mesh_lookup"), "tc", {
       limit: 0,
     });
     expect(bad.error).toMatchObject({ code: "ARG_INVALID" });
+  });
+
+  it("mesh_lookup strips ext from returned accounts (A34)", async () => {
+    const { ctx, rec } = makeCtx({
+      accounts: [
+        {
+          id: "acct_alice",
+          displayName: "Alice",
+          endpointClass: "stream",
+          capabilities: ["translate"],
+          initiate: ["chat"],
+          ext: { sso_profile_ref: "host-private" },
+        },
+      ],
+    });
+    const body = await run(byName(buildToolSet(ctx), "mesh_lookup"), "tc", {
+      query: "alice",
+    });
+    expect(rec.lookups[0]).toMatchObject({ query: "alice" });
+    const accounts = body.accounts as Array<Record<string, unknown>>;
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]!.id).toBe("acct_alice");
+    expect(accounts[0]).not.toHaveProperty("ext");
   });
 
   it("mesh_inbox returns the §10.4 shape with summary/digest separation", async () => {

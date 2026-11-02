@@ -6,9 +6,11 @@
 // 前断言 runtime dependencies 的实际版本满足声明范围，把「装错版本」在门禁最前段
 // 拦下，而不是让它伪装成测试失败。
 //
-// 范围：只查 package.json 的 `dependencies`（运行时/发布物依赖）；devDependencies
-// 不进包，且其版本漂移不影响消费者。semver 断言覆盖本项目当前用到的 `^` / `~`
-// 区间与精确/裸版本号；遇到不支持的范围宁可报错（fail-closed）也不放行。
+// 范围：查 package.json 的 `dependencies` 与 `devDependencies`。runtime 依赖的
+// 版本漂移会伪装成测试失败；devDependencies（vitest / coverage-v8 / tsup / typescript /
+// pi-ai faux 等）漂移同样会让测试或构建结果不可信（A42）。semver 断言覆盖本项目
+// 当前用到的 `^` / `~` 区间与精确/裸版本号；遇到不支持的范围宁可报错（fail-closed）
+// 也不放行。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { existsSync, readFileSync } from "node:fs";
@@ -33,6 +35,11 @@ function satisfies(version, range) {
     const lo = parse(r.slice(1));
     if (!lo) throw new Error(`无法解析依赖范围 "${range}"`);
     if (!v) return false;
+    // semver：^0.y.z 钉 minor（>=0.y.z <0.(y+1).0），^0.0.z 钉 patch（A45）。
+    if (lo.major === 0 && lo.minor === 0) {
+      return v.major === 0 && v.minor === 0 && v.patch >= lo.patch;
+    }
+    if (lo.major === 0) return v.major === 0 && v.minor === lo.minor && cmp(v, lo) >= 0;
     return v.major === lo.major && cmp(v, lo) >= 0;
   }
   if (r.startsWith("~")) {
@@ -47,12 +54,12 @@ function satisfies(version, range) {
 }
 
 /**
- * 断言 node_modules 里 runtime dependencies 的实际版本满足 package.json 声明。
+ * 断言 node_modules 里 runtime + dev 依赖的实际版本满足 package.json 声明。
  * 任一缺失或版本不满足即 throw Error（message 可直接交给调用方的 fail()）。
  */
 export function assertInstalledDepsMatch() {
   const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
-  const deps = pkg.dependencies ?? {};
+  const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
   for (const [name, range] of Object.entries(deps)) {
     const pkgJson = join(ROOT, "node_modules", ...name.split("/"), "package.json");
     if (!existsSync(pkgJson)) {

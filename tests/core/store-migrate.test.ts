@@ -164,11 +164,11 @@ describe("migrate() backup integrity and failure blocking (C07/I05)", () => {
       // 备份失败 ⇒ 迁移零增生：005 未落盘（无表、无键）。
       expect(tableCount(probe, "extra_marker")).toBe(0);
       expect(probe.prepare("SELECT v FROM mesh_meta WHERE k='migration:005_extra.sql'").get()).toBeUndefined();
-      // 原 5 个迁移键仍在（升级路径 → 备份 → 失败前尚未盖任何新章）。
+      // 原 1 个迁移键仍在（升级路径 → 备份 → 失败前尚未盖任何新章）。
       const keys = (
         probe.prepare("SELECT k FROM mesh_meta WHERE k LIKE 'migration:%'").all() as Array<{ k: string }>
       ).map((r) => r.k);
-      expect(keys).toHaveLength(5);
+      expect(keys).toHaveLength(1);
     } finally {
       probe.close();
     }

@@ -12,7 +12,7 @@ import { createMesh } from "../../src/index.js";
 import { EndpointLock, LockHeldError } from "../../src/pi/lock.js";
 
 const sessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "lock-test" }),
+  create: async () => ({ session: {}, runtimeRef: "lock-test" }),
   open: async () => ({ session: {} }),
 };
 

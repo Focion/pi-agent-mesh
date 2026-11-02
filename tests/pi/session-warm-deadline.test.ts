@@ -20,7 +20,8 @@ import type {
   EndpointState,
   SessionFactory,
 } from "../../src/core/types.js";
-import { PiStreamPort } from "../../src/pi/stream-port.js";
+import { PiStreamPort } from "../../src/pi/durable-port.js";
+import { fakeDurableSession } from "../helpers/pi-session.js";
 
 type Degraded = { slot: string; reason: string; degradedTo: string };
 
@@ -34,21 +35,7 @@ interface Harness {
 }
 
 function fakeSession(): unknown {
-  return {
-    isIdle: true,
-    sessionManager: {
-      getSessionId: () => "s-1",
-      getEntry: () => undefined,
-      getEntries: () => [],
-      appendCustomEntry: () => "e-1",
-    },
-    sendCustomMessage: async () => {},
-    steer: async () => {},
-    followUp: async () => {},
-    waitForIdle: async () => {},
-    subscribe: () => () => {},
-    dispose: () => {},
-  };
+  return fakeDurableSession();
 }
 
 /** 永不解 resolve：供 deadline 象限（open/create 都 hang） */
@@ -58,7 +45,7 @@ const neverFactory: SessionFactory = {
 };
 
 const fastFactory: SessionFactory = {
-  create: async () => ({ session: fakeSession(), piSessionId: "pi-1" }),
+  create: async () => ({ session: fakeSession(), runtimeRef: "pi-1" }),
   open: async () => ({ session: fakeSession() }),
 };
 
@@ -78,7 +65,7 @@ function makeHarness(factory: SessionFactory, warmTimeoutMs: number): Harness {
     accountId: "a1",
     topology: { kind: "unified" },
     state: "cold",
-    piSessionId: null,
+    runtimeRef: null,
     lease: "shared",
     leaseUntil: null,
     lastActiveAt: null,

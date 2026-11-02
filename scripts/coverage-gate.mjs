@@ -15,7 +15,7 @@
 // locations 命中数组逐项计数（hits>0 为覆盖，总项数为分母），而非「整支全覆盖」。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +34,28 @@ const THRESHOLD = 95;
 if (!existsSync(FINAL)) {
   console.error(`✗ 未找到 ${FINAL} —— 先运行 \`vitest run --coverage\`（generate ${'coverage-final.json'}）。`);
   process.exit(1);
+}
+
+// A41：校验报告新鲜度——任一 src/** 源码比 coverage-final.json 新，说明是残留旧报告，
+// 作废（强制重跑 `vitest run --coverage`），不放行过期覆盖数据。
+{
+  let newest = 0;
+  const walk = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) walk(p);
+      else if (/\.(ts|tsx|mts|mjs|js|jsx|cjs|cts)$/.test(name)) {
+        newest = Math.max(newest, statSync(p).mtimeMs);
+      }
+    }
+  };
+  walk(join(ROOT, "src"));
+  if (newest > statSync(FINAL).mtimeMs) {
+    console.error(
+      `✗ coverage/coverage-final.json 过期（源码有更新晚于报告生成）——重跑 \`vitest run --coverage\` 再执行本门。`,
+    );
+    process.exit(1);
+  }
 }
 
 const cov = JSON.parse(readFileSync(FINAL, "utf8"));

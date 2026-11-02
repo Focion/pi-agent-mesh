@@ -1,13 +1,17 @@
 ---
 title: 从 pi-coding-agent 迁移到 pi-durable 的实施计划
 date: 2026-10-19
-status: active
-owner: 待指派
+status: archived
+archived_date: 2026-11-01
+archived_from: notes/plan/2026-10-19-pi-durable-migration-plan.md
+archived_reason: 迁移全部完成。步骤 1–10 均已执行并验证，规范升 1.0.3，版本 0.2.0 发布。详细执行记录见 notes/plan/2026-10-20-execution-plan.md（同期归档）。
+owner: Pi Agent Mesh Dev
 tags: [plan, pi-sdk, migration, delivery-semantics]
 related:
   - notes/tech/2026-09-07-pi-agent-mesh-spec.md
-  - notes/tech/2026-10-13-pi-1.1.0-probe-findings.md
-  - notes/tech/2026-10-13-mesh-llm-config-design.md
+  - notes/archive/2026-10-13-pi-1.1.0-probe-findings.md
+  - notes/archive/2026-10-13-mesh-llm-config-design.md
+  - notes/archive/2026-10-20-audit-fix-plan.md
 ---
 
 ## 目标
@@ -258,6 +262,18 @@ MD6、MD7 与 Node 24 基线一样对使用方可见，三者合并成一条破�
 `node:sqlite`（`packages/chord/src/sqlite/node.ts` 使用 `DatabaseSync`）；`snapshots/bench-baseline.json`
 的指纹是 node 24.19.0。
 
+### 10. 与审计修复计划的衔接（2026-10-20）
+
+2026-10-20 的全量审计另立了一份计划（[`2026-10-20-audit-fix-plan.md`](2026-10-20-audit-fix-plan.md)，条目编号 `A*`）。两份计划不合并，交集只由一方负责：
+
+- **本计划负责**（写进下表对应步骤，作为验收条件）：A60 → 步骤 1；A21 → 步骤 3；A12、A13 → 步骤 4；A03、A04、A10 → 步骤 8；A08、A09 → 步骤 9。问题描述和触发场景以审计计划为准，这里不重复。
+- **审计计划负责、但卡本计划的前置条件**：
+  - 门禁修复 A40、A42、A44 须在步骤 3 开工前完成。迁移验收依赖 `check:imports`，而现有门禁实测可被绕过。
+  - A20 的 SCHEMA_VERSION 策略须在步骤 5 写 `005_*.sql` 之前定案。
+  - 审计计划步骤 3、4（core 中与执行体无关的修复），以及 A07（cursor 语义）、A30（§5.2 与附录 J O2）的规范裁决，须在步骤 8 开工前完成。
+  - A26 与步骤 4 都改 `createMesh` 的关闭路径，两者串行。
+- 共用时间线见审计计划"执行时机与职责划分"一节。
+
 ## 步骤
 
 分两大阶段。**阶段一（步骤 1–7）不动 `src/core/`**：StreamPort 十方法契约原样保留，用 durable 重新实现
@@ -266,15 +282,15 @@ MD6、MD7 与 Node 24 基线一样对使用方可见，三者合并成一条破�
 
 | # | 事项 | 依赖 | 状态 |
 | --- | --- | --- | --- |
-| 1 | 前置：备好 Node 24 环境（建议钉当前 LTS 小版本）；`engines.node` 与 `scripts/test.mjs` 守卫抬到 `>=24.0.0`，CI/本地文档同步；`npm i @earendil-works/pi-durable@1.3.0 @earendil-works/pi-ai@1.3.0 @earendil-works/chord@1.3.0`（精确版本、不用 `^`，且必须与 durable 自己声明的版本逐一对齐——durable 对 pi-ai/chord 钉的就是 `1.3.0`，装出两份会让 `Models` / `Context` 类型不互认），`pi-ai` 与 `chord` 升为直接依赖 | 决策确认 | done |
-| 2 | 探针与新契约测试 CT-D1–CT-D11（先写，红着开工）：①空闲 submit 当场 `placed` 且带 entryId ②忙时进 `pi.inbox` 且文档可读 ③同 `requestId` 返回原 submission（含重开 Harness 后）④display-only write 不进模型上下文、带 `model` 的 write 进上下文且不起轮 ⑤`beforeRequest` 钩子的注入体进入该次请求的 messages、位于尾部、且不新增任何条目 ⑥崩溃后重开 + `resume()` 继续未完成 run ⑦（CT-D7，锁住 §9 F-B 的事实）钩子里 `api.memo()` 同名重复写返回首次的值；generation 运行中 `getTask()` 能读到 `memos`，结束后读不到——这条若某天变绿成「结束后仍可读」，R12 的方案才可以简化 ⑧（CT-D8）`endRun` 结算：run 中途落位的 steer 在 run 失败/中止时随 run 一起变 `unanswered` 且**带 `entry`** ⑨（CT-D9）同 `requestId` 对 `unanswered` 记录再次 `submit()` 返回原记录、不新建 ⑩（CT-D10）带 `model` 的 write 在空闲 conversation 上不起轮、在忙 conversation 上下一个边界落位 ⑪（CT-D11）mesh 工具声明 `replay:"safe"` 后，执行中崩溃重开会以**同一 `callId`** 重跑 | 1 | done |
-| 3 | `src/pi/durable-port.ts`：以 durable 实现 StreamPort 十方法。`warm`→开 storage+`Harness.open`+`resume()`；`deliver`→按档位 submit；`note`→display-only write；`injectContext`→装/卸 `beforeRequest` 钩子（mesh 扩展装在 registry 最后，确认经 `onInjectionConfirmed` 写 mesh 账本）；`status`→读 watch 维护的内存视图（`status()` 是同步方法，durable 的文档读取都是异步的，不能现读；深度按模式封顶 1，OQ2）；`deliver` 按 `triggerTurn` 分 input / write（§2）；`hasEntries`→`entries()` 查询；`onEntry`/`onTurnEnd`→每端点 `watch()` 适配（OQ5），状态从 `value` 推导而不是逐条重放 `ops`——watch 积压超过 100 帧会被合并成一帧全量视图；`evict`→先 `waitForIdle` 再 `harness.close()`（§9 F-I）；mesh 工具逐个审 `replay` 策略（§9 F-D）。chord `Context` 只在 `src/pi/` 内构造，绝不外泄到 core | 2 | todo |
-| 4 | `session-factory.ts` 重写：产出 `{harness, conversationId}`；`llm-config.ts` 重写到 pi-ai `createModels`/`createProvider`；`RuntimeConfig.resources` 改为显式拒绝；每次 warm 对 root `configure({model, thinkingLevel})`（§9 F-G）；`lock.ts` 的锁对象从 session 文件改为 durable storage 文件，且锁必须先于 `Harness.open`；接入 MD8 的失败通道；`createMesh` 的关闭路径逐个 `harness.close()`（§9 F-I） | 2 | todo |
+| 1 | 前置：备好 Node 24 环境（建议钉当前 LTS 小版本）；`engines.node` 与 `scripts/test.mjs` 守卫抬到 `>=24.0.0`，CI/本地文档同步；`npm i @earendil-works/pi-durable@1.3.0 @earendil-works/pi-ai@1.3.0 @earendil-works/chord@1.3.0`（精确版本、不用 `^`，且必须与 durable 自己声明的版本逐一对齐——durable 对 pi-ai/chord 钉的就是 `1.3.0`，装出两份会让 `Models` / `Context` 类型不互认），`pi-ai` 与 `chord` 升为直接依赖。**装 durable 之前**，先在 Node 24 下按现有 lock 执行 `npm ci`，跑通现有代码的全量测试并取得覆盖率基线（审计 A60：当前本机 pi 实装 0.85.1 与 lock 不符，`@vitest/coverage-v8` 缺失，测试结果不可信） | 决策确认 | todo |
+| 2 | 探针与新契约测试 CT-D1–CT-D11（先写，红着开工）：①空闲 submit 当场 `placed` 且带 entryId ②忙时进 `pi.inbox` 且文档可读 ③同 `requestId` 返回原 submission（含重开 Harness 后）④display-only write 不进模型上下文、带 `model` 的 write 进上下文且不起轮 ⑤`beforeRequest` 钩子的注入体进入该次请求的 messages、位于尾部、且不新增任何条目 ⑥崩溃后重开 + `resume()` 继续未完成 run ⑦（CT-D7，锁住 §9 F-B 的事实）钩子里 `api.memo()` 同名重复写返回首次的值；generation 运行中 `getTask()` 能读到 `memos`，结束后读不到——这条若某天变绿成「结束后仍可读」，R12 的方案才可以简化 ⑧（CT-D8）`endRun` 结算：run 中途落位的 steer 在 run 失败/中止时随 run 一起变 `unanswered` 且**带 `entry`** ⑨（CT-D9）同 `requestId` 对 `unanswered` 记录再次 `submit()` 返回原记录、不新建 ⑩（CT-D10）带 `model` 的 write 在空闲 conversation 上不起轮、在忙 conversation 上下一个边界落位 ⑪（CT-D11）mesh 工具声明 `replay:"safe"` 后，执行中崩溃重开会以**同一 `callId`** 重跑 | 1 | todo |
+| 3 | `src/pi/durable-port.ts`：以 durable 实现 StreamPort 十方法。`warm`→开 storage+`Harness.open`+`resume()`；`deliver`→按档位 submit；`note`→display-only write；`injectContext`→装/卸 `beforeRequest` 钩子（mesh 扩展装在 registry 最后，确认经 `onInjectionConfirmed` 写 mesh 账本）；`status`→读 watch 维护的内存视图（`status()` 是同步方法，durable 的文档读取都是异步的，不能现读；深度按模式封顶 1，OQ2）；`deliver` 按 `triggerTurn` 分 input / write（§2）；`hasEntries`→`entries()` 查询；`onEntry`/`onTurnEnd`→每端点 `watch()` 适配（OQ5），状态从 `value` 推导而不是逐条重放 `ops`——watch 积压超过 100 帧会被合并成一帧全量视图；`evict`→先 `waitForIdle` 再 `harness.close()`（§9 F-I）；mesh 工具逐个审 `replay` 策略（§9 F-D）。chord `Context` 只在 `src/pi/` 内构造，绝不外泄到 core。验收含审计 A21：`close()` 时即使有 delivered 未 consumed 的投递，也要强制卸载、释放端点锁，并等待进行中的 warm | 2；审计 A40/A42/A44 | todo |
+| 4 | `session-factory.ts` 重写：产出 `{harness, conversationId}`；`llm-config.ts` 重写到 pi-ai `createModels`/`createProvider`；`RuntimeConfig.resources` 改为显式拒绝；每次 warm 对 root `configure({model, thinkingLevel})`（§9 F-G）；`lock.ts` 的锁对象从 session 文件改为 durable storage 文件，且锁必须先于 `Harness.open`；接入 MD8 的失败通道；`createMesh` 的关闭路径逐个 `harness.close()`（§9 F-I）。锁的验收含审计 A12、A13：陈旧锁原子接管（不再先检查再删除）、release/refresh 前校验持有者、锁文件记录 mode | 2；审计 A26 串行 | todo |
 | 5 | 端点标识与 Observer 迁移（MD7/MD9）：`piSessionId` → `runtimeRef`；`migrations/005_*.sql`（`mesh_deliveries` 加 `submission_id`/`attempt`；`mesh_stream_entries` 主键改 `(runtime_ref, entry_id)`——SQLite 不能改主键，得建新表、拷数据、换名，旧行的 `pi_session_id` 原样迁入 `runtime_ref`；不动 000）；`streamEntries`/`replay`/`forkAt` 按 durable 语义重写，`forkAt` 落到 `conversation.fork()`；`snapshots/` 重签 | 3, 4 | todo |
 | 6 | 测试基础设施与 demo：`tests/helpers/pi-session.ts` 重写（用了 fake timers 的用例要把 `setTimer`/`now` 传给 `Harness.open`，见 §7）；`tests/pi/**` 15 个文件重写；`tests/e2e` 中 `g02-baseline-reopen` / `disk-factory-reopen` / `two-process-*` / `dual-process-migrate-lock` 按新存储形态调整；demo rpc 与受影响 Tab 更新 | 3, 4, 5 | todo |
 | 7 | 阶段一验收：`check:imports`（`PI_PACKAGES` 已含 durable/pi-ai/chord）、`typecheck`、`typecheck:demo`、全量测试、`build`、`demo:smoke` 全绿 | 6 | todo |
-| 8 | 收缩 StreamPort 契约（动 core）：`deliver` 返回 `{submissionId, status}`；mailbox 的 delivered/consumed 改读 submission；`reconcileDelivered` 改为按 submission id 精确读 | 7 | todo |
-| 9 | 删补偿机制并更新冻结表：`handoff_at`/`handoffTimeoutMs` 回退、entry 差分镜像、`beforeClearQueue`(I22)、`inFlightCount` 自持计数。每删一处先把对应测试改成断言新路径再删实现；同步更新 `contract-freeze` 的状态域与转换表 | 8 | todo |
+| 8 | 收缩 StreamPort 契约（动 core）：`deliver` 返回 `{submissionId, status}`；mailbox 的 delivered/consumed 改读 submission；`reconcileDelivered` 改为按 submission id 精确读。审计 A03（端点恢复后盲目重投）、A04（运行中端点被提前标 consumed）、A10（P2 只确认实际进入注入体的 delivery）的场景写成验收测试 | 7；审计计划步骤 3、4；A07、A30 裁决 | todo |
+| 9 | 删补偿机制并更新冻结表：`handoff_at`/`handoffTimeoutMs` 回退、entry 差分镜像、`beforeClearQueue`(I22)、`inFlightCount` 自持计数。每删一处先把对应测试改成断言新路径再删实现；同步更新 `contract-freeze` 的状态域与转换表。审计 A08（clearQueue 后条目不重复）、A09（长回合期间不重投）的场景写成验收测试 | 8 | todo |
 | 10 | 规范 1.0.3 + changelog + 发 `0.2.0`（OQ4）：§2 平台基线（durable + Node 24）、§7 投递、§8 端口契约重写；F1–F5 移入附录「coding-agent 时代的负面知识」；I22 标注退役、I23 改写为「mesh 扩展必须排在最后」；MD1–MD10 与 OQ1–OQ8 落成 `Q*`；四条破坏性变更（`engines>=24`、`resources` 废弃、`runtimeRef` 改名、历史不平移）合并成一条公告 | 9 | todo |
 
 ## 里程碑
@@ -325,13 +341,6 @@ durable 白送了一批 mesh 现在没有的原语。登记在此，便于迁移
 
 ## 进度记录
 
-- 2026-10-20：**M1 探针成立。** 步骤 1/2 完成（`engines.node` 与 `scripts/test.mjs` 守卫抬到 `>=24.0.0`，
-  durable/pi-ai/chord 以精确 `1.3.0` 装为直接依赖；`tests/pi/durable-contract.test.ts` 落地 CT-D1–CT-D11，
-  共 12 个用例在真 durable + pi-ai faux provider 上全绿）。实测钉住的关键行为：崩溃模拟必须直接
-  `storage.close()` 而非 `harness.close()`——后者 `beforeClose()` 会 `#tasks.join()` 等运行中任务，对
-  `await` 悬崖上不响应 abort 的 tool/generation 会永久挂起，不能作为「进程死亡」的替身；`replay:"safe"`
-  工具在 storage 直接关闭 + 重开 + `resume()` 后以同一 `callId` 重跑，generation 中断的 run 在重开后重新
-  发起请求（callCount 1→2）并 `done`。
 - 2026-10-19：完成上游 `packages/durable` 1.3.0 的读码调研（README + 类型 + `admitSubmission`/`inbox.ts`/
   storage adapter + 失败通道 + 上游测试夹具），确认 F1–F5 逐条消解、三档映射、能力缺口、破坏面清单与
   MD1–MD9 决策项，产出本计划。尚未安装依赖、未运行任何 durable 代码。
@@ -361,3 +370,4 @@ durable 白送了一批 mesh 现在没有的原语。登记在此，便于迁移
   `triggerTurn` 维度、按模式分槽的 `pi.inbox` 上限、`<deliveryId>:<attempt>` 的 requestId 规则、warm 时
   `configure()` 模型、关闭路径，以及 R14/R15 与 CT-D8–CT-D11。删去已废止的「步骤 11」残留引用。
   注：上方 2026-10-19 第三条记录里「R12（P2 确认是内存事实）」与同日第二条的「已解决」都已被本条取代。
+- 2026-10-20：与审计修复计划对照，决定两份计划不合并。A60、A21、A12、A13、A03、A04、A08–A10 由本计划负责，已写进步骤 1、3、4、8、9 的验收条件；审计门禁修复与规范裁决列为步骤 3、5、8 的前置条件（见 §10）。

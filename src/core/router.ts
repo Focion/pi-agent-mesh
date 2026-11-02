@@ -94,18 +94,23 @@ export class MeshRouter implements Router {
     const payloadBytes = Buffer.byteLength(payloadJson, "utf8");
     let toNorm = Array.from(new Set(input.to ?? []));
     const mentionsRaw = Array.from(new Set(input.mentions ?? []));
+    // A31：空串 / 空白 clientToken 不可作为幂等键（openai-compatible 服务端可能返回
+    // 空串或计数 id，如 "" / "call_0"），退化为 5 秒去重窗，否则同会话后续发送全命中首条。
     const clientToken =
-      input.clientToken ??
-      // §5.5：宿主缺省 clientToken 退化为 5 秒去重窗
-      sha256Hex(
-        from +
-          " " +
-          convId +
-          " " +
-          sha256Hex(payloadJson) +
-          " " +
-          Math.floor(Date.now() / 5000),
-      );
+      input.clientToken && input.clientToken.trim().length > 0
+        ? input.clientToken
+        :
+          // §5.5：宿主缺省 clientToken 退化为 5 秒去重窗（含 from/convId/payload/时间窗，
+          // 本身就把 endpoint 与会话混进了键）
+          sha256Hex(
+            from +
+              " " +
+              convId +
+              " " +
+              sha256Hex(payloadJson) +
+              " " +
+              Math.floor(Date.now() / 5000),
+          );
     const key = idempotencyKey(convId, from, clientToken);
 
     // ── 第 0 步：幂等（§5.5）──
@@ -698,6 +703,22 @@ export class MeshRouter implements Router {
       // ── pending_acks（§14.2：ack 30s / reply 5min；queue 恒 sync=0，to_account=消费者）──
       const ackTarget = conv.kind === "queue" ? queueConsumer : expectTarget;
       if (expect !== "none" && ackTarget) {
+        // A34：自填 correlationId 撞 mesh_pending_acks 主键时抛原始 Sqlite UNIQUE 错误。
+        // correlationId 由 Router 签发（§14.1 推论），自填仅用于应答回显（replyOf 命中）；
+        // 未命中 replyOf 的自填先查重，命中即干净拒绝，而不是把 SQLITE_CONSTRAINT 漏出去。
+        if (input.correlationId !== undefined && replyOf === null) {
+          const taken = d.store.db
+            .prepare<[string], { n: number }>(
+              "SELECT COUNT(*) AS n FROM mesh_pending_acks WHERE correlation_id = ?",
+            )
+            .get(input.correlationId) as { n: number };
+          if (taken.n > 0) {
+            throw new MeshRejectError(
+              "ARG_INVALID",
+              "correlationId already in use: " + input.correlationId,
+            );
+          }
+        }
         // §14.5：sync=1（阻塞式）才参与环检测；queue 与普通 request 均为 sync=0
         const sync = conv.kind === "queue" ? 0 : input.blocking ? 1 : 0;
         if (sync === 1) {
@@ -749,7 +770,7 @@ export class MeshRouter implements Router {
       let tombOriginal: Envelope | null = null;
       if (kind === "tombstone" && input.replyTo) {
         d.store.db
-          .prepare("UPDATE mesh_messages SET tombstoned_by = ? WHERE id = ?")
+          .prepare("UPDATE mesh_messages SET tombstoned_by = ? WHERE id = ? AND tombstoned_by IS NULL") // A34：tombstone 只写一次（I11）
           .run(envelope.id, input.replyTo);
         tombDropped = d.store.db
           .prepare<[string], { account_id: string }>(
@@ -762,6 +783,14 @@ export class MeshRouter implements Router {
               "WHERE message_id = ? AND state IN ('routed','queued','parked')",
           )
           .run(routedAt, input.replyTo);
+        // A11：撤回（tombstone）同步把对应 outbox 载体标 done——否则同机接收进程的 poller
+        // 仍会认领并注入已撤回的消息（handleOutboxDelivery 的状态复核是兜底，这里提前结束其重试）。
+        d.store.db
+          .prepare(
+            "UPDATE mesh_outbox SET state = 'done' WHERE delivery_id IN (" +
+              "SELECT id FROM mesh_deliveries WHERE message_id = ? AND state = 'dropped' AND drop_reason = 'TOMBSTONED')",
+          )
+          .run(input.replyTo);
         const origRow = d.store.db
           .prepare<[string], MessageRow>(
             "SELECT * FROM mesh_messages WHERE id = ?",

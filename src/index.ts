@@ -11,6 +11,7 @@
 
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { ALL_CAPS, capsSubsetOf, MeshRegistry, validCaps } from "./core/registry.js";
 import { MeshEventBus } from "./core/events.js";
 import type { StorageFaultCode } from "./core/health.js";
@@ -30,7 +31,7 @@ import { buildToolSet } from "./core/tools.js";
 import { InProcessTransport, SameHostTransport } from "./core/transport.js";
 import { isoNow, jsonParse, sleep, ulid } from "./core/util.js";
 import { EndpointLock, LockHeldError } from "./pi/lock.js";
-import { PiStreamPort } from "./pi/stream-port.js";
+import { PiStreamPort } from "./pi/durable-port.js";
 import { createAssembledSessionFactory } from "./pi/session-factory.js";
 import { MeshConfigError, resolveLlmConfig } from "./pi/llm-config.js";
 import type { LlmConfig, RuntimeConfig } from "./pi/llm-config.js";
@@ -192,6 +193,16 @@ class HostToolContext implements ToolContext {
     const limit = Math.min(Math.max(opts?.limit ?? 20, 1), 100);
     let sql = "SELECT * FROM mesh_messages WHERE conversation_id = ? AND seq > ?";
     const args: unknown[] = [conversationId, lower];
+    // §5.2/R4（A30）：定向消息的投递集 = to ∪ mentions（to 为空 = 全体成员减发送方），
+    // 发送方恒可见自己发的消息。故可见性谓词 = from_account=reader ∨ to_accounts 为空
+    // （NULL/'[]'）∨ reader∈to ∨ reader∈mentions。非收件人的同会话成员读不到定向消息。
+    sql +=
+      " AND (from_account = ?" +
+      " OR to_accounts IS NULL" +
+      " OR to_accounts = ?" +
+      " OR EXISTS (SELECT 1 FROM json_each(to_accounts) WHERE value = ?)" +
+      " OR EXISTS (SELECT 1 FROM json_each(mentions) WHERE value = ?))";
+    args.push(this.d.accountId, "[]", this.d.accountId, this.d.accountId);
     if (opts?.beforeSeq !== undefined) {
       sql += " AND seq < ?";
       args.push(opts.beforeSeq);
@@ -247,7 +258,7 @@ class HostToolContext implements ToolContext {
     return this.d.registry.listContacts(this.d.accountId, query);
   }
 
-  async lookup(q: { query?: string; capabilities?: string[]; limit?: number }): Promise<Account[]> {
+  async lookup(q: { query?: string; capabilities?: string[]; conversationId?: string; limit?: number }): Promise<Account[]> {
     return this.d.registry.lookupAccounts(q);
   }
 
@@ -360,7 +371,6 @@ function validateLimits(limits: Limits): void {
   inRange("requestChainMaxDepth", limits.requestChainMaxDepth, 1, 64);
   inRange("maxAttempts", limits.maxAttempts, 1, 100);
   inRange("policyTimeoutMs", limits.policyTimeoutMs, 1, 1000);
-  inRange("handoffTimeoutMs", limits.handoffTimeoutMs, 1000, 600000);
   if (!(limits.sweepIntervalMs === 0 || (limits.sweepIntervalMs >= 1000 && limits.sweepIntervalMs <= 86_400_000)))
     fail(`sweepIntervalMs = ${limits.sweepIntervalMs} (want 1000..86.4×10⁶ or 0)`);
   inRange("sinkBackoffBaseMs", limits.sinkBackoffBaseMs, 1, 86_400_000);
@@ -372,12 +382,49 @@ function validateLimits(limits: Limits): void {
   inRange("sharedVersionsKept", limits.sharedVersionsKept, 0, 1000);
 }
 
+/** A27：运行期校验 StreamTopology（§8.1）——类型只能防编译期，JS 调用方/跨边界仍可传坏值。 */
+function validateTopology(t: StreamTopology): void {
+  const bad = (msg: string): never => {
+    throw new MeshRejectError("ARG_INVALID", msg);
+  };
+  if (t.kind === "unified") return;
+  if (t.kind === "perConversation") {
+    if (t.scope !== "conversation" && t.scope !== "purpose") {
+      bad(`perConversation.scope must be conversation|purpose, got ${JSON.stringify(t.scope)}`);
+    }
+    if (typeof t.key !== "string" || t.key.length === 0) {
+      bad("perConversation.key must be a non-empty string");
+    }
+    return;
+  }
+  if (t.kind === "pooled") {
+    if (!Number.isInteger(t.size) || t.size < 1) {
+      bad(`pooled.size must be a positive integer, got ${JSON.stringify(t.size)}`);
+    }
+    if (
+      t.affinity !== undefined &&
+      t.affinity !== "none" &&
+      t.affinity !== "conversation" &&
+      t.affinity !== "sender"
+    ) {
+      bad(`pooled.affinity must be none|conversation|sender, got ${JSON.stringify(t.affinity)}`);
+    }
+    return;
+  }
+  bad(`unknown topology kind ${JSON.stringify((t as { kind?: unknown }).kind)}`);
+}
+
 export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> {
   const limits = { ...DEFAULT_LIMITS, ...options.limits };
   const devMode = options.devMode ?? false;
   const writerId = `mesh-${randomUUID()}`;
-  // 端点工作目录根：sessionFactory（缺省装配）与端点锁/PiStreamPort 共用
-  const stateDir = join(dirname(options.dbPath), "mesh");
+  // 端点工作目录根：sessionFactory（缺省装配）与端点锁/PiStreamPort 共用。
+  // A27：内存库（dbPath=":memory:"）没有磁盘父目录，dirname(":memory:") 会落到 "."，
+  // 让锁/工作目录污染进程 cwd。改用系统临时目录下的独立子目录。
+  const stateDir =
+    options.dbPath === ":memory:"
+      ? join(tmpdir(), "pi-agent-mesh", `mem-${writerId}`)
+      : join(dirname(options.dbPath), "mesh");
 
   // 附录 F 通条③：超出允许范围的值在 createMesh 时直接 reject，不做静默夹取。
   validateLimits(limits);
@@ -403,10 +450,66 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   if (options.seal !== undefined && (typeof options.seal.key !== "string" || options.seal.key.length === 0)) {
     throw new Error("mesh: options.seal.key must be a non-empty string (§22.4)");
   }
+  // A22（§12.1 全有全无）：把「自定义 Transport / StreamPort 能力」校验前移到抢锁之前——
+  // 此时实例锁与 DB 都还没拿，非法配置直接 reject，不留任何资源。抢锁后再发现缺能力，
+  // 就得为「关库 + 释放实例锁」补一整条回滚路径。
   // §19 投递搬运：默认 InProcessTransport（单进程直派）；可传 SameHostTransport
-  // （同机多进程 outbox，§19.3）。宿主传入的其它 Transport 实现将直接使用（不做校验收敛）。
-  if (options.transport !== undefined && options.transport !== "sameHost") {
-    // 自定义 Transport 实现：由宿主自管生命周期，不在此启动 poller
+  // （同机多进程 outbox，§19.3）或宿主自定义 Transport 实现（自管生命周期）。
+  if (
+    options.transport !== undefined &&
+    options.transport !== "sameHost" &&
+    !(options.transport instanceof SameHostTransport)
+  ) {
+    const t = options.transport as { publish?: unknown; subscribe?: unknown; ack?: unknown; stop?: unknown };
+    if (
+      typeof t.publish !== "function" ||
+      typeof t.subscribe !== "function" ||
+      typeof t.ack !== "function"
+    ) {
+      throw new MeshConfigError(
+        "MESH_BAD_CONFIG",
+        "custom Transport must implement publish/subscribe/ack (§12.1)",
+      );
+    }
+    // A27（§12.1）：可选的 stop 合同只要提供了就必须是函数，否则 close 时 `transport.stop?.()`
+    // 会对非函数值做调用而抛 TypeError，且错误发生在收尾路径。
+    if (t.stop !== undefined && typeof t.stop !== "function") {
+      throw new MeshConfigError(
+        "MESH_BAD_CONFIG",
+        "custom Transport.stop must be a function if provided (§12.1)",
+      );
+    }
+  }
+  // A27（§19.3）：transportOptions 为 0 会退化成热轮询（pollIntervalMs）或每轮立即回收
+  // （claimTtlMs）；maxAttempts 为 0 会立即死信。各值须为正整数，否则在抢锁前 reject。
+  if (options.transportOptions !== undefined) {
+    const to = options.transportOptions;
+    for (const [name, n] of [
+      ["pollIntervalMs", to.pollIntervalMs],
+      ["claimTtlMs", to.claimTtlMs],
+      ["maxAttempts", to.maxAttempts],
+    ] as const) {
+      if (n !== undefined && (!Number.isInteger(n) || n < 1)) {
+        throw new MeshConfigError(
+          "MESH_BAD_CONFIG",
+          `transportOptions.${name} must be a positive integer (§19.3)`,
+        );
+      }
+    }
+  }
+  if (options.streamPort) {
+    const SP_METHODS = [
+      "warm", "evict", "deliver", "nudge", "note",
+      "injectContext", "status", "submissionStatus", "onEntry", "onTurnEnd",
+    ] as const;
+    for (const m of SP_METHODS) {
+      if (typeof (options.streamPort as unknown as Record<string, unknown>)[m] !== "function") {
+        throw new MeshConfigError(
+          "MESH_BAD_CONFIG",
+          `custom StreamPort must implement ${m} (§12.1)`,
+        );
+      }
+    }
   }
 
   // ── sessionFactory 装配（LD1）：policies.sessionFactory 高级路径优先；
@@ -444,11 +547,11 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   const undeterminedEndpoints: string[] = [];
   if (options.dbPath !== ":memory:") {
     // recoverDeadEndpoints：先回收死写者遗留的实例锁（单进程崩溃后 .instance.lock 残留会挡住重启）。
+    // A12：用 EndpointLock.reclaim 原子接管（rename 抢占 + 抢到后判活），替代「先 ownerIsLive
+    // 再 forceRelease」；结果无论 held/unknown 都无妨——紧随的 acquire（O_EXCL）会以
+    // LockHeldError 兜底，真正一票否决本进程进入。
     if (recoverDead && !useSameHost) {
-      const instPath = options.dbPath + ".instance.lock";
-      if ((await EndpointLock.ownerIsLive(instPath)) === "dead") {
-        await EndpointLock.forceRelease(instPath);
-      }
+      await EndpointLock.reclaim(options.dbPath + ".instance.lock");
     }
     instanceLock = await EndpointLock.acquire(options.dbPath + ".instance.lock", {
       writerId,
@@ -484,13 +587,13 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
         .all() as Array<{ id: string }>).map((r) => r.id);
 
       // recoverDeadEndpoints：回收死写者遗留的端点锁，暖化不被陈旧锁卡死（M-R10 唯一合法自动回收）。
-      // I04：只有五态里的 "dead"（pid 不存在 / 启动时刻不符）才回收；损坏/不可读 → 保持 unavailable 并告警。
+      // A12：reclaim 原子接管（rename 抢占 + 抢到后判活），替代「先 ownerIsLive 再 forceRelease」；
+      // 只有 "reclaimed" 才清 lock_path；"unknown"（损坏/不可读/判据不齐）保持并告警，绝不猜（§19.6）。
       if (recoverDead) {
         for (const id of endpointIds) {
           const lockPath = join(stateDir, "locks", `${id}.lock`);
-          const verdict = await EndpointLock.ownerIsLive(lockPath);
-          if (verdict === "dead") {
-            await EndpointLock.forceRelease(lockPath);
+          const verdict = await EndpointLock.reclaim(lockPath);
+          if (verdict === "reclaimed") {
             store.db.prepare("UPDATE mesh_endpoints SET lock_path = NULL WHERE id = ?").run(id);
           } else if (verdict === "unknown") {
             undeterminedEndpoints.push(id);
@@ -510,7 +613,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     }
   }
 
-  const registry = new MeshRegistry(store.db, limits);
+  const registry = new MeshRegistry(store.db, limits, { tx: (fn) => store.tx(fn) });
   const events = new MeshEventBus();
   // I04：无法判定的端点锁（损坏/不可读）——保持 unavailable 并告警，绝不猜（§19.6）
   for (const id of undeterminedEndpoints) {
@@ -525,24 +628,24 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
       store.bumpCounter("invariant_violated");
     },
   });
-  // §19 Transport：默认 InProcess，调用方传 SameHostTransport 实例或用 "sameHost" 字符串创建
+  // §19 Transport：默认 InProcess，调用方传 SameHostTransport 实例或用 "sameHost" 字符串创建。
+  // 能力校验已前移到抢锁之前（A22）；此处只做类型收敛，SameHost/InProcess 恒具备三能力。
   const transport =
     options.transport === "sameHost"
       ? new SameHostTransport(store.db, writerId, options.transportOptions)
       : options.transport instanceof SameHostTransport
         ? options.transport
         : (options.transport ?? new InProcessTransport());
-  // C02（§12.1）：自定义 Transport 必须在运行期证成 publish/subscribe/ack 三能力，缺任一即拒绝启用（不静默缺失）
-  if (
-    typeof (transport as { publish?: unknown }).publish !== "function" ||
-    typeof (transport as { subscribe?: unknown }).subscribe !== "function" ||
-    typeof (transport as { ack?: unknown }).ack !== "function"
-  ) {
-    throw new MeshConfigError(
-      "MESH_BAD_CONFIG",
-      "custom Transport must implement publish/subscribe/ack (§12.1)",
-    );
-  }
+
+  // A22（§12.1 全有全无）：抢锁 + 开库之后，任何一步失败（recompute/reconcile/sweep/
+  // transport.start 抛错）都回滚已拿的「实例锁 + DB 句柄」，否则宿主会因 LockHeldError
+  // 无法用同一 dbPath 重建。定义在此（transport/store/instanceLock 均在作用域内），
+  // 供其后的 recompute 与 reconcile/sweep 两个 try 块共用。
+  const rollbackAssembly = async (): Promise<void> => {
+    try { await transport.stop?.(); } catch { /* 尽力停止 poller */ }
+    try { await instanceLock?.release(); } catch { /* 锁释放失败不掩盖原错误 */ }
+    try { store.close(); } catch { /* 关库失败不掩盖原错误 */ }
+  };
 
   // 策略装配：九个槽八个默认，sessionFactory 必填（§12.1 类型层已保证）
   let mailbox!: MeshMailbox;
@@ -556,8 +659,16 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     // §23.3：invariant_violated 是“必须 0”的告警计数器，与上面的同名事件同源撞击。
     store.bumpCounter("invariant_violated");
     // §8.3/§19.4：exclusive 租约到期释放后，窗口内 parked(LEASE_HELD) 的投递应回 queued 重投
-    if (info.reason === "lease_ttl_expired") {
-      void mailbox?.retryEndpoint(info.endpointId);
+    // MD8：session_failed（harness.closed reason="failed"）同样触发——端点已不可用，parked 行
+    // 重入 queued，下次 warm 成功再投。
+    if (info.reason === "lease_ttl_expired" || info.reason === "session_failed") {
+      // A26：void 调用补 catch，避免 close 后仍在途的重投 rejection 让进程崩溃
+      mailbox?.retryEndpoint(info.endpointId).catch((err) => {
+        events.emit("invariant_violated", {
+          code: "retry_endpoint_failed",
+          detail: { endpointId: info.endpointId, reason: String(err) },
+        });
+      });
     }
   };
 
@@ -597,7 +708,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   };
 
   const endpointsOf = (acct: AccountId): Array<{ id: EndpointId; inFlight: number; topology: StreamTopology }> =>
-    registry.endpointsOf(acct).map((e) => ({ id: e.id, inFlight: mailbox ? mailbox.inFlightCount(e.id) : 0, topology: e.topology }));
+    registry.endpointsOf(acct).map((e) => ({ id: e.id, inFlight: mailbox ? port.status(e.id).inFlight : 0, topology: e.topology }));
 
   const defaults = createDefaultPolicies({ isAwaiting, endpointsOf, limits });
   const policies: Policies = {
@@ -680,23 +791,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
       ),
   });
 
-  // C10（§12.1）：自定义 StreamPort 必须在运行期证成全部 10 个能力，缺任一即拒绝启用
-  // （不静默缺失）——否则 note/injectContext/hasEntries/onTurnEnd 等静默丢投递或漏对账。
-  if (options.streamPort) {
-    const SP_METHODS = [
-      "warm", "evict", "deliver", "nudge", "note",
-      "injectContext", "status", "hasEntries", "onEntry", "onTurnEnd",
-    ] as const;
-    for (const m of SP_METHODS) {
-      if (typeof (port as unknown as Record<string, unknown>)[m] !== "function") {
-        throw new MeshConfigError(
-          "MESH_BAD_CONFIG",
-          `custom StreamPort must implement ${m} (§12.1)`,
-        );
-      }
-    }
-  }
-
+  // C10（§12.1）：自定义 StreamPort 的 10 能力校验已前移到抢锁之前（A22）。
   if (options.streamPort && !(options.streamPort instanceof PiStreamPort)) {
     // §12.1：自定义 StreamPort 使 replay(§23.2) / 崩溃恢复双向核对(§8.4) /
     // .lock 单写者(M3) 三项保证失效，启动时降级并警告。
@@ -732,7 +827,12 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   const sinkHandlers = new Map<AccountId, SinkHandler>();
 
   // ③ 崩溃恢复核对（§8.4）：以 deliveries 为真相重算收件箱缓存（派生缓存可重建）。
-  store.recomputeInboxCaches();
+  try {
+    store.recomputeInboxCaches();
+  } catch (err) {
+    await rollbackAssembly();
+    throw err;
+  }
 
   /** sameHost（§19.3）：端点锁 writerId 与本进程匹配 ⇒ 本进程直派；否则走 outbox */
   const isEndpointLocal = async (endpointId: EndpointId): Promise<boolean> => {
@@ -775,6 +875,8 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     transport,
     isEndpointLocal,
     port,
+    // A10：跨进程 P2 收件后由 mailbox 回调刷新注入文本（本进程无 onRouted 触发）。
+    onInjectionRefresh: refreshInjection,
     sinkHandlers,
     awaitingCorrelations,
     clock: safeClock,
@@ -802,51 +904,62 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   // 真实 session 双向核对（在→consumed(partial)，不在→queued 重投，拿不到 session→
   // park+告警）。冷端点由 sweep / warm 触发对账，启动此处仅核对已 hot 的（FakeStreamPort
   // 默认 hot，e2e 重启测试据此断言）；重投走 deliverOne → port.deliver 同步回吐 entry，
-  // 故必须在 onEntry 接好之后。
-  await mailbox.reconcileDelivered();
+  // 故必须在 onEntry 接好之后。A02：先重投上一进程崩溃留下的 routed 残骸，再做 delivered 核对。
+  // A22：这些 await 点（reconcile/sweep/transport.start）任一抛错都要回滚「实例锁 + DB 句柄」——
+  // rollbackAssembly 已在 transport 构造后定义，此处复用。
+  try {
+    await mailbox.reconcileRouted();
+    await mailbox.reconcileDelivered();
 
-  // sameHost（§19.3）：启动 outbox poller（启动时先回收一轮 stale claimed，再周期轮询）
-  if (transport instanceof SameHostTransport) transport.start();
+    // sameHost（§19.3）：启动 outbox poller（启动时先回收一轮 stale claimed，再周期轮询）
+    if (transport instanceof SameHostTransport) transport.start();
 
-  router = new MeshRouter({
-    store,
-    registry,
-    events,
-    policies,
-    limits,
-    devMode,
-    mentionAllCap: options.mentionAllCap,
-    sealKey: options.seal?.key,
-    onRouted: async (envelope) => {
-      await mailbox.fanout(envelope);
-      // fanout 后刷新受影响端点的 P2 注入（未读摘要可能已变化）
-      const ids = store.db
-        .prepare<[string], { endpoint_id: string | null }>(
-          "SELECT DISTINCT endpoint_id FROM mesh_deliveries WHERE message_id = ? AND endpoint_id IS NOT NULL",
-        )
-        .all(envelope.id) as Array<{ endpoint_id: string | null }>;
-      for (const r of ids) if (r.endpoint_id) refreshInjection(r.endpoint_id);
-    },
-    isAwaiting,
-  });
+    router = new MeshRouter({
+      store,
+      registry,
+      events,
+      policies,
+      limits,
+      devMode,
+      mentionAllCap: options.mentionAllCap,
+      sealKey: options.seal?.key,
+      onRouted: async (envelope) => {
+        await mailbox.fanout(envelope);
+        // fanout 后刷新受影响端点的 P2 注入（未读摘要可能已变化）
+        const ids = store.db
+          .prepare<[string], { endpoint_id: string | null }>(
+            "SELECT DISTINCT endpoint_id FROM mesh_deliveries WHERE message_id = ? AND endpoint_id IS NOT NULL",
+          )
+          .all(envelope.id) as Array<{ endpoint_id: string | null }>;
+        for (const r of ids) if (r.endpoint_id) refreshInjection(r.endpoint_id);
+      },
+      isAwaiting,
+    });
 
-  await mailbox.sweep();
+    await mailbox.sweep();
+  } catch (err) {
+    await rollbackAssembly();
+    throw err;
+  }
 
   // N01：周期清扫定时器（§7.5/§7.9/§14.3/§17.2 都由 sweep 驱动）。守卫防重入：
   // 上一轮未结束则跳过本轮，满足「调度不重叠」；.unref() 让定时器不拖住进程退出。
+  // A26：跟踪在途 sweep 的 promise，close() 等它收敛，避免 dispose 之后又被 sweep 重新升温。
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
   let sweepBusy = false;
+  let sweepPromise: Promise<void> | undefined;
   if (limits.sweepIntervalMs > 0) {
     sweepTimer = setInterval(() => {
       if (sweepBusy) return;
       sweepBusy = true;
-      mailbox
+      sweepPromise = mailbox
         .sweep()
         .catch(() => {
           // sweep 内部单步失败不影响下一轮；错误已在各步内 emit/计数。
         })
         .finally(() => {
           sweepBusy = false;
+          sweepPromise = undefined;
         });
     }, limits.sweepIntervalMs);
     sweepTimer.unref?.();
@@ -959,11 +1072,16 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     if (vis !== "full" || max <= 0) return;
     const membership = registry.getMembership(c.id, account);
     if (!membership) return;
+    // R4（A30）：注入与 history 同一可见性谓词，非收件人的定向消息不进入加入历史块。
     const rows = store.db
-      .prepare<[string, number, number], MessageRow>(
-        "SELECT * FROM mesh_messages WHERE conversation_id = ? AND seq <= ? ORDER BY seq DESC LIMIT ?",
+      .prepare<[string, number, string, string, string, string, number], MessageRow>(
+        "SELECT * FROM mesh_messages WHERE conversation_id = ? AND seq <= ?" +
+          " AND (from_account = ? OR to_accounts IS NULL OR to_accounts = ?" +
+          " OR EXISTS (SELECT 1 FROM json_each(to_accounts) WHERE value = ?)" +
+          " OR EXISTS (SELECT 1 FROM json_each(mentions) WHERE value = ?))" +
+          " ORDER BY seq DESC LIMIT ?",
       )
-      .all(c.id, membership.joinedSeq, max) as MessageRow[];
+      .all(c.id, membership.joinedSeq, account, "[]", account, account, max) as MessageRow[];
     if (rows.length === 0) return;
     const block = renderJoinHistoryBlock(
       rows.reverse().map(rowToEnvelope),
@@ -992,6 +1110,33 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   }
 
   async function createConversationHost(input: CreateConversationInput): Promise<Conversation> {
+    assertOpen();
+    // A32：建群不得绕过准入——被拒绝的私聊不能改成「建群拉人」。对每个非创建者成员
+    // 走 canInitiateDirect（fail-closed，§9.1），否决 → reject(CANNOT_INITIATE)，零落库。
+    if (input.type === "group") {
+      const creator = registry.getAccount(input.creator);
+      for (const m of input.members ?? []) {
+        if (m === input.creator) continue;
+        const peer = registry.getAccount(m);
+        if (!creator || !peer) continue; // 未知账号由 registry.createConversation 统一拒绝
+        const allowed = await withPolicyTimeout(
+          policyDeps("accessControl", "deny"),
+          () => {
+            const hook = policies.accessControl.canInitiateDirect;
+            if (!hook) return true; // 钩子缺失 → 放行（缺省 AllowAll 恒真）
+            return hook(creator, peer);
+          },
+          false,
+          (v) => typeof v === "boolean", // 返回 undefined/其它类型 → 非法 → deny（§22.5 fail-closed）
+        );
+        if (!allowed) {
+          throw new MeshRejectError(
+            "CANNOT_INITIATE",
+            "canInitiateDirect denied: " + input.creator + " -> " + m,
+          );
+        }
+      }
+    }
     const conv = await registry.createConversation(input);
     if (input.type === "group") {
       emitConvChanged(input.creator ? conv.id : conv.id, {
@@ -1008,6 +1153,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     account: AccountId,
     opts: { caps?: Cap[]; by?: AccountId } = {},
   ): Promise<void> {
+    assertOpen();
     const c = requireGroup(conv);
     const by = opts.by ?? SYSTEM_ACCOUNT;
     if (!registry.getAccount(account)) throw new MeshRejectError("NOT_A_MEMBER", "unknown account: " + account);
@@ -1024,6 +1170,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   }
 
   async function groupRemoveMember(conv: ConversationId, account: AccountId, by: AccountId): Promise<void> {
+    assertOpen();
     requireGroup(conv);
     const m = registry.getMembership(conv, account);
     if (!m) return;
@@ -1037,6 +1184,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   }
 
   async function groupJoin(conv: ConversationId, account: AccountId): Promise<void> {
+    assertOpen();
     const c = requireGroup(conv);
     if (!c.config.openJoin) throw new MeshRejectError("JOIN_DENIED", "openJoin is disabled");
     if (!registry.getAccount(account)) throw new MeshRejectError("NOT_A_MEMBER", "unknown account: " + account);
@@ -1060,6 +1208,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   }
 
   async function groupLeave(conv: ConversationId, account: AccountId): Promise<void> {
+    assertOpen();
     requireGroup(conv);
     const m = registry.getMembership(conv, account);
     if (!m) return;
@@ -1071,6 +1220,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   }
 
   async function groupSetCaps(conv: ConversationId, account: AccountId, caps: Cap[], by: AccountId): Promise<void> {
+    assertOpen();
     requireGroup(conv);
     if (!validCaps(caps)) throw new Error("CAP_REQUIRED");
     requireMemberCap(conv, by, "setCaps");
@@ -1090,6 +1240,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     topic?: string,
     announcement?: string,
   ): Promise<void> {
+    assertOpen();
     requireConv(conv);
     requireMemberCap(conv, by, "setTopic");
     registry.setTopic(conv, topic, announcement);
@@ -1103,12 +1254,14 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   }
 
   async function groupMute(conv: ConversationId, account: AccountId, until: string): Promise<void> {
+    assertOpen();
     requireGroup(conv);
     registry.mute(conv, account, until);
     emitConvChanged(conv, { op: "muted", by: account, target: account }); // 不发 system 消息
   }
 
   async function groupDissolve(conv: ConversationId, by: AccountId): Promise<void> {
+    assertOpen();
     requireGroup(conv);
     requireMemberCap(conv, by, "dissolve");
     await emitSystem(conv, `${by} dissolved the conversation`); // 先 system 后归档（Router 拒投已归档会话）
@@ -1118,6 +1271,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   }
 
   async function upgradeToGroup(directConv: ConversationId, extra: AccountId[], by: AccountId): Promise<Conversation> {
+    assertOpen();
     const c = requireConv(directConv);
     if (c.kind !== "direct") throw new Error("ARG_INVALID");
     const directMembers = registry.listMembers(directConv).map((x) => x.accountId);
@@ -1149,6 +1303,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     data?: unknown;
     error?: unknown;
   }): Promise<void> {
+    assertOpen();
     const pa = store.db
       .prepare<
         [string],
@@ -1288,7 +1443,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     m: SendInput & { from: string; expect: "ack" | "reply" },
     opts?: { await?: boolean },
   ): Promise<{ correlationId: string } | AckResult> {
-    if (closed) throw new Error("mesh: host is closed");
+    assertOpen();
     const { from, ...input } = m;
     const blocking = opts?.await === true;
     const r = await router.route({
@@ -1352,17 +1507,9 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
       }
     };
 
-    return new Promise<AckResult>((resolve) => {
+    return new Promise<AckResult>((resolve, reject) => {
       let done = false;
       let poll: ReturnType<typeof setInterval> | undefined;
-      const finish = (result: AckResult) => {
-        if (done) return;
-        done = true;
-        offAck();
-        offTimeout();
-        if (poll !== undefined) clearInterval(poll);
-        resolve(result);
-      };
 
       // 快路径：本进程事件（detail 精确到 data/error）
       const offAck = events.on("message_acked", (p) => {
@@ -1384,6 +1531,26 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
         finish({ correlationId, ok: false, from: expectedFrom, timedOut: true });
       });
 
+      const cleanup = () => {
+        pendingBlockers.delete(onClose);
+        offAck();
+        offTimeout();
+        if (poll !== undefined) clearInterval(poll);
+      };
+      const finish = (result: AckResult) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(result);
+      };
+      const onClose = () => {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(new Error("mesh: host is closed"));
+      };
+      pendingBlockers.add(onClose);
+
       // 立即补查一次：闭合路由悬挂窗口内已经发生的快 ack / 已终态
       const seeded = terminalState();
       if (seeded) {
@@ -1397,11 +1564,8 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
         try {
           st = terminalState();
         } catch {
-          // 宿主已 close（DB 连接关闭）或存储故障：停止轮询，勿在定时器内抛未捕获异常。
-          offAck();
-          offTimeout();
-          if (poll !== undefined) clearInterval(poll);
-          done = true;
+          // 宿主已 close（DB 连接关闭）或存储故障：reject 挂起的等待者，勿永久挂起（A24）。
+          onClose();
           return;
         }
         if (st) finish(st);
@@ -1417,6 +1581,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     account: string,
     opts?: { fromSeq?: number },
   ): Promise<void> {
+    assertOpen();
     const c = requireConv(conv);
     if (c.kind !== "topic") throw new Error("ARG_INVALID: not a topic");
     const acc = registry.getAccount(account);
@@ -1438,41 +1603,58 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   }
 
   async function topicUnsubscribe(conv: string, account: string): Promise<void> {
+    assertOpen();
     const c = requireConv(conv);
     if (c.kind !== "topic") throw new Error("ARG_INVALID: not a topic");
-    // §16.3 ① 软删
-    registry.unsubscribe(conv, account);
-    // §16.3 ② queued/parked → dropped(ACL_DENIED)。mesh_deliveries 无 conversation_id，
-    // 需经 message_id 关联 mesh_messages 定位本会话的投递行。
-    store.db
-      .prepare(
-        "UPDATE mesh_deliveries SET state='dropped', drop_reason='ACL_DENIED', state_changed_at=? " +
-          "WHERE account_id=? AND state IN ('queued','parked') " +
-          "AND message_id IN (SELECT id FROM mesh_messages WHERE conversation_id=?)",
-      )
-      .run(isoNow(), account, conv);
-    // §16.3 ③ mesh_inboxes 该会话行清零：cursor_seq 置「当时的 next_seq」（非 0，规则 3），
-    // 重新订阅才不按旧游标算巨大落后量；旧折叠摘要与重新订阅无关，一并清空。
-    store.db
-      .prepare(
-        "UPDATE mesh_inboxes SET pending_count=0, pending_bytes=0, overflow_count=0, overflow_summary=NULL, " +
-          "cursor_seq=(SELECT next_seq FROM mesh_conversations WHERE id=?) WHERE account_id=? AND conversation_id=?",
-      )
-      .run(conv, account, conv);
+    // A16：① 软删订阅、② 撤未读投递行、③ 清空 inbox 缓存 必须同一事务，避免崩溃中途
+    // 留下「订阅已退、pending 未清」的半态。且撤行口径须与 pending 真相一致——
+    // routed/queued/parked/delivered 都是 recomputeInboxCaches 计入未读的状态，只撤
+    // queued/parked 会留下 delivered/routed 行，重启重算后未读数「复活」。
+    store.tx(() => {
+      // §16.3 ① 软删
+      registry.unsubscribe(conv, account);
+      // §16.3 ② 未读投递行 → dropped(ACL_DENIED)。mesh_deliveries 无 conversation_id，
+      // 需经 message_id 关联 mesh_messages 定位本会话的投递行。
+      store.db
+        .prepare(
+          "UPDATE mesh_deliveries SET state='dropped', drop_reason='ACL_DENIED', state_changed_at=? " +
+            "WHERE account_id=? AND state IN ('routed','queued','parked','delivered') " +
+            "AND message_id IN (SELECT id FROM mesh_messages WHERE conversation_id=?)",
+        )
+        .run(isoNow(), account, conv);
+      // §16.3 ③ mesh_inboxes 该会话行清零：cursor_seq 置「当时的 next_seq」（非 0，规则 3），
+      // 重新订阅才不按旧游标算巨大落后量；旧折叠摘要与重新订阅无关，一并清空。
+      store.db
+        .prepare(
+          "UPDATE mesh_inboxes SET pending_count=0, pending_bytes=0, overflow_count=0, overflow_summary=NULL, " +
+            "cursor_seq=(SELECT next_seq FROM mesh_conversations WHERE id=?) WHERE account_id=? AND conversation_id=?",
+        )
+        .run(conv, account, conv);
+    });
     emitConvChanged(conv, { op: "unsubscribed", by: account, target: account });
   }
 
   // ── requeue（§17.8）─────────────────────────────────────────────────────
 
   async function requeue(messageId: string, targetConv: string): Promise<void> {
+    assertOpen();
     const row = store.db
       .prepare<[string], MessageRow>("SELECT * FROM mesh_messages WHERE id = ?")
       .get(messageId) as MessageRow | undefined;
     if (!row) throw new MeshRejectError("NO_SUCH_KEY", "no such message: " + messageId);
     const env = rowToEnvelope(row);
     const target = requireConv(targetConv);
-    // 标记原 delivery 为 dropped（若仍处于未终态），避免悬挂 claimed
-    // I32(a)：pending→dropped 减少未读缓存。先取受影响 (account, conv)，UPDATE 后重算。
+    // A15：先重投成功，再撤原行。旧实现先把原行置 dropped 再 route——route 被拒（如非成员）
+    // 或中途崩溃时，消息已经丢失。延后撤行保证重投失败时原消息原样保留。
+    await router.route({
+      from: env.from,
+      conversationId: targetConv,
+      kind: (env.kind === "task" ? "task" : "chat") as RouteInput["kind"],
+      expect: target.kind === "queue" ? ("ack" as const) : ("none" as const),
+      payload: env.payload,
+      clientToken: "requeue-" + messageId,
+    });
+    // 重投成功后撤原投递行（claimed 也要撤，避免悬挂）；I32(a)：pending→dropped 重算未读。
     const affected = store.db
       .prepare<[string], { account_id: string; conversation_id: string }>(
         "SELECT DISTINCT d.account_id, m.conversation_id FROM mesh_deliveries d " +
@@ -1487,14 +1669,6 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
       )
       .run(isoNow(), messageId);
     for (const a of affected) store.recomputeInbox(a.account_id, a.conversation_id);
-    await router.route({
-      from: env.from,
-      conversationId: targetConv,
-      kind: (env.kind === "task" ? "task" : "chat") as RouteInput["kind"],
-      expect: target.kind === "queue" ? ("ack" as const) : ("none" as const),
-      payload: env.payload,
-      clientToken: "requeue-" + messageId,
-    });
   }
 
   function makeToolContext(accountId: AccountId, endpointId: EndpointId): ToolContext {
@@ -1537,6 +1711,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
             return;
           case "unsubscribe":
             await topicUnsubscribe(conv, accountId);
+            return;
           default:
             throw new Error("ARG_INVALID");
         }
@@ -1552,67 +1727,115 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
   // ── close（§12.1：全有全无）────────────────────────────────────────────
 
   let closed = false;
-  async function close(): Promise<void> {
-    if (closed) return;
+  // A24：blocking request({await:true}) 的挂起等待者，close 时统一 reject（不 resolve/reject 会永久挂起）。
+  const pendingBlockers = new Set<() => void>();
+  // A26：统一写入口护栏——close 后一切写/控制 API 都拒绝，而不是静默改已关的 store/port。
+  // （只读投影 observer/toolSet/lookup 不在此列；DB 已关，它们读到的要么为空要么抛错。）
+  const assertOpen = (): void => {
+    if (closed) throw new Error("mesh: host is closed");
+  };
+  // A27：缓存 close promise——并发 close 的第二次调用返回同一个在途 promise，
+  // 而不是越过 close 立即 resolve（那样会在清理真正完成之前就放行调用方）。
+  let closePromise: Promise<void> | undefined;
+  async function doClose(): Promise<void> {
     closed = true;
+    for (const rejectBlock of pendingBlockers) rejectBlock();
+    pendingBlockers.clear();
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
-    for (const u of injectionUnsub.values()) u();
-    injectionUnsub.clear();
-    // sameHost：停 outbox poller；已认领未完成的 delivery 由其他进程在回收窗口中接管
-    for (const u of transportSubs.values()) u();
-    transportSubs.clear();
-    // C02（§12.1）：停 transport 的轮询/定时器（SameHostTransport 与自定义实现共用 stop 合同）
-    await transport.stop?.();
-    // 等在途 handoff 收敛或超时（§12.1）
-    const deadline = Date.now() + limits.handoffTimeoutMs;
-    const endpointIds = (store.db
-      .prepare<[], { id: string }>("SELECT id FROM mesh_endpoints")
-      .all() as Array<{ id: string }>).map((r) => r.id);
-    while (Date.now() < deadline) {
-      let inflight = 0;
-      for (const id of endpointIds) inflight += mailbox.inFlightCount(id) + port.status(id).inFlight;
-      if (inflight === 0) break;
-      await sleep(10);
-    }
-    // I16（§12.1）：port.dispose 失败也不跳过实例锁释放与关库——三者按序全部收尾，
-    // 之后重抛首个错误（残留写者不是可接受的失败模式）。
+
+    // A27：收尾每一步都独立 try/catch，任何一步抛错都不跳过后续的实例锁释放与关库；
+    // 首个错误在全部收尾完成后重抛。这是「全有全无」的 close 面：宁可报错也不残留写者。
     let firstErr: unknown;
-    try {
+    const run = async (step: () => Promise<void> | void): Promise<void> => {
+      try {
+        await step();
+      } catch (err) {
+        firstErr ??= err;
+      }
+    };
+
+    // A26：等在途 sweep 收敛后再 dispose 端口，避免 dispose 之后又被 sweep 重新升温。
+    await run(async () => {
+      if (sweepPromise) await sweepPromise;
+    });
+    await run(() => {
+      for (const u of injectionUnsub.values()) u();
+      injectionUnsub.clear();
+    });
+    // sameHost：停 outbox poller；已认领未完成的 delivery 由其他进程在回收窗口中接管
+    await run(() => {
+      for (const u of transportSubs.values()) u();
+      transportSubs.clear();
+    });
+    // C02（§12.1）：停 transport 的轮询/定时器（SameHostTransport 与自定义实现共用 stop 合同）
+    await run(() => transport.stop?.());
+    // 等在途 handoff 收敛或超时（§12.1）
+    await run(async () => {
+      const deadline = Date.now() + 30000;
+      const endpointIds = (store.db
+        .prepare<[], { id: string }>("SELECT id FROM mesh_endpoints")
+        .all() as Array<{ id: string }>).map((r) => r.id);
+      while (Date.now() < deadline) {
+        let inflight = 0;
+        for (const id of endpointIds) inflight += port.status(id).inFlight;
+        if (inflight === 0) break;
+        await sleep(10);
+      }
+    });
+    // I16（§12.1）：port.dispose 失败也不跳过实例锁释放与关库——三者按序全部收尾。
+    await run(async () => {
       const p = port as unknown as { dispose?: () => Promise<void> };
       if (typeof p.dispose === "function") await p.dispose();
-    } catch (err) {
-      firstErr = err;
-    }
-    try {
+    });
+    await run(async () => {
       await instanceLock?.release();
-    } catch (err) {
-      firstErr ??= err;
-    }
-    try {
+    });
+    await run(() => {
       store.close();
-    } catch (err) {
-      firstErr ??= err;
-    }
+    });
+
     if (firstErr) throw firstErr;
+  }
+  function close(): Promise<void> {
+    if (!closePromise) closePromise = doClose();
+    return closePromise;
   }
 
   // ── MeshHost 对象 ───────────────────────────────────────────────────────
 
   const host: MeshHost = {
     // ── 账号、端点与寻址 ──
-    registerAccount: (a: RegisterAccountInput) => registry.registerAccount(a),
-    registerEndpoint: (e: RegisterEndpointInput) => registry.registerEndpoint(e),
+    registerAccount: (a: RegisterAccountInput) => {
+      assertOpen();
+      return registry.registerAccount(a);
+    },
+    registerEndpoint: async (e: RegisterEndpointInput) => {
+      assertOpen();
+      validateTopology(e.topology);
+      return registry.registerEndpoint(e);
+    },
     registerSinkHandler(accountId: AccountId, h: SinkHandler): Unsubscribe {
+      assertOpen();
       sinkHandlers.set(accountId, h);
       // §6.3③：handler 晚到的投递从 NO_SINK_HANDLER 恢复
-      void mailbox.retryAccount(accountId);
+      // A26：void 调用补 catch，避免 close 后仍在途重投 rejection 让进程崩溃
+      mailbox.retryAccount(accountId).catch((err) => {
+        events.emit("invariant_violated", {
+          code: "retry_account_failed",
+          detail: { accountId, reason: String(err) },
+        });
+      });
       return () => {
         if (sinkHandlers.get(accountId) === h) sinkHandlers.delete(accountId);
       };
     },
-    markConsumed: (deliveryId: string) => mailbox.markConsumed(deliveryId),
+    markConsumed: (deliveryId: string) => {
+      assertOpen();
+      return mailbox.markConsumed(deliveryId);
+    },
     async setPresence(accountId: AccountId, state: PresenceState, opts?: { until?: string; reason?: string }) {
+      assertOpen();
       const prev = registry.effectivePresence(accountId);
       registry.setPresence(accountId, state, opts);
       const next = registry.effectivePresence(accountId);
@@ -1623,12 +1846,14 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
       }
     },
     upsertContact: async (ownerId, peerId, opts) => {
+      assertOpen();
       registry.upsertContact(ownerId, peerId, opts);
     },
     lookup: async (q) => registry.lookupAccounts(q),
 
     // ── 会话与成员 ──
-    ensureDirect: (a, b) => {
+    ensureDirect: async (a, b) => {
+      assertOpen();
       if (!registry.getAccount(a) || !registry.getAccount(b)) {
         throw new MeshRejectError("NOT_A_MEMBER", "both accounts must be registered");
       }
@@ -1658,7 +1883,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
 
     // ── 发送与应答 ──
     async send(m: SendInput & { from: string }) {
-      if (closed) throw new Error("mesh: host is closed");
+      assertOpen();
       // I34：任一存储故障激活即停发（告警+边界），恢复后自动放行。
       if (store.health.isStopSend()) {
         throw new InvariantViolationError("storage_fault", {
@@ -1671,25 +1896,43 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
     },
     request: (m, opts) => request(m, opts) as Promise<{ correlationId: string } | AckResult>,
     ack: (r) => ackCorrelation(r),
-    claim: (messageId, by) => mailbox.claim(messageId, by),
+    claim: (messageId, by) => {
+      assertOpen();
+      return mailbox.claim(messageId, by);
+    },
     requeue: (messageId, targetConv) => requeue(messageId, targetConv),
 
     // ── 控制面 ──
-    nudge: (endpointId, cue, opts) => port.nudge(endpointId, cue, opts),
-    injectContext: (endpointId, text) => port.injectContext(endpointId, text),
-    beforeClearQueue: (endpointId) => mailbox.beforeClearQueue(endpointId),
+    nudge: (endpointId, cue, opts) => {
+      assertOpen();
+      return port.nudge(endpointId, cue, opts);
+    },
+    injectContext: (endpointId, text) => {
+      assertOpen();
+      return port.injectContext(endpointId, text);
+    },
 
     // ── 共享空间 ──
     shared: {
       get: (spaceId, key, opts) => sharedSpace.get(spaceId, key, opts.as, opts.version),
-      put: (spaceId, key, data, opts) => sharedSpace.put(spaceId, key, data, opts),
-      append: (spaceId, key, item, opts) => sharedSpace.append(spaceId, key, item, opts),
-      del: (spaceId, key, opts) => sharedSpace.del(spaceId, key, opts),
+      put: (spaceId, key, data, opts) => {
+        assertOpen();
+        return sharedSpace.put(spaceId, key, data, opts);
+      },
+      append: (spaceId, key, item, opts) => {
+        assertOpen();
+        return sharedSpace.append(spaceId, key, item, opts);
+      },
+      del: (spaceId, key, opts) => {
+        assertOpen();
+        return sharedSpace.del(spaceId, key, opts);
+      },
       list: (spaceId, opts) => sharedSpace.list(spaceId, opts),
     },
 
     // ── 流控制 ──
     async warm(endpointId: string, lease?: MeshLease) {
+      assertOpen();
       await port.warm(endpointId, lease);
       await mailbox.retryEndpoint(endpointId);
       refreshInjection(endpointId);
@@ -1704,16 +1947,19 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
       }
     },
     evict: async (endpointId) => {
+      assertOpen();
       // sameHost：清理 transport 订阅避免 stale handler
       transportSubs.get(endpointId)?.();
       transportSubs.delete(endpointId);
       await port.evict(endpointId);
     },
     async reclaimEndpoint(endpointId) {
-      // §27.4 / M-R10：只有 ownerIsLive === "dead" 才回收；alive/unknown 一律拒绝（绝不猜）。
+      assertOpen();
+      // A12（§27.4 / M-R10）：EndpointLock.reclaim 原子接管——只有 "reclaimed" 才回收；
+      // "held"（活持）/ "unknown"（判据不齐）一律拒绝（绝不猜，§19.6）。
       const lockPath = join(stateDir, "locks", `${endpointId}.lock`);
-      const verdict = await EndpointLock.ownerIsLive(lockPath);
-      if (verdict !== "dead") {
+      const verdict = await EndpointLock.reclaim(lockPath);
+      if (verdict !== "reclaimed") {
         const ep = registry.getEndpoint(endpointId);
         // I26：经 setEndpointState 补发 endpoint_state_changed（reclaim 拒绝降级也是状态跃迁）
         if (ep) setEndpointState(endpointId, "unavailable");
@@ -1722,9 +1968,8 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
           events.emit("invariant_violated", { code: "endpoint_lock_undetermined", detail: { endpointId } });
           store.bumpCounter("invariant_violated");
         }
-        return { outcome: verdict === "alive" ? "held" : "unknown" };
+        return { outcome: verdict === "held" ? "held" : "unknown" };
       }
-      await EndpointLock.forceRelease(lockPath);
       registry.setEndpointLock(endpointId, null);
       return { outcome: "reclaimed" };
     },
@@ -1804,7 +2049,6 @@ export type {
   MeshHost,
   MeshLease,
   MeshOptions,
-  MeshRejectError,
   MeshToolName,
   MeshToolResult,
   MessageId,
@@ -1813,7 +2057,6 @@ export type {
   OptionalPolicySlot,
   ParkReason,
   PendingDelivery,
-  PiSessionId,
   Policies,
   PolicyDegradeReason,
   PolicySlot,
@@ -1831,6 +2074,7 @@ export type {
   RequiredPolicySlot,
   RetentionCandidate,
   RetentionPolicy,
+  RuntimeRef,
   SendInput,
   SessionFactory,
   SharedObjectMeta,
@@ -1863,6 +2107,9 @@ export {
   PARK_REASONS,
   REJECT_CODES,
   TOOL_ERROR_CODES,
+  // R3（A25）：MeshRejectError 是公开错误契约（send/request 直接抛出），根使用者须能
+  // instanceof 判定，故与 InvariantViolationError 同级值导出。
+  MeshRejectError,
 } from "./core/types.js";
 
 export { REGISTERED_COUNTERS } from "./core/store.js";
@@ -1880,4 +2127,4 @@ export type {
   ResolvedLlm,
 } from "./pi/llm-config.js";
 export { EndpointLock, LockHeldError } from "./pi/lock.js";
-export { PiPortError, PiStreamPort } from "./pi/stream-port.js";
+export { PiPortError, PiStreamPort } from "./pi/durable-port.js";

@@ -43,7 +43,7 @@ const check = (label: string, cond: boolean): void => {
 // 占位策略：sink 路径不建 session，这段不会被调用。真实接入时改用
 // createMesh({ llm, runtime }) 或 createAssembledSessionFactory（见 src/pi/）。
 const sessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "quickstart" }),
+  create: async () => ({ session: {}, runtimeRef: "quickstart" }),
   open: async () => ({ session: {} }),
 };
 

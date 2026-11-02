@@ -14,7 +14,7 @@ import type { StorageFaultCode } from "../../src/core/health.js";
 import { SqliteStore } from "../../src/core/store.js";
 
 const sessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "health-test" }),
+  create: async () => ({ session: {}, runtimeRef: "health-test" }),
   open: async () => ({ session: {} }),
 };
 

@@ -9,7 +9,7 @@ import type { Transport } from "../../src/core/types.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
 const sessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "opt-test" }),
+  create: async () => ({ session: {}, runtimeRef: "opt-test" }),
   open: async () => ({ session: {} }),
 };
 

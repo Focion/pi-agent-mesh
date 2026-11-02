@@ -108,7 +108,11 @@ export function sealFieldsFromRow(row: MessageRow): SealFields {
 export function sealValid(key: string, row: MessageRow): boolean {
   const expected = computeSealToken(key, sealFieldsFromRow(row));
   const actual = row.seal ?? "";
+  // A34：实际 seal 是「自验签」输入、不可信任。畸形 hex（含非法字符）会让
+  // Buffer.from(actual, "hex") 提前截断、与期望缓冲长度不一致，进而让 timingSafeEqual
+  // 抛异常。长度相等但仍非正规 hex 时直接判无效，而不是让它抛。
   if (actual.length !== expected.length) return false;
+  if (!/^[0-9a-f]+$/i.test(actual)) return false;
   return timingSafeEqual(
     Buffer.from(expected, "hex"),
     Buffer.from(actual, "hex"),

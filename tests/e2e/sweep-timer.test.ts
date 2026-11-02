@@ -18,11 +18,20 @@ import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "sweep-test" }),
+  create: async () => ({ session: {}, runtimeRef: "sweep-test" }),
   open: async () => ({ session: {} }),
 };
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+// A45：轮询直到条件满足，替代固定 sleep（集中用于正向等待；反向「仍保持 parked」仍需固定窗口）。
+const waitFor = async (cond: () => boolean, ms = 4000): Promise<void> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise<void>((r) => setTimeout(r, 25));
+  }
+  throw new Error("waitFor: condition not met within " + ms + "ms");
+};
 
 const LONG_AGO = "1970-01-01T00:00:00.000Z"; // 远早于任何 TTL 阈值
 
@@ -108,7 +117,7 @@ describe("W06 N01: periodic sweep timer", () => {
 
       // 让 parked 的 TTL 已过：下一轮定时 sweep 必会落 dropped
       backdateParkedAt(dbPath, r.messageId);
-      await sleep(2200); // 定时器（1s 间隔）至少跑一轮
+      await waitFor(() => deliveryState(dbPath, r.messageId) === "dropped"); // 定时器（1s 间隔）至少跑一轮
 
       expect(deliveryState(dbPath, r.messageId)).toBe("dropped");
       await assertInvariants(host);
@@ -140,7 +149,7 @@ describe("W06 N01: periodic sweep timer", () => {
 
 describe("W06 I32(b): topicUnsubscribe cursor = next_seq", () => {
   it("clears pending/overflow and sets cursor_seq to the current next_seq (not 0)", async () => {
-    const { host, dbPath } = await makeMesh({ handoffTimeoutMs: 1000 });
+    const { host, dbPath } = await makeMesh({});
     try {
       await makeSpeaker(host, "pub");
       await host.registerAccount({
@@ -185,6 +194,47 @@ describe("W06 I32(b): topicUnsubscribe cursor = next_seq", () => {
         expect(inbox!.overflow_summary).toBeNull();
         expect(inbox!.cursor_seq).toBe(nextSeq!.next_seq);
         expect(inbox!.cursor_seq).toBeGreaterThan(0); // 非 0（§16.3 规则 3）
+      } finally {
+        db.close();
+      }
+      await assertInvariants(host);
+    } finally {
+      await host.close();
+    }
+  });
+
+  it("A16: hot subscriber 的 delivered 行也一并撤回（口径统一，重启重算 pending 仍为 0）", async () => {
+    const { host, dbPath } = await makeMesh({});
+    try {
+      await makeSpeaker(host, "pub");
+      await makeSpeaker(host, "sub"); // 有 hot 端点 → topic note 投到 delivered（非 parked）
+      const topic = await host.createConversation({ type: "topic", creator: "pub" });
+      await host.subscribe(topic.id, "sub");
+      const r = await host.send({
+        from: "pub",
+        conversationId: topic.id,
+        kind: "chat",
+        expect: "none",
+        text: "hot sub",
+      });
+      // fanout 落盘：subscript 有热端点 → delivered
+      await waitFor(() => deliveryState(dbPath, r.messageId) === "delivered");
+
+      await host.unsubscribe(topic.id, "sub");
+
+      // A16：delivered（与 queued/parked/routed 一样属未读真相）也必须被撤回为 dropped。
+      // 旧实现只撤 queued/parked，留下 delivered 行 → 重启 recomputeInboxCaches 会把
+      // pending_count 从 0 重新算回 1，未读数「复活」。
+      expect(deliveryState(dbPath, r.messageId)).toBe("dropped");
+
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        const inbox = db
+          .prepare(
+            "SELECT pending_count FROM mesh_inboxes WHERE account_id = ? AND conversation_id = ?",
+          )
+          .get("sub", topic.id) as { pending_count: number } | undefined;
+        expect(inbox?.pending_count).toBe(0);
       } finally {
         db.close();
       }

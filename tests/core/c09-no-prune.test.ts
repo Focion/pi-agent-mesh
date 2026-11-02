@@ -41,7 +41,7 @@ function makeHarness(opts: { limits?: Partial<Limits> } = {}): Harness {
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
   };

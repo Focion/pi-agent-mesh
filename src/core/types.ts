@@ -15,7 +15,7 @@ export type MessageId = string; // = Envelope.id
 export type DeliveryId = string; // = mesh_deliveries.id
 export type SpaceId = string; // conversationId | "global" | 宿主自定义
 export type EntryId = string; // pi entry id（onEntry 归因）
-export type PiSessionId = string; // 仅 stream 端点有
+export type RuntimeRef = string; // 仅 stream 端点有（不透明：包装 storagePath + conversationId，MD7）
 export type CorrelationId = string; // 请求-应答配对键
 
 export type Grade = "steer" | "followUp" | "silent"; // 三档（F1：nextTurn 已删）
@@ -226,7 +226,7 @@ export interface Endpoint {
   accountId: AccountId;
   topology: StreamTopology;
   state: EndpointState;
-  piSessionId: PiSessionId | null; // 未热化 / sink / external 恒为 null
+  runtimeRef: RuntimeRef | null; // 未热化 / sink / external 恒为 null
   lease: MeshLease;
   leaseUntil: string | null;
   lastActiveAt: string | null;
@@ -296,12 +296,11 @@ export interface DeliveryTrace {
   reason: RejectCode | ParkReason | DropReason | null;
   /** I28：定档/不唤醒/降档留痕（backpressure_downgrade / wake_throttled / sink_backoff / muted / dnd / offline / activation）。 */
   note: string | null;
-  /** I28：重投触发原因（entry_vanished / handoff_timeout / claim_timeout / 原 parked_reason；未重投为 null）。 */
+  /** I28：重投触发原因（entry_vanished / nack / claim_timeout / 原 parked_reason；未重投为 null）。 */
   redeliverReason: string | null;
   attempts: number;
   woke: boolean;
   path: ContextPath | null;
-  handoffAt: string | null;
   parkedAt: string | null;
   stateChangedAt: string;
   createdAt: string;
@@ -309,7 +308,7 @@ export interface DeliveryTrace {
 
 export interface StreamEntry {
   entryId: EntryId;
-  piSessionId: PiSessionId;
+  runtimeRef: RuntimeRef;
   parentId: EntryId | null;
   seqInStream: number;
   entryType: string;
@@ -569,11 +568,11 @@ export interface SessionFactory {
     endpoint: Endpoint;
     account: Account;
     tools: ToolDefinition[];
-  }): Promise<{ session: unknown; piSessionId: string }>;
+  }): Promise<{ session: unknown; runtimeRef: string }>;
   open(ctx: {
     endpoint: Endpoint;
     account: Account;
-    piSessionId: string;
+    runtimeRef: string;
     tools: ToolDefinition[];
   }): Promise<{ session: unknown }>;
   dispose?(ctx: { endpoint: Endpoint; session: unknown }): Promise<void>;
@@ -642,7 +641,6 @@ export interface Limits {
   requestChainMaxDepth: number; // 8
   maxAttempts: number; // 3
   policyTimeoutMs: number; // 50（九槽统一超时，I21）
-  handoffTimeoutMs: number; // 30000
   sweepIntervalMs: number; // 30000（周期清扫间隔；0 = 不启动定时器）
   sinkBackoffBaseMs: number; // 1000（sink 拒收退避起始间隔）
   sinkBackoffMaxMs: number; // 30000（sink 退避间隔上限，§21.2 指数退避有上限）
@@ -675,7 +673,6 @@ export const DEFAULT_LIMITS: Limits = {
   requestChainMaxDepth: 8,
   maxAttempts: 3,
   policyTimeoutMs: 50,
-  handoffTimeoutMs: 30000,
   sweepIntervalMs: 30000,
   sinkBackoffBaseMs: 1000,
   sinkBackoffMaxMs: 30000,
@@ -749,9 +746,33 @@ export interface PortStatus {
   idleMs?: number; // §15.2 派生 idle 的时长锚点（端口/会话级；缺省回落到端点 last_active_at）
 }
 
+/** durable submission 的生命周期状态（§9 F-A：queued → placed → done / unanswered）。 */
+export type SubmissionStatus = "queued" | "placed" | "done" | "unanswered";
+
+/** deliver 的返回投影：submissionId + 当场读到的状态（不承诺最终态，F5/MD3）。 */
+export interface SubmissionHandle {
+  submissionId: string;
+  status: SubmissionStatus;
+  entryId?: string;
+}
+
+/**
+ * submission 权威投影（§8.4 对账按 id 精确读一条，取代「逐条问 entry 是否还在」）。
+ * status 语义：queued=仍在 pi.inbox 未落位；placed=已落进运行中的一轮（仅 input）；
+ * done=已结算进转录；unanswered=终态未答，判据先看 entry 再看 reason（§9 F-A）。
+ */
+export interface SubmissionRecord {
+  id: string;
+  status: SubmissionStatus;
+  entryId?: string; // placed/done 的落盘 entry；input 的 unanswered 带 entry 时也在
+  reason?: string; // unanswered 的原因码（aborted/run_failed/stale/model_error）
+  type: "input" | "write";
+}
+
 /**
  * mesh-core 与 pi SDK 之间的唯一接口，恰好 10 个方法（§2.4）。
- * deliver 的 resolve 不等于 delivered（F5）；判据是 onEntry。
+ * deliver 的 resolve 不等于 delivered（F5）；判据是 submission 状态（MD3），
+ * onEntry 仅作镜像与快速归因，不再是对账权威。
  */
 export interface StreamPort {
   warm(endpointId: string, lease?: MeshLease): Promise<void>;
@@ -761,8 +782,8 @@ export interface StreamPort {
     rendered: string,
     envelope: Envelope,
     grade: Grade,
-    opts?: { triggerTurn?: boolean }
-  ): Promise<{ entryId?: string }>;
+    opts?: { triggerTurn?: boolean; deliveryId?: string; attempt?: number }
+  ): Promise<SubmissionHandle>;
   nudge(
     endpointId: string,
     cue: string,
@@ -771,7 +792,8 @@ export interface StreamPort {
   note(endpointId: string, customType: string, data: unknown): Promise<void>;
   injectContext(endpointId: string, text: string): Unsubscribe;
   status(endpointId: string): PortStatus;
-  hasEntries(endpointId: string, entryIds: string[]): Promise<Set<string>>;
+  /** §8.4：按 submission id 精确读一条权威投影。端点冷/记录不存在 → null。 */
+  submissionStatus(endpointId: string, submissionId: string): Promise<SubmissionRecord | null>;
   onEntry(h: (e: PortEntryEvent) => void): Unsubscribe;
   onTurnEnd(h: (e: { endpointId: string }) => void): Unsubscribe;
 }
@@ -801,7 +823,7 @@ export interface Observer {
   trace(messageId: string): Promise<DeliveryTrace[]>;
   inboxOf(accountId: string): Promise<InboxView>;
   conversationsOf(accountId: string): Promise<ConversationSummary[]>;
-  streamEntries(piSessionId: string, opts?: { sinceSeq?: number }): Promise<StreamEntry[]>;
+  streamEntries(runtimeRef: string, opts?: { sinceSeq?: number }): Promise<StreamEntry[]>;
   replay(endpointId: string, opts?: { untilSeq?: number }): Promise<ReplayResult>;
   forkAt(endpointId: string, entryId: string): Promise<{ endpointId: string }>;
   counters(names?: string[], since?: string): Promise<Record<string, number>>;
@@ -824,7 +846,7 @@ export interface RegisterAccountInput {
 export interface RegisterEndpointInput {
   accountId: AccountId;
   topology: StreamTopology;
-  piSessionId?: string;
+  runtimeRef?: string;
 }
 
 export interface CreateConversationInput {
@@ -844,7 +866,7 @@ export interface MeshHost {
   markConsumed(deliveryId: string): Promise<void>;
   setPresence(accountId: string, state: PresenceState, opts?: { until?: string; reason?: string }): Promise<void>;
   upsertContact(ownerId: string, peerId: string, opts?: { alias?: string; tags?: unknown }): Promise<void>;
-  lookup(q: { query?: string; capabilities?: string[]; limit?: number }): Promise<Account[]>;
+  lookup(q: { query?: string; capabilities?: string[]; conversationId?: string; limit?: number }): Promise<Account[]>;
 
   // ── 会话与成员 ──
   ensureDirect(a: string, b: string): Promise<Conversation>;
@@ -875,7 +897,6 @@ export interface MeshHost {
   // ── 控制面：推自己的 Agent，不伪造消息 ──
   nudge(endpointId: string, cue: string, opts?: { deliverAs?: "steer" | "followUp"; triggerTurn?: boolean }): Promise<void>;
   injectContext(endpointId: string, text: string): Unsubscribe;
-  beforeClearQueue(endpointId: string): Promise<void>;
 
   // ── 共享空间（P4）──
   shared: {
@@ -953,8 +974,6 @@ export interface MeshOptions {
    */
   seal?: { key: string };
 }
-
-export declare function createMesh(options: MeshOptions): Promise<MeshHost>;
 
 // ─── ⑫ 错误类型 ───────────────────────────────────────────────────────────
 

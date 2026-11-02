@@ -17,7 +17,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import Database from "better-sqlite3";
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AccountId, ConversationId } from "./types.js";
@@ -27,7 +27,7 @@ import { hourBucket, isoNow } from "./util.js";
 
 /** 附录 E：23 个登记计数器（devMode 下写入未登记名直接抛错） */
 export const REGISTERED_COUNTERS = new Set([
-  // A 组：16 个事件计数
+  // A 组：17 个事件计数
   "dedup_hit",
   "wake_throttled",
   "backpressure_downgrade",
@@ -43,7 +43,7 @@ export const REGISTERED_COUNTERS = new Set([
   "park_expired",
   "claim_timeout",
   "queue_cleared_detected",
-  "delivery_handoff_timeout",
+  "routed_retry",
   // B 组：7 个派生指标分子分母
   "messages_total",
   "deliveries_total",
@@ -57,7 +57,7 @@ export const REGISTERED_COUNTERS = new Set([
 /** schema 版本基准（§28.3）：与 migrations/ 的最大序号一致。DB 的 schema_version 大于此即拒绝启动。 */
 const SCHEMA_VERSION = 1;
 /** 库版本（§11.7 / §28.3 的 `library_version` 键），与 package.json version 同步。 */
-export const LIBRARY_VERSION = "0.1.0";
+export const LIBRARY_VERSION = "0.2.0";
 
 /** WAL 阈值默认值（I34）；规范附录 F.2 未定义，W02 拍板 8 MiB。 */
 const DEFAULT_WAL_MAX_BYTES = 8 * 1024 * 1024;
@@ -79,6 +79,12 @@ function migrationsDir(): string {
     dir = parent;
   }
   throw new Error("mesh: could not locate package root for migrations/");
+}
+
+/** 迁移文件名/戳的序号：取前三位数字 `NNN`（`\d{3}_*.sql`），非法回 0。 */
+function migrationSeq(name: string): number {
+  const n = Number.parseInt(name.slice(0, 3), 10);
+  return Number.isInteger(n) ? n : 0;
 }
 
 export interface OpenStoreOptions {
@@ -279,17 +285,13 @@ export class SqliteStore implements Store {
     const files = readdirSync(dir)
       .filter((f) => /^\d{3}_.*\.sql$/.test(f))
       .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    // 新库上 mesh_meta 尚不存在（由 000_init.sql 创建）：先查表是否存在，
-    // 而不是一上来就 SELECT——否则首次迁移必然抛「no such table: mesh_meta」。
-    const hasMeta =
-      (
-        this.db
-          .prepare(
-            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='mesh_meta'",
-          )
-          .get() as { n: number }
-      ).n > 0;
+    // 本构建内置迁移的最大序号（§28.3 / ruling R2）：SCHEMA_VERSION 固定为 1 不再
+    // 推进，改用「未知迁移戳」兜住「库比程序新」——DB 里出现大于此序号的迁移戳即拒绝。
+    const maxKnownSeq = files.reduce((max, f) => Math.max(max, migrationSeq(f)), 0);
+
     // §28.3：旧库不得打开新 DB——schema_version 大于本库预期必须拒绝启动。
+    // 该值为迁移脚本维护的静态序（000_init.sql 置 '1'），读取无需写锁。
+    const hasMeta = this.hasMetaTable();
     if (hasMeta) {
       const sv = this.db
         .prepare("SELECT v FROM mesh_meta WHERE k = 'schema_version'")
@@ -301,43 +303,70 @@ export class SqliteStore implements Store {
         );
       }
     }
-    const applied = new Set(
-      hasMeta
-        ? (
+
+    // A18：一次「扫描」写锁（BEGIN IMMEDIATE）。锁内重读 hasMeta/applied，杜绝双进程
+    // 读到陈旧 applied 后重复执行；同时在锁内判定「未知迁移戳」并做前置备份（tmp+rename
+    // 原子落盘）。备份只针对升级路径（已有库 + 存在待跑脚本）。
+    let pending: string[] = [];
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+    } catch (err) {
+      this.classifyWriteFault(err);
+      throw err;
+    }
+    try {
+      // 锁内重查：另一进程可能刚在拿到写锁前建表并提交。
+      const hasMetaNow = this.hasMetaTable();
+      let applied = new Set<string>();
+      if (hasMetaNow) {
+        applied = new Set(
+          (
             this.db
               .prepare<[], { k: string }>(
                 "SELECT k FROM mesh_meta WHERE k LIKE 'migration:%'",
               )
               .all() as Array<{ k: string }>
-          ).map((r) => r.k.replace("migration:", ""))
-        : [],
-    );
-    const pending = files.filter((f) => !applied.has(f));
-    // C07/I05：升级路径（已有库）跑新脚本前先备份；备份失败拒绝无保护迁移。
-    if (pending.length > 0 && hasMeta && this.dbPath !== ":memory:") {
-      const backupPath = this.dbPath + ".premigrate.bak";
-      writeFileSync(backupPath, this.db.serialize());
-      this.db
-        .prepare(
-          "INSERT INTO mesh_meta (k, v) VALUES ('backup_path', ?) " +
-            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        )
-        .run(backupPath);
+          ).map((r) => r.k.replace("migration:", "")),
+        );
+        // Ruling R2：SCHEMA_VERSION 判定之外，再按「未知迁移戳」拒绝——DB 里若含有
+        // 本构建不认识的更大序号迁移（库比程序新），这里拒绝而非静默继续打开。
+        const unknowns = [...applied].filter((f) => migrationSeq(f) > maxKnownSeq);
+        if (unknowns.length > 0) {
+          throw new Error(
+            `mesh: database was migrated by a newer library (unknown migrations: ${unknowns.join(", ")}); upgrade the library (§28.3)`,
+          );
+        }
+      }
+      pending = files.filter((f) => !applied.has(f));
+      // C07/I05：升级路径（已有库）跑新脚本前先做同步快照备份；备份失败拒绝无保护迁移。
+      if (pending.length > 0 && hasMetaNow && this.dbPath !== ":memory:") {
+        const backupPath = this.dbPath + ".premigrate.bak";
+        const tmpPath = backupPath + ".tmp";
+        writeFileSync(tmpPath, this.db.serialize());
+        renameSync(tmpPath, backupPath);
+        this.db
+          .prepare(
+            "INSERT INTO mesh_meta (k, v) VALUES ('backup_path', ?) " +
+              "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+          )
+          .run(backupPath);
+      }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.classifyWriteFault(err);
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // rollback 失败不掩盖原错误（库可能已损坏，交给 not_writable/integrity 链）。
+      }
+      throw err;
     }
+
+    // 逐脚本续跑（§28.3 C07）：每个脚本各自 IMMEDIATE 事务 + 同事务盖章，崩溃后按
+    // pending 续跑。A18：锁内重读该脚本戳，已被他进程盖过则跳过，防并发重复执行。
     let ranAny = false;
     for (const f of pending) {
-      // 注意：迁移 SQL 来自库自带 migrations/ 目录（受版本控制的静态资产），
-      // 不是运行时输入；DDL 无法参数化。每个脚本各自事务 + 同事务盖章，
-      // 崩溃后按 pending 续跑（逐脚本续跑语义）。
-      const tx = this.db.transaction(() => {
-        this.db.exec(readFileSync(join(dir, f), "utf8"));
-        const migrationKey = "migration:" + f;
-        this.db
-          .prepare("INSERT OR REPLACE INTO mesh_meta (k, v) VALUES (?, ?)")
-          .run(migrationKey, isoNow());
-      });
-      tx();
-      ranAny = true;
+      if (this.applyMigration(f, dir)) ranAny = true;
     }
     // §28.3：schema_applied_at = 最近一次迁移完成时间（仅当本次真的跑了迁移才盖章）。
     // schema_version 本身由迁移脚本维护（000_init.sql 置 '1'）。
@@ -350,34 +379,101 @@ export class SqliteStore implements Store {
     }
   }
 
+  /** mesh_meta 是否已存在（由 000_init.sql 创建）：新库首开前查表而非直接 SELECT，避免「no such table」。 */
+  private hasMetaTable(): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='mesh_meta'",
+      )
+      .get() as { n: number };
+    return row.n > 0;
+  }
+
+  /** 单脚本迁移：BEGIN IMMEDIATE 写锁内重读该脚本戳，已应用则跳过；否则执行 DDL + 同事务盖章。 */
+  private applyMigration(f: string, dir: string): boolean {
+    // 注意：迁移 SQL 来自库自带 migrations/ 目录（受版本控制的静态资产），
+    // 不是运行时输入；DDL 无法参数化。
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+    } catch (err) {
+      this.classifyWriteFault(err);
+      throw err;
+    }
+    let applied = false;
+    try {
+      const migrationKey = "migration:" + f;
+      // A18：写锁内重读该脚本戳，已被他进程盖过则跳过（防并发重复执行）。
+      // 新库上 mesh_meta（000_init.sql 才创建）尚不存在时无法查戳，直接视为未应用。
+      const already = this.hasMetaTable()
+        ? this.db.prepare("SELECT 1 AS x FROM mesh_meta WHERE k = ?").get(migrationKey)
+        : undefined;
+      if (!already) {
+        this.db.exec(readFileSync(join(dir, f), "utf8"));
+        this.db
+          .prepare("INSERT OR REPLACE INTO mesh_meta (k, v) VALUES (?, ?)")
+          .run(migrationKey, isoNow());
+        applied = true;
+      }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.classifyWriteFault(err);
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // rollback 失败不掩盖原错误。
+      }
+      throw err;
+    }
+    return applied;
+  }
+
   /** N04：按 ftsEnabled 对账 FTS 表存在性（contentless，可逆，不改 000_init.sql）。 */
   private reconcileFts(): void {
-    const exists =
-      (
-        this.db
-          .prepare(
-            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='mesh_messages_fts'",
-          )
-          .get() as { n: number }
-      ).n > 0;
-    if (!this.ftsEnabled) {
-      // contentless：删表零行数据损失，text 可由 mesh_messages.payload 重建。
-      if (exists) this.db.exec("DROP TABLE IF EXISTS mesh_messages_fts");
-    } else if (!exists) {
-      this.db.exec(FTS_DDL);
-      // 回填：与 router 的 payload.text ?? JSON.stringify(payload) 同口径（§7.4）。
-      this.db.exec(
-        "INSERT INTO mesh_messages_fts (rowid, text) " +
-          "SELECT m.rowid, COALESCE(json_extract(m.payload, '$.text'), m.payload) " +
-          "FROM mesh_messages m",
-      );
+    // A20：建表 + 回填 + fts_enabled 盖章同一事务（C07 原子性），避免崩溃留下「有表无章/
+    // 有章无回填」的中间态。contentless FTS 的 CREATE + INSERT 在事务内可用（SQLite ≥3.16）。
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+    } catch (err) {
+      this.classifyWriteFault(err);
+      throw err;
     }
-    this.db
-      .prepare(
-        "INSERT INTO mesh_meta (k, v) VALUES ('fts_enabled', ?) " +
-          "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-      )
-      .run(this.ftsEnabled ? "1" : "0");
+    try {
+      const exists =
+        (
+          this.db
+            .prepare(
+              "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='mesh_messages_fts'",
+            )
+            .get() as { n: number }
+        ).n > 0;
+      if (!this.ftsEnabled) {
+        // contentless：删表零行数据损失，text 可由 mesh_messages.payload 重建。
+        if (exists) this.db.exec("DROP TABLE IF EXISTS mesh_messages_fts");
+      } else if (!exists) {
+        this.db.exec(FTS_DDL);
+        // 回填：与 router 的 payload.text ?? JSON.stringify(payload) 同口径（§7.4）。
+        this.db.exec(
+          "INSERT INTO mesh_messages_fts (rowid, text) " +
+            "SELECT m.rowid, COALESCE(json_extract(m.payload, '$.text'), m.payload) " +
+            "FROM mesh_messages m",
+        );
+      }
+      this.db
+        .prepare(
+          "INSERT INTO mesh_meta (k, v) VALUES ('fts_enabled', ?) " +
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        )
+        .run(this.ftsEnabled ? "1" : "0");
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.classifyWriteFault(err);
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // rollback 失败不掩盖原错误。
+      }
+      throw err;
+    }
   }
 
   // ─── 事务 ─────────────────────────────────────────────────────────────
@@ -476,6 +572,9 @@ export class SqliteStore implements Store {
           FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id
           WHERE d.account_id = i.account_id AND m.conversation_id = i.conversation_id
             AND d.state = 'dropped' AND d.drop_reason = 'folded'
+            -- A14：只统计 cursor_seq 之后的折叠行。cursor 已推进越过（追赶固化过）的
+            -- 折叠行不计——否则每次重启都按全部历史 folded 行重算，追赶摘要「复活」。
+            AND m.seq > i.cursor_seq
         ), 0),
         overflow_summary = NULL
     `);
@@ -506,13 +605,14 @@ export class SqliteStore implements Store {
             FROM mesh_deliveries d JOIN mesh_messages m ON m.id = d.message_id
             WHERE d.account_id = ? AND m.conversation_id = ?
               AND d.state = 'dropped' AND d.drop_reason = 'folded'
+              AND m.seq > (SELECT cursor_seq FROM mesh_inboxes WHERE account_id = ? AND conversation_id = ?)
           ), 0)
         WHERE account_id = ? AND conversation_id = ?`,
       )
       .run(
         accountId, conversationId,
         accountId, conversationId,
-        accountId, conversationId,
+        accountId, conversationId, accountId, conversationId,
         accountId, conversationId,
       );
   }

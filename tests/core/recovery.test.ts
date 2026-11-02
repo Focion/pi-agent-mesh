@@ -55,7 +55,7 @@ function makeHarness(opts: { limits?: Partial<Limits> } = {}): Harness {
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
   };
@@ -108,7 +108,7 @@ async function addHotEndpoint(h: Harness, id: string): Promise<Endpoint> {
   const ep = await h.registry.registerEndpoint({
     accountId: id,
     topology: { kind: "unified" },
-    piSessionId: "pi-" + id,
+    runtimeRef: "pi-" + id,
   });
   h.registry.updateEndpointState(ep.id, "hot");
   return ep;
@@ -157,6 +157,8 @@ describe("D03 authoritative recovery (§8.4)", () => {
     expect(row.entry_id).toBeTruthy();
     const deliveredBefore = h.port.delivered.length;
 
+    // 崩溃残骸：delivered_at 早于本进程启动（A04），sweep 对账才纳入
+    h.db.prepare("UPDATE mesh_deliveries SET delivered_at = '1970-01-01T00:00:00.000Z' WHERE message_id = ?").run(r.messageId);
     await h.mailbox.reconcileDelivered();
     const after = deliveryRow(h, r.messageId);
     expect(after.state).toBe("consumed");
@@ -172,7 +174,7 @@ describe("D03 authoritative recovery (§8.4)", () => {
     h.store.close();
   });
 
-  it("entry vanished → requeue and re-deliver exactly once, then consumed(partial) on re-run", async () => {
+  it("A08: clearQueue 抹掉已投递条目 → 只重投一次、不重复；反复对账留 turn_end 兜底 (A04)", async () => {
     const h = makeHarness();
     await addAcc(h, "A");
     await addAcc(h, "W");
@@ -188,15 +190,19 @@ describe("D03 authoritative recovery (§8.4)", () => {
     h.port.vanishedEntries.add(entryId);
     const before = h.port.delivered.length;
 
+    h.db.prepare("UPDATE mesh_deliveries SET delivered_at = '1970-01-01T00:00:00.000Z' WHERE message_id = ?").run(r.messageId);
     await h.mailbox.reconcileDelivered();
     // 回 queued 后重投一次：port 多出恰好一条 entry
     expect(h.port.delivered.length).toBe(before + 1);
+    // A08：clearQueue 抹条目被记为「条目旁落」，只重投一次、不重复进入上下文
+    expect(counter(h, "queue_cleared_detected")).toBe(1);
 
-    // 反复恢复：新 entry 已在 session → consumed(partial)，不再重投（无重复进上下文）
+    // 反复恢复：重投后的 delivered 行 delivered_at 晚于本进程启动，A04 交给 turn_end
+    // 不再被 sweep 对账二次重投——换新 submission 后 attempt 停留在 1，无重复进上下文。
     await h.mailbox.reconcileDelivered();
     const after = deliveryRow(h, r.messageId);
-    expect(after.state).toBe("consumed");
-    expect(after.partial).toBe(1);
+    expect(after.state).toBe("delivered");
+    expect(after.attempt).toBe(1);
     expect(h.port.delivered.length).toBe(before + 1);
     h.store.close();
   });
@@ -215,6 +221,7 @@ describe("D03 authoritative recovery (§8.4)", () => {
     expect(entryId).toBeTruthy();
 
     // 崩溃后端点冷、warm 又拿不到 session：无法判定 → park + NO_SESSION 告警（§8.4）
+    h.db.prepare("UPDATE mesh_deliveries SET delivered_at = '1970-01-01T00:00:00.000Z' WHERE message_id = ?").run(r.messageId);
     h.port.setEndpointState(ep.id, "cold");
     h.port.warmError = Object.assign(new Error("no session"), { code: "NO_SESSION" });
 
@@ -224,6 +231,39 @@ describe("D03 authoritative recovery (§8.4)", () => {
     expect(after.parked_reason).toBe("NO_SESSION");
     expect(after.entry_id).toBe(entryId); // entry_id 保留，下次 warm 成功再对账
     expect(counter(h, "invariant_violated")).toBe(1);
+    h.store.close();
+  });
+
+  it("warm 失败恢复后不盲重投：parked(submission) → retryEndpoint 精确读 → consumed(partial) (A03)", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "W");
+    const ep = await addHotEndpoint(h, "W");
+    const conv = await h.registry.ensureDirect("A", "W");
+    const r = await h.router.route(msg("A", conv.id));
+    await flush();
+    const row = deliveryRow(h, r.messageId);
+    expect(row.state).toBe("delivered");
+    expect(row.submission_id).toBeTruthy(); // durable 投递后必带权威 submission
+    const deliveredBefore = h.port.delivered.length;
+
+    // 崩溃后 warm 失败：park（保留 submission_id）
+    h.db.prepare("UPDATE mesh_deliveries SET delivered_at = '1970-01-01T00:00:00.000Z' WHERE message_id = ?").run(r.messageId);
+    h.port.setEndpointState(ep.id, "cold");
+    h.port.warmError = Object.assign(new Error("no session"), { code: "NO_SESSION" });
+    await h.mailbox.reconcileDelivered();
+    expect(deliveryRow(h, r.messageId).state).toBe("parked");
+
+    // 端点恢复：retryEndpoint 的 requeueParked 对带 submission 的行早退、不盲重投；
+    // 随后 reconcileDeliveredForEndpoint 按 submission id 精确读（done 带 entry）→ consumed(partial)
+    h.port.warmError = undefined;
+    h.port.setEndpointState(ep.id, "hot");
+    await h.mailbox.retryEndpoint(ep.id);
+    await flush();
+    const after = deliveryRow(h, r.messageId);
+    expect(after.state).toBe("consumed");
+    expect(after.partial).toBe(1);
+    expect(h.port.delivered.length).toBe(deliveredBefore); // 无重复进上下文（I5）
     h.store.close();
   });
 

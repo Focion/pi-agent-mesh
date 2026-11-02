@@ -39,6 +39,11 @@ import {
 
 const TOOL_RESULT_MAX_BYTES = 8192; // toolResultMaxBytes（附录 F）
 const SEND_TEXT_MAX_BYTES = 8192;
+// A34：mesh_send 除 text 外其余字段也设大小上限（防无界注水/扇出膨胀）。
+const SEND_DATA_MAX_BYTES = 65536; // payload.data / ext 序列化上限（对齐 sharedObjectMaxBytes）
+const SEND_ATTACHMENTS_MAX = 32; // 单条消息附件引用数上限
+const SEND_TARGETS_MAX = 256; // to / mentions 数组长度上限
+const SEND_REF_MAX_BYTES = 256; // attachment.spaceId / key 单串字节上限
 
 export interface ToolErrorBody {
   error: { code: string; message: string; hint?: string };
@@ -413,13 +418,23 @@ function buildMeshSend(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinit
         textTruncated = true;
       }
       const data = params.data;
+      if (
+        data !== undefined &&
+        Buffer.byteLength(JSON.stringify(data), "utf8") > SEND_DATA_MAX_BYTES
+      ) {
+        return badArg(`data exceeds ${SEND_DATA_MAX_BYTES} bytes`);
+      }
       const to = asStringArray(params.to);
       if (params.to !== undefined && to === undefined)
         return badArg("to must be an array of account ids");
+      if (to !== undefined && to.length > SEND_TARGETS_MAX)
+        return badArg(`to exceeds ${SEND_TARGETS_MAX} accounts`);
       const mentions = asStringArray(params.mentions);
       if (params.mentions !== undefined && mentions === undefined) {
         return badArg("mentions must be an array of account ids");
       }
+      if (mentions !== undefined && mentions.length > SEND_TARGETS_MAX)
+        return badArg(`mentions exceeds ${SEND_TARGETS_MAX} accounts`);
       const replyTo = asString(params.replyTo);
       if (params.replyTo !== undefined && replyTo === undefined)
         return badArg("replyTo must be a non-empty string");
@@ -451,6 +466,12 @@ function buildMeshSend(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinit
           if (spaceId === undefined || key === undefined) {
             return badArg("attachment requires spaceId and key");
           }
+          if (
+            Buffer.byteLength(spaceId, "utf8") > SEND_REF_MAX_BYTES ||
+            Buffer.byteLength(key, "utf8") > SEND_REF_MAX_BYTES
+          ) {
+            return badArg("attachment spaceId/key too long");
+          }
           const version =
             o.version === undefined ? undefined : asInt(o.version);
           if (o.version !== undefined && version === undefined)
@@ -461,6 +482,8 @@ function buildMeshSend(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinit
               : { spaceId, key, version },
           );
         }
+        if (attachments.length > SEND_ATTACHMENTS_MAX)
+          return badArg(`attachments exceeds ${SEND_ATTACHMENTS_MAX} refs`);
       }
       if (
         text === undefined &&
@@ -486,7 +509,15 @@ function buildMeshSend(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefinit
       if (attachments.length > 0) {
         input.payload = { ...(input.payload ?? {}), attachments };
       }
-      if (params.ext !== undefined) input.ext = params.ext;
+      if (params.ext !== undefined) {
+        if (
+          Buffer.byteLength(JSON.stringify(params.ext), "utf8") >
+          SEND_DATA_MAX_BYTES
+        ) {
+          return badArg(`ext exceeds ${SEND_DATA_MAX_BYTES} bytes`);
+        }
+        input.ext = params.ext;
+      }
       try {
         const r = await ctx.send({ ...input, clientToken: toolCallId }); // §10.2：clientToken 恒取 tool_call id
         return okJson(
@@ -582,18 +613,17 @@ function buildMeshLookup(ctx: ToolContext, opts: BuildToolSetOptions): ToolDefin
       }
       const conversationId = asString(params.conversationId);
       try {
-        let accounts = await ctx.lookup({
+        const accounts = await ctx.lookup({
           limit: limitInfo.limit,
           ...(query === undefined ? {} : { query }),
           ...(capabilities === undefined ? {} : { capabilities }),
+          ...(conversationId === undefined ? {} : { conversationId }),
         });
-        if (conversationId !== undefined) {
-          const members = await ctx.members(conversationId);
-          const ids = new Set(members.map((m) => m.accountId));
-          accounts = accounts.filter((a) => ids.has(a.id));
-        }
+        // A34：不把账号 ext 泄露给工具结果（host 私有载荷）；成员/query/capabilities 过滤器与
+        // LIMIT 已在 registry.lookupAccounts 的 SQL 层就位（先过滤后 LIMIT）。
+        const publicAccounts = accounts.map(({ ext: _omit, ...rest }) => rest);
         return okJson({
-          accounts,
+          accounts: publicAccounts,
           truncated:
             limitInfo.truncated || accounts.length > limitInfo.limit
               ? true

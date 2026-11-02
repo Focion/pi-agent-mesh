@@ -9,7 +9,9 @@ export default defineConfig({
   target: "node20",
   outDir: "dist",
   outExtension: ({ format }) => ({ js: format === "esm" ? ".js" : ".cjs" }),
-  // mesh-core must stay tree-shakeable without dragging mesh-pi (§29.1)
-  splitting: false,
+  // R3（A25）：开 splitting 让 core 与 root 共享同一份错误类模块，统一跨入口 instanceof
+  // 身份；否则每个入口各自打包一份 MeshRejectError / InvariantViolationError，跨入口判定失败。
+  // §29.1 的 tree-shakeable 由 treeshake:true 保证，不因 splitting 破坏。
+  splitting: true,
   treeshake: true
 });

@@ -73,7 +73,6 @@ interface DeliveryRow {
   queued_at: string | null;
   delivered_at: string | null;
   consumed_at: string | null;
-  handoff_at: string | null;
   state_changed_at: string;
   note: string | null;
   redeliver_reason: string | null;
@@ -276,7 +275,6 @@ export class MeshObserver implements Observer {
         attempts: r.attempts,
         woke: r.woke === 1,
         path: (r.path as DeliveryTrace["path"]) ?? null,
-        handoffAt: r.handoff_at,
         parkedAt: r.parked_at,
         stateChangedAt: r.state_changed_at,
         createdAt,
@@ -578,19 +576,19 @@ export class MeshObserver implements Observer {
   }
 
   async streamEntries(
-    piSessionId: string,
+    runtimeRef: string,
     opts?: { sinceSeq?: number },
   ): Promise<StreamEntry[]> {
     const since = opts?.sinceSeq ?? 0;
     const rows = this.rows(
-      "SELECT entry_id, pi_session_id, parent_id, seq_in_stream, entry_type, raw_json, " +
-        "mesh_message_id, created_at FROM mesh_stream_entries WHERE pi_session_id = ? AND seq_in_stream >= ? " +
+      "SELECT entry_id, runtime_ref, parent_id, seq_in_stream, entry_type, raw_json, " +
+        "mesh_message_id, created_at FROM mesh_stream_entries WHERE runtime_ref = ? AND seq_in_stream >= ? " +
         "ORDER BY seq_in_stream",
-      [piSessionId, since],
+      [runtimeRef, since],
     );
     return rows.map((raw) => ({
       entryId: raw["entry_id"] as string,
-      piSessionId: raw["pi_session_id"] as string,
+      runtimeRef: raw["runtime_ref"] as string,
       parentId: (raw["parent_id"] as string | null) ?? null,
       seqInStream: raw["seq_in_stream"] as number,
       entryType: raw["entry_type"] as string,
@@ -609,8 +607,8 @@ export class MeshObserver implements Observer {
     const endpoint = this.registry.getEndpoint(endpointId);
     const accountId = endpoint?.accountId ?? "";
     let entries: StreamEntry[] = [];
-    if (endpoint?.piSessionId) {
-      entries = await this.streamEntries(endpoint.piSessionId);
+    if (endpoint?.runtimeRef) {
+      entries = await this.streamEntries(endpoint.runtimeRef);
       const untilSeq = opts?.untilSeq;
       if (untilSeq !== undefined) {
         entries = entries.filter((e) => e.seqInStream <= untilSeq);

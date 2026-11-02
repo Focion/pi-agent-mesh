@@ -26,6 +26,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -144,6 +145,11 @@ ok(`tarball: ${tarball}（${(statSync(tarball).size / 1024).toFixed(1)} KiB · $
 
 step("校验 tarball 名单");
 const packed = new Set(manifest.files?.map((f) => f.path) ?? []);
+// A44：必含清单按目录比对——全部 migrations/*.sql 都必须进包，不只 000_init.sql。
+const migrationFiles = readdirSync(join(ROOT, "migrations"))
+  .filter((f) => f.endsWith(".sql"))
+  .sort()
+  .map((f) => `migrations/${f}`);
 const REQUIRED = [
   "package.json",
   "dist/index.js",
@@ -154,16 +160,16 @@ const REQUIRED = [
   "dist/core/index.cjs",
   "dist/core/index.d.ts",
   "dist/core/index.d.cts",
-  "migrations/000_init.sql",
+  ...migrationFiles,
 ];
 for (const p of REQUIRED) {
   if (!packed.has(p)) fail(`tarball 缺少关键文件：${p}`);
 }
-const FORBIDDEN = ["src/", "demo/", "tests/", "docs/", "node_modules/"];
+const FORBIDDEN = ["src/", "examples/", "tests/", "docs/", "node_modules/"];
 for (const p of FORBIDDEN) {
   if ([...packed].some((f) => f.startsWith(p))) fail(`tarball 不应包含源码/目录：${p}`);
 }
-ok(`含 ${REQUIRED.length} 个关键文件，无 src/demo/tests/docs/node_modules 泄漏`);
+ok(`含 ${REQUIRED.length} 个关键文件，无 src/examples/tests/docs/node_modules 泄漏`);
 
 // ── 6. 离线消费者冒烟 ─────────────────────────────────────────────────────
 
@@ -197,9 +203,13 @@ f(root, "createMesh", "root"); f(root, "createPiSessionFactory", "root");
 f(root, "PiStreamPort", "root"); f(root, "EndpointLock", "root");
 f(root, "LockHeldError", "root"); f(root, "PiPortError", "root");
 f(root, "MeshUnsupportedError", "root"); f(root, "InvariantViolationError", "root");
+// R3（A25）：MeshRejectError 是公开错误契约，根入口必须值导出（不再是 type-only）
+f(root, "MeshRejectError", "root");
 if (typeof root.DEFAULT_LIMITS !== "object") throw new Error("root.DEFAULT_LIMITS 缺失");
-if ("MeshRejectError" in root) throw new Error("root 不应暴露 MeshRejectError(type-only)，出现即边界泄漏");
 f(core, "MeshRejectError", "core"); f(core, "MeshUnsupportedError", "core"); f(core, "InvariantViolationError", "core");
+// R3（A25）：跨入口 instanceof / 类身份统一（splitting 让两入口共享同一错误类模块）
+if (!(new root.MeshRejectError("NOT_A_MEMBER") instanceof core.MeshRejectError)) throw new Error("MeshRejectError 跨入口 instanceof 判不中——splitting 未生效");
+if (root.InvariantViolationError !== core.InvariantViolationError) throw new Error("InvariantViolationError 跨入口不是同一类");
 f(core, "InProcessTransport", "core"); f(core, "SqliteStore", "core"); f(core, "MeshRouter", "core"); f(core, "createDefaultPolicies", "core");
 if (typeof core.DEFAULT_LIMITS !== "object") throw new Error("core.DEFAULT_LIMITS 缺失");
 console.log("ESM ok: root + core 均可用，pi 未静态加载");
@@ -212,6 +222,7 @@ console.log("ESM ok: root + core 均可用，pi 未静态加载");
 const root = require("@pi/agent-mesh");
 const core = require("@pi/agent-mesh/core");
 if (typeof root.createMesh !== "function") throw new Error("cjs root.createMesh 缺失");
+if (typeof root.MeshRejectError !== "function") throw new Error("cjs root.MeshRejectError 缺失");
 if (typeof core.MeshRejectError !== "function") throw new Error("cjs core.MeshRejectError 缺失");
 console.log("CJS ok: require 双入口均可用");
 `,

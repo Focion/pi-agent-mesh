@@ -72,7 +72,7 @@ function makeHarness(opts: { limits?: Partial<Limits> } = {}): Harness {
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
   };
@@ -139,7 +139,7 @@ async function addHotEndpoint(h: Harness, id: string): Promise<Endpoint> {
   const ep = await h.registry.registerEndpoint({
     accountId: id,
     topology: { kind: "unified" },
-    piSessionId: "pi-" + id,
+    runtimeRef: "pi-" + id,
   });
   h.registry.updateEndpointState(ep.id, "hot");
   return ep;

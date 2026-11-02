@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // mesh 面板 · 观测（F）。counters 网格（含本次新增 blind_write / claim_timeout /
-// queue_cleared_detected / delivery_handoff_timeout）、§24.2 验收比值、15 个 MeshEvent
+// queue_cleared_detected）、§24.2 验收比值、15 个 MeshEvent
 // 汇聚的活动流，以及只读观测入口 checkInvariants / search / replay / streamEntries。
 // （observer.forkAt 不在 v0.1.0 范围，未接入。）
 // ═══════════════════════════════════════════════════════════════════════════
@@ -11,10 +11,10 @@ const COUNTERS = [
   "messages_total", "deliveries_total", "dedup_hit", "wake_throttled", "backpressure_downgrade",
   "seq_gap", "blind_write", "request_timeout", "invariant_violated", "fanout_warn", "inbox_overflowed",
   "fold_events", "policy_degraded", "parked_total", "park_expired", "claim_timeout",
-  "queue_cleared_detected", "delivery_handoff_timeout", "wake_per_message_idle", "wake_per_message_busy",
+  "queue_cleared_detected", "wake_per_message_idle", "wake_per_message_busy",
   "verbatim_copies", "silent_grade", "cold_hit",
 ];
-const NEW_COUNTERS = new Set(["blind_write", "claim_timeout", "queue_cleared_detected", "delivery_handoff_timeout"]);
+const NEW_COUNTERS = new Set(["blind_write", "claim_timeout", "queue_cleared_detected"]);
 
 function renderCounters() {
   const box = $("#obsCounters");
@@ -126,9 +126,9 @@ function wireOps() {
   });
 
   $("#btnObsStream")?.addEventListener("click", async () => {
-    const piSessionId = $("#obsStreamSid").value.trim();
-    if (!piSessionId) return toast("填写 piSessionId", "err");
-    const list = await safeRpc("streamEntries", { piSessionId });
+    const runtimeRef = $("#obsStreamSid").value.trim();
+    if (!runtimeRef) return toast("填写 runtimeRef", "err");
+    const list = await safeRpc("streamEntries", { runtimeRef });
     renderJson(`streamEntries → ${Array.isArray(list) ? list.length : 0} 条`, (list || []).map((s) => ({ seq: s.seqInStream, type: s.entryType, bytes: s.rawJson?.length ?? 0 })));
   });
 

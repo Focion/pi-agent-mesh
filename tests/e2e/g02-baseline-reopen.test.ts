@@ -1,9 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// G02（本地验收·存储与迁移）：合成 0.1.0 基线库的重开幂等、数据完整与迁移续跑。
+// G02（本地验收·存储与迁移）：合成 0.2.0 基线库的重开幂等、数据完整与迁移续跑。
 //
-// 基线库由 tests/helpers/baseline-db.ts 的 buildBaselineDb() 确定性重建（执行 5 个迁移
-// 脚本 + 打 meta 印章 + 固定 id 种子数据，不提交二进制）。三条测试分别证明：
-//   ① 重开幂等——createMesh 打开已全链迁移的库时零新增迁移、零 .premigrate.bak、schema 仍 v1；
+// 基线库由 tests/helpers/baseline-db.ts 的 buildBaselineDb() 确定性重建（执行 000_init
+// 迁移脚本 + 打 meta 印章 + 固定 id 种子数据，不提交二进制）。三条测试分别证明：
+//   ① 重开幂等——createMesh 打开已迁移的库时零新增迁移、零 .premigrate.bak、schema 仍 v1；
 //   ② 数据完整——16 条不变量全绿，且 shared 版本链 / claim 归属 / inbox 游标逐项抽查；
 //   ③ 迁移续跑——基线库上再注入一个迁移脚本即触发升级备份（.premigrate.bak + backup_path），
 //      既有数据不受损。
@@ -22,7 +22,7 @@ import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "g02-baseline" }),
+  create: async () => ({ session: {}, runtimeRef: "g02-baseline" }),
   open: async () => ({ session: {} }),
 };
 
@@ -59,14 +59,12 @@ describe("G02: 基线库迁移/重开（§28.3 / C07 / I05）", () => {
         | undefined;
       expect(sv?.v).toBe("1");
 
-      // 恰好 5 个迁移键（000..004），重开未新增
+      // 恰好 1 个迁移键（000_init），重开未新增
       const migrationKeys = db
         .prepare("SELECT k FROM mesh_meta WHERE k LIKE 'migration:%'")
         .all() as Array<{ k: string }>;
       expect(migrationKeys.map((r) => r.k).sort()).toEqual(
-        ["000_init.sql", "001_presence_source.sql", "002_pool_meta.sql", "003_claim_owner.sql", "004_delivery_decision.sql"].map(
-          (f) => "migration:" + f,
-        ),
+        ["000_init.sql"].map((f) => "migration:" + f),
       );
 
       // 五类数据（accounts/endpoints/conversations/messages/deliveries）行数与种子一致

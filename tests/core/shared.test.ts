@@ -301,6 +301,27 @@ describe("SharedSpace: ACL", () => {
     h.store.close();
   });
 
+  it("tombstoned key read by an outsider → SPACE_FORBIDDEN (not null, A34)", async () => {
+    const h = makeShared();
+    await addAccount(h.registry, "A");
+    await addAccount(h.registry, "B");
+    await addAccount(h.registry, "C"); // 非成员
+    const space = await makeConvSpace(h.registry);
+    await h.shared.put(space, "k", "x", { as: "A" });
+    await h.shared.del(space, "k", { as: "A" }); // 墓碑
+
+    // A34：ACL 判定先于 null 返回。若先返回 null 再判 ACL，无权方可用
+    // 「null vs SPACE_FORBIDDEN」区分键是否存在（泄露键名）。
+    await expect(h.shared.get(space, "k", "C")).rejects.toMatchObject({
+      code: "SPACE_FORBIDDEN",
+    });
+    // 读旧版本同样先判 ACL
+    await expect(h.shared.get(space, "k", "C", 1)).rejects.toMatchObject({
+      code: "SPACE_FORBIDDEN",
+    });
+    h.store.close();
+  });
+
   it("public ACL allows anyone to read and write", async () => {
     const h = makeShared();
     await addAccount(h.registry, "A");

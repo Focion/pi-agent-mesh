@@ -2,6 +2,8 @@
 -- 17 张表 + 1 张 fts5 虚拟表，单一 SQLite 文件。
 -- 约定：表名 mesh_ 前缀；索引 ix_/ux_ 前缀；时间列 TEXT ISO-8601 UTC；
 --       ext 一律 TEXT 存 JSON，库不建索引不解释（M1/I18）。
+-- v0.2.0 合并基线：runtime_ref（原 pi_session_id）、submission 记账列、
+-- pool 元列、presence 显式列、claim 归属列、redeliver_reason 列一应入基线。
 
 -- 连接级设置（journal_mode 持久化；foreign_keys / busy_timeout 每连接由应用设置）
 PRAGMA journal_mode = WAL;
@@ -25,6 +27,7 @@ CREATE TABLE IF NOT EXISTS mesh_accounts (
   presence       TEXT NOT NULL DEFAULT 'offline',
   presence_until TEXT,
   presence_reason TEXT,
+  presence_explicit INTEGER NOT NULL DEFAULT 0,
   created_at     TEXT NOT NULL,
   archived_at    TEXT,
   ext            TEXT
@@ -40,7 +43,9 @@ CREATE TABLE IF NOT EXISTS mesh_endpoints (
   scope         TEXT,
   scope_key     TEXT,
   pool_slot     INTEGER,
-  pi_session_id TEXT,
+  pool_size     INTEGER,
+  pool_affinity TEXT,
+  runtime_ref   TEXT,
   lease_mode    TEXT NOT NULL DEFAULT 'shared' CHECK (lease_mode IN ('shared','exclusive')),
   lease_until   TEXT,
   lock_path     TEXT,
@@ -55,17 +60,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_endpoint_pool ON mesh_endpoints(account_id,
   WHERE topology = 'pooled';
 
 CREATE TABLE IF NOT EXISTS mesh_streams (
-  pi_session_id   TEXT PRIMARY KEY,
-  endpoint_id     TEXT NOT NULL REFERENCES mesh_endpoints(id),
-  account_id      TEXT NOT NULL REFERENCES mesh_accounts(id),
-  purpose         TEXT,
-  cwd             TEXT,
-  created_at      TEXT NOT NULL,
-  last_entry_at   TEXT,
-  entry_count     INTEGER NOT NULL DEFAULT 0,
-  leaf_entry_id   TEXT,
+  runtime_ref    TEXT PRIMARY KEY,
+  endpoint_id    TEXT NOT NULL REFERENCES mesh_endpoints(id),
+  account_id     TEXT NOT NULL REFERENCES mesh_accounts(id),
+  purpose        TEXT,
+  cwd            TEXT,
+  created_at     TEXT NOT NULL,
+  last_entry_at  TEXT,
+  entry_count    INTEGER NOT NULL DEFAULT 0,
+  leaf_entry_id  TEXT,
   model_config_hash TEXT,
-  ext             TEXT
+  ext            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS mesh_contacts (
@@ -160,28 +165,33 @@ CREATE VIRTUAL TABLE IF NOT EXISTS mesh_messages_fts USING fts5(
 
 -- ═══ 5. 投递与收件箱 ═══
 CREATE TABLE IF NOT EXISTS mesh_deliveries (
-  id            TEXT PRIMARY KEY,
-  message_id    TEXT NOT NULL REFERENCES mesh_messages(id),
-  account_id    TEXT NOT NULL REFERENCES mesh_accounts(id),
-  endpoint_id   TEXT REFERENCES mesh_endpoints(id),
-  grade         TEXT CHECK (grade IN ('steer','followUp','silent')),
-  path          TEXT CHECK (path IN ('P1','P2','P3')),
-  woke          INTEGER NOT NULL DEFAULT 0,
-  state         TEXT NOT NULL CHECK (state IN
-                  ('routed','queued','parked','delivered','consumed','dropped','claimed','acked')),
-  partial       INTEGER NOT NULL DEFAULT 0,
-  parked_reason TEXT,
-  drop_reason   TEXT,
-  entry_id      TEXT,
-  attempts      INTEGER NOT NULL DEFAULT 0,
-  claim_until   TEXT,
-  parked_at     TEXT,
-  queued_at     TEXT,
-  delivered_at  TEXT,
-  consumed_at   TEXT,
-  handoff_at    TEXT,
+  id              TEXT PRIMARY KEY,
+  message_id      TEXT NOT NULL REFERENCES mesh_messages(id),
+  account_id      TEXT NOT NULL REFERENCES mesh_accounts(id),
+  endpoint_id     TEXT REFERENCES mesh_endpoints(id),
+  grade           TEXT CHECK (grade IN ('steer','followUp','silent')),
+  path            TEXT CHECK (path IN ('P1','P2','P3')),
+  woke            INTEGER NOT NULL DEFAULT 0,
+  state           TEXT NOT NULL CHECK (state IN
+                    ('routed','queued','parked','delivered','consumed','dropped','claimed','acked')),
+  partial         INTEGER NOT NULL DEFAULT 0,
+  parked_reason   TEXT,
+  drop_reason     TEXT,
+  entry_id        TEXT,
+  submission_id   TEXT,
+  attempt         INTEGER NOT NULL DEFAULT 0,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  claim_until     TEXT,
+  claimed_by      TEXT,
+  claimed_at      TEXT,
+  claim_error     TEXT,
+  parked_at       TEXT,
+  queued_at       TEXT,
+  delivered_at    TEXT,
+  consumed_at     TEXT,
+  redeliver_reason TEXT,
   state_changed_at TEXT NOT NULL,
-  note          TEXT,
+  note            TEXT,
   UNIQUE (message_id, endpoint_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_delivery_noep ON mesh_deliveries(message_id, account_id)
@@ -189,7 +199,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_delivery_noep ON mesh_deliveries(message_id
 CREATE INDEX IF NOT EXISTS ix_delivery_inflight ON mesh_deliveries(endpoint_id, state)
   WHERE state IN ('queued','delivered');
 CREATE INDEX IF NOT EXISTS ix_delivery_parked   ON mesh_deliveries(state, parked_at) WHERE state = 'parked';
-CREATE INDEX IF NOT EXISTS ix_delivery_claim    ON mesh_deliveries(state, claim_until) WHERE state = 'claimed';
+CREATE INDEX IF NOT EXISTS ix_delivery_claim    ON mesh_deliveries(state, claim_until)
+  WHERE state IN ('delivered','claimed');
 CREATE INDEX IF NOT EXISTS ix_delivery_message  ON mesh_deliveries(message_id);
 
 CREATE TABLE IF NOT EXISTS mesh_inboxes (
@@ -227,17 +238,18 @@ CREATE INDEX IF NOT EXISTS ix_pending_cycle    ON mesh_pending_acks(from_account
 
 -- ═══ 6. 会话镜像 ═══
 CREATE TABLE IF NOT EXISTS mesh_stream_entries (
-  entry_id        TEXT PRIMARY KEY,
-  pi_session_id   TEXT NOT NULL REFERENCES mesh_streams(pi_session_id),
+  entry_id        TEXT NOT NULL,
+  runtime_ref     TEXT NOT NULL REFERENCES mesh_streams(runtime_ref),
   parent_id       TEXT,
   seq_in_stream   INTEGER NOT NULL,
   entry_type      TEXT NOT NULL,
   raw_json        TEXT NOT NULL,
   mesh_message_id TEXT REFERENCES mesh_messages(id),
   created_at      TEXT NOT NULL,
-  model_config_hash TEXT
+  model_config_hash TEXT,
+  PRIMARY KEY (runtime_ref, entry_id)
 );
-CREATE INDEX IF NOT EXISTS ix_entry_stream  ON mesh_stream_entries(pi_session_id, seq_in_stream);
+CREATE INDEX IF NOT EXISTS ix_entry_stream  ON mesh_stream_entries(runtime_ref, seq_in_stream);
 CREATE INDEX IF NOT EXISTS ix_entry_message ON mesh_stream_entries(mesh_message_id)
   WHERE mesh_message_id IS NOT NULL;
 

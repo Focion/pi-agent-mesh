@@ -8,9 +8,9 @@
 // 路由：
 //   POST /api/<command>  → rpc.dispatch（JSON 体 {…} → {ok, result?|error}）
 //   GET  /api/events     → SSE（text/event-stream）
-//   GET  /…             → demo/public/ 静态托管
+//   GET  /…             → examples/public/ 静态托管
 //
-// 运行：node demo/src/server.ts（Node ≥ 22.19 原生 TS type-stripping）。
+// 运行：node examples/src/server.ts（Node ≥ 22.19 原生 TS type-stripping）。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -129,6 +129,25 @@ function readBody(req: IncomingMessage, limitBytes = 1024 * 1024): Promise<Recor
 
 // ── HTTP 服务器 ──────────────────────────────────────────────────────────────
 
+// A35：本地面板只服务 localhost。Origin 存在时必须同站，Host 必须是回环地址（防
+// DNS rebinding / CSRF / 跨站请求）。无 Origin（curl、非浏览器客户端）放行。
+function isLocalOrigin(req: IncomingMessage): boolean {
+  const origin = String(req.headers["origin"] ?? "");
+  if (origin !== "") {
+    try {
+      const u = new URL(origin);
+      if (u.protocol !== "http:") return false;
+      if (!["localhost", "127.0.0.1", "::1"].includes(u.hostname)) return false;
+    } catch {
+      return false;
+    }
+  }
+  const host = String(req.headers["host"] ?? "");
+  if (host === "") return true;
+  const hostname = host.replace(/:\d+$/, "").replace(/^\[|\]$/g, "");
+  return ["localhost", "127.0.0.1", "::1"].includes(hostname);
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
@@ -167,6 +186,14 @@ const server = createServer(async (req, res) => {
 
     if (path.startsWith("/api/")) {
       if (req.method !== "POST") return json(res, 405, { ok: false, error: { name: "Method", message: "POST only" } });
+      // A35：本地面板只服务本站 —— 校验 Host/Origin 防 DNS rebinding / CSRF，并要求 JSON Content-Type。
+      if (!isLocalOrigin(req)) {
+        return json(res, 403, { ok: false, error: { name: "Forbidden", message: "untrusted Origin/Host" } });
+      }
+      const ct = String(req.headers["content-type"] ?? "");
+      if (!ct.toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { ok: false, error: { name: "UnsupportedMediaType", message: "application/json only" } });
+      }
       const cmd = path.slice("/api/".length);
       const args = await readBody(req);
       const result = await dispatch(controller, cmd, args);
@@ -190,7 +217,7 @@ server.on("error", (err: NodeJS.ErrnoException) => {
   throw err;
 });
 
-server.listen(config.port, () => {
+server.listen(config.port, "127.0.0.1", () => { // A35：默认绑定回环地址，不监听所有网卡
   process.stdout.write(
     `[mesh-demo] 面板已就绪 → http://localhost:${config.port}\n` +
       `            model  = ${resolvedLlm.providerId}/${resolvedLlm.modelId} · thinking=${resolvedLlm.thinkingLevel ?? "default"}\n` +
@@ -205,8 +232,9 @@ server.listen(config.port, () => {
 const tickTimer = setInterval(() => {
   controller.tick()
     .then((snap) => sse.publish("tick", snap))
-    .catch(() => {
-      // tick 失败静默（下一次再试）
+    .catch((err) => {
+      // A45：tick 失败不再静默吞掉——面板应能看到观测链路在坏，否则验收断言会假绿。
+      process.stderr.write(`[mesh-demo] tick 失败：${String(err)}\n`);
     });
 }, 1000);
 tickTimer.unref?.();

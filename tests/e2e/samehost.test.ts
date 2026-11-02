@@ -20,11 +20,19 @@ import { EndpointLock } from "../../src/index.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+// A45：轮询直到条件满足，替代固定 sleep（固定等待既慢又脆）。
+const waitFor = async (cond: () => boolean, ms = 5000): Promise<void> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise<void>((r) => setTimeout(r, 25));
+  }
+  throw new Error("waitFor: condition not met within " + ms + "ms");
+};
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "e2e-session" }),
+  create: async () => ({ session: {}, runtimeRef: "e2e-session" }),
   open: async () => ({ session: {} }),
 };
 
@@ -50,7 +58,7 @@ async function makeHost(
     streamPort: port,
     transport: "sameHost",
     transportOptions,
-    limits: { handoffTimeoutMs: 1000 },
+    limits: {},
     devMode: true,
   });
   await host.registerAccount({
@@ -123,7 +131,9 @@ describe("sameHost two-process delivery (§19.3)", () => {
 
     // ── ⑥ 等待 HostB 的 poller 认领并投递 ──
     // poller 启动时已跑首轮（runPollCycle in start()），send 后下一轮在 pollIntervalMs 内触发。
-    await sleep(300);
+    await waitFor(() =>
+      ctxB.port.delivered.some((d) => d.endpointId === ctxB.epId && d.envelope.id === messageId),
+    );
     await flush();
 
     // HostB 的 FakeStreamPort.delivered 应有跨进程投递的这条消息
@@ -190,7 +200,9 @@ describe("sameHost two-process delivery (§19.3)", () => {
       text: "幂等测试",
     });
 
-    await sleep(300);
+    await waitFor(() =>
+      ctxB.port.delivered.some((d) => d.endpointId === ctxB.epId && d.rendered?.includes("幂等测试")),
+    );
     await flush();
 
     // 验证目标进程收到（含消息内容）

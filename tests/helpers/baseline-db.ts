@@ -1,6 +1,6 @@
-// G02（本地验收·存储与迁移）：确定性重建「迁移全链已跑完的 0.1.0 基线库」。
+// G02（本地验收·存储与迁移）：确定性重建「迁移已完成的 0.2.0 基线库」。
 //
-// 不提交二进制 DB：从仓库 migrations/ 的 5 个脚本逐文件执行（与 SqliteStore.migrate
+// 不提交二进制 DB：从仓库 migrations/ 的全部脚本逐文件执行（与 SqliteStore.migrate
 // 同序），再写入与 000_init/migrate/seedMeta/reconcileFts 同口径的 mesh_meta 印章
 // （schema_version / migration:* / schema_applied_at / library_version / fts_enabled），
 // 最后插入一组固定 id 的种子数据——让库处于「早于本次进程已正常跑过迁移的现状」。
@@ -44,7 +44,7 @@ function stampMeta(db: Database.Database): void {
   );
   for (const f of sortedMigrations()) set.run("migration:" + f, T0);
   set.run("schema_applied_at", T0);
-  set.run("library_version", "0.1.0");
+  set.run("library_version", "0.2.0");
   set.run("fts_enabled", "1");
   set.run("created_at", T0);
   set.run("clock_observed_at", T1);
@@ -249,7 +249,7 @@ export function buildBaselineDb(): string {
   ).run("space-1", "cfg", 2, '{"v":2}', "alice", T2);
 
   db.prepare(
-    "INSERT INTO mesh_streams (pi_session_id, endpoint_id, account_id, created_at) VALUES (?,?,?,?)",
+    "INSERT INTO mesh_streams (runtime_ref, endpoint_id, account_id, created_at) VALUES (?,?,?,?)",
   ).run("ps-alice-1", "ep-alice", "alice", T0);
 
   // 抽查用：alice 在 dc 已消费完 seq2，游标随之前移（recomputeInboxCaches 不触碰 cursor_seq）。

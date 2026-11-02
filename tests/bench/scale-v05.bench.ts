@@ -18,7 +18,7 @@ import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "v05" }),
+  create: async () => ({ session: {}, runtimeRef: "v05" }),
   open: async () => ({ session: {} }),
 };
 
@@ -38,7 +38,7 @@ async function makeWorld(extraLimits: Record<string, unknown> = {}): Promise<Wor
     dbPath: join(dir, "mesh.db"),
     policies: { sessionFactory: stubSessionFactory },
     streamPort: port,
-    limits: { handoffTimeoutMs: 1000, sweepIntervalMs: 0, ...extraLimits },
+    limits: { sweepIntervalMs: 0, ...extraLimits },
     devMode: false,
   });
   return { host, port, dir };

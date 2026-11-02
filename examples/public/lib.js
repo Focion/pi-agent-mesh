@@ -128,7 +128,7 @@ function mergeTick(t) {
       if (ex) {
         ex.state = e.state;
         ex.lease = e.lease;
-        ex.piSessionId = e.piSessionId;
+        ex.runtimeRef = e.runtimeRef;
       }
     }
   }

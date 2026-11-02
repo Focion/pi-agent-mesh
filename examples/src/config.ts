@@ -1,13 +1,13 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // mesh 面板 · 配置层（全真实）— 无密钥 fail-fast。
 //
-// 本面板只读 Mesh 配置：`demo/demo.config.json` 直接内嵌 `llm` + `runtime` 两个
+// 本面板只读 Mesh 配置：`examples/demo.config.json` 直接内嵌 `llm` + `runtime` 两个
 // 对象（与 `createMesh({ llm, runtime })` 的公共入口同 schema）。**不再**镜像任何
 // pi 配置：不读 `~/.pi/agent` 的 models.json / auth.json / settings，不查
 // `@earendil-works/pi-ai` 的内建目录，不镜像 pi 的环境变量凭据表（LD2/LD4）。
 // 模型 / Provider / 凭据全部收敛到 `resolveLlmConfig`（Mesh 侧 fail-fast）。
 //
-// 运行：bash demo/start.sh（Node ≥ 22.19 原生 type-stripping）。
+// 运行：bash examples/start.sh（Node ≥ 22.19 原生 type-stripping）。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -49,7 +49,7 @@ export class ConfigError extends Error {
   }
 }
 
-/** 仓库根（demo/src/config.ts → ../../）——让默认路径与 cwd 无关。 */
+/** 仓库根（examples/src/config.ts → ../../）——让默认路径与 cwd 无关。 */
 const ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
 interface DemoConfigFile {
@@ -70,7 +70,7 @@ function envStr(name: string): string | undefined {
 
 function readConfigFile(): DemoConfigFile {
   const explicit = envStr("MESH_DEMO_CONFIG");
-  const path = explicit ?? join(ROOT, "demo", "demo.config.json");
+  const path = explicit ?? join(ROOT, "examples", "demo.config.json");
   if (!existsSync(path)) return {};
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as DemoConfigFile;
@@ -92,7 +92,7 @@ function loadConfig(): DemoConfig {
         `[mesh-demo] demo.config.json 结构已变更：`,
         `  旧字段 provider / modelId 已由 "llm": { "model": "<providerId>:<modelId>", ... } 取代；`,
         `  凭据由 "llm".{apiKey|apiKeyEnv} 或 "llm".providers."<id>".{apiKey|apiKeyEnv} 提供。`,
-        `  请参照 demo/demo.config.example.json 改写（本面板不再读 ~/.pi 的 models.json / auth.json）。`,
+        `  请参照 examples/demo.config.example.json 改写（本面板不再读 ~/.pi 的 models.json / auth.json）。`,
       ].join("\n"),
     );
   }
@@ -114,9 +114,9 @@ function loadConfig(): DemoConfig {
 
   const runtime: RuntimeConfig = { ...(file.runtime ?? {}) };
 
-  // dbPath：显式覆盖（env 或文件）相对 cwd 解析；缺省用仓库内 demo/.data。
+  // dbPath：显式覆盖（env 或文件）相对 cwd 解析；缺省用仓库内 examples/.data。
   const dbOverride = envStr("MESH_DEMO_DB") ?? file.dbPath;
-  const dbPath = dbOverride ? resolve(process.cwd(), dbOverride) : join(ROOT, "demo", ".data", "mesh.db");
+  const dbPath = dbOverride ? resolve(process.cwd(), dbOverride) : join(ROOT, "examples", ".data", "mesh.db");
 
   const stateOverride = envStr("MESH_DEMO_STATE_DIR") ?? file.stateDir;
   const stateDir = stateOverride

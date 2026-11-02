@@ -108,7 +108,7 @@ function makeHarness(
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
     ...opts.policies,
@@ -173,7 +173,7 @@ async function addHotEndpoint(h: Harness, id: string): Promise<Endpoint> {
   const ep = await h.registry.registerEndpoint({
     accountId: id,
     topology: { kind: "unified" },
-    piSessionId: "pi-" + id,
+    runtimeRef: "pi-" + id,
   });
   h.registry.updateEndpointState(ep.id, "hot");
   return ep;
@@ -314,7 +314,7 @@ describe("event contract: mailbox delivered/consumed/dropped", () => {
 // ─── host 级（createMesh + FakeStreamPort）：ack 端点与状态跃迁 ──────────────
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "e2e-session" }),
+  create: async () => ({ session: {}, runtimeRef: "e2e-session" }),
   open: async () => ({ session: {} }),
 };
 
@@ -325,7 +325,7 @@ async function makeMesh(): Promise<{ host: MeshHost; dir: string; port: FakeStre
     dbPath: join(dir, "mesh.db"),
     policies: { sessionFactory: stubSessionFactory },
     streamPort: port,
-    limits: { handoffTimeoutMs: 1000 },
+    limits: {},
     devMode: true,
   });
   return { host, dir, port };
@@ -344,6 +344,28 @@ async function makeSpeaker(host: MeshHost, id: string): Promise<{ endpointId: st
 }
 
 describe("event contract: host ack + endpoint state", () => {
+  it("blocking request 在 close 后被 reject，不永久挂起（A24）", async () => {
+    const { host } = await makeMesh();
+    await makeSpeaker(host, "requester");
+    await makeSpeaker(host, "responder");
+    const conv = await host.ensureDirect("requester", "responder");
+    // await:true 且对方不 ack：请求停留在轮询态。close 须统一 reject 所有挂起等待者。
+    const pending = host.request(
+      {
+        from: "requester",
+        conversationId: conv.id,
+        kind: "chat",
+        expect: "ack",
+        to: ["responder"],
+      },
+      { await: true },
+    );
+    const assertion = expect(pending).rejects.toThrow(/closed/); // 先挂 handler，避免 close 时的 unhandled rejection
+    await new Promise((r) => setTimeout(r, 50)); // 让 request 越过 route、进入轮询
+    await host.close();
+    await assertion;
+  });
+
   it("request-response ack 的 message_acked 携带真实 endpointId", async () => {
     const { host } = await makeMesh();
     try {

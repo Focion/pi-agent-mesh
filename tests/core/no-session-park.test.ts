@@ -13,7 +13,7 @@ import { MeshRegistry } from "../../src/core/registry.js";
 import { MeshRouter } from "../../src/core/router.js";
 import { SqliteStore } from "../../src/core/store.js";
 import { InProcessTransport } from "../../src/core/transport.js";
-import type { Endpoint, Envelope, Grade, Limits, Policies } from "../../src/core/types.js";
+import type { Endpoint, Envelope, Grade, Limits, Policies, SubmissionHandle } from "../../src/core/types.js";
 import { DEFAULT_LIMITS } from "../../src/core/types.js";
 import type { RouteInput } from "../../src/core/contracts.js";
 import { openTestDb } from "../helpers/db.js";
@@ -29,8 +29,8 @@ class ThrowingPort extends FakeStreamPort {
     rendered: string,
     envelope: Envelope,
     grade: Grade,
-    opts?: { triggerTurn?: boolean },
-  ): Promise<{ entryId?: string }> {
+    opts?: { triggerTurn?: boolean; deliveryId?: string; attempt?: number },
+  ): Promise<SubmissionHandle> {
     if (this.deliverThrows !== null) throw this.deliverThrows;
     return super.deliver(endpointId, rendered, envelope, grade, opts);
   }
@@ -67,7 +67,7 @@ function makeHarness(): Harness {
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
   };
@@ -115,7 +115,7 @@ async function addHotEndpoint(h: Harness, id: string): Promise<Endpoint> {
   const ep = await h.registry.registerEndpoint({
     accountId: id,
     topology: { kind: "unified" },
-    piSessionId: "pi-" + id,
+    runtimeRef: "pi-" + id,
   });
   h.registry.updateEndpointState(ep.id, "hot");
   return ep;

@@ -1,158 +1,111 @@
-// 契约测试共享基建：真 pi + faux provider（无网络、无 LLM）。
-// 每条契约测试保护一条被 SDK 实测推翻过的设计决定（F1–F5，§2.3/§23.5）——
-// pi 升级后这里红一条，就是那条假设失效了，不是测试坏了。
+// 契约测试共享基建：真 pi-durable + faux provider（无网络、无 LLM）。
 //
-// faux 模型的接法（实测结论，0.85.1）：
-// compat.registerFauxProvider 只注册 api 级 stream，ModelRuntime 的
-// prepareRequest 仍会以 Unknown provider 拒掉；必须把 createFauxCore 的
-// streamSimple 直接注册进 session.modelRuntime（registerProvider）。
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { loadPiSdk, type PiSdk } from "../../src/pi/pi-sdk.js";
+// durable 时代（MD1/OQ3）不再有 coding-agent 的 SessionManager / modelRuntime /
+// extensionRunner。faux 模型走 pi-ai 公开的 `fauxProvider()` + `createModels()`：
+// `createFaux` 产出「一个 provider 已挂好的 Models + 一道 ModelRef」，直接喂给
+// `createPiSessionFactory({ stateDir, models, model })`（高级/低层路径），或用
+// `createAssembledSessionFactory` 走缺省装配。脚本化应答用 pi-ai 的
+// `fauxAssistantMessage` / `fauxToolCall`（见 tests/pi/durable-contract.test.ts）。
+import {
+  createModels,
+  fauxProvider,
+  type FauxProviderHandle,
+  type Models,
+} from "@earendil-works/pi-ai";
 
-export interface FauxCore {
-  provider: string;
-  api: string;
-  getModel(): any;
-  setResponses(responses: Array<unknown>): void;
-  appendResponses(responses: Array<unknown>): void;
-  state: { callCount: number };
+/** 一个 provider 已挂好的 faux 装配：喂给 createPiSessionFactory 的 models + model。 */
+export interface Faux {
+  /** pi-ai Models（faux provider 已 setProvider 进去）。 */
+  readonly models: Models;
+  /** ModelRef（provider + modelId），agent 装配用它。 */
+  readonly model: { provider: string; modelId: string };
+  readonly provider: FauxProviderHandle["provider"];
+  readonly state: FauxProviderHandle["state"];
+  setResponses(responses: Parameters<FauxProviderHandle["setResponses"]>[0]): void;
+  appendResponses(responses: Parameters<FauxProviderHandle["appendResponses"]>[0]): void;
+  getModel(): ReturnType<FauxProviderHandle["getModel"]>;
+  callCount(): number;
 }
 
-type FauxCompat = {
-  fauxAssistantMessage(content: unknown, opts?: { stopReason?: string }): unknown;
-  fauxToolCall(name: string, args: unknown, opts?: { id?: string }): unknown;
-};
-
-export interface PiTestSession {
-  pi: PiSdk;
-  session: any;
-  sm: any;
-  faux: FauxCore;
-  dir: string;
-  events: Array<{ type: string; [k: string]: unknown }>;
-  dispose(): void;
-}
-
-let compatCache: FauxCompat | undefined;
-let fauxModuleCache: { createFauxCore(opts?: { models?: Array<{ id: string }> }): FauxCore & { streamSimple: unknown } } | undefined;
-
-/** pi-ai/compat（fauxAssistantMessage 等剧本工具） */
-export async function loadFauxCompat(): Promise<FauxCompat> {
-  if (!compatCache) {
-    compatCache = (await import("@earendil-works/pi-ai/compat")) as unknown as FauxCompat;
-  }
-  return compatCache;
-}
-
-/** 建 faux provider 内核（不触碰全局 api 注册表，用例间天然隔离） */
-export async function createFaux(modelId = "faux-1"): Promise<FauxCore> {
-  if (!fauxModuleCache) {
-    fauxModuleCache = (await import("@earendil-works/pi-ai/providers/faux")) as never;
-  }
-  return fauxModuleCache.createFauxCore({ models: [{ id: modelId }] });
-}
-
-/** 把 faux 内核注册进一个已建好的 session 的 ModelRuntime */
-export function registerFauxInto(session: any, faux: FauxCore & { streamSimple?: unknown }): void {
+/** 建 faux 装配（不触碰全局 provider 注册表，用例间天然隔离）。 */
+export async function createFaux(modelId = "faux-1"): Promise<Faux> {
+  const faux = fauxProvider({ models: [{ id: modelId }] });
+  const models = createModels();
+  models.setProvider(faux.provider);
   const model = faux.getModel();
-  session.modelRuntime.registerProvider(faux.provider, {
-    apiKey: "faux-test-key",
-    baseUrl: "http://faux.local", // 占位：faux streamSimple 不发请求，但校验要求 baseUrl
-    api: faux.api,
-    streamSimple: (faux as { streamSimple?: unknown }).streamSimple,
-    models: [
-      {
-        id: model.id,
-        name: model.id,
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128_000,
-        maxTokens: 4096,
-      },
-    ],
-  });
-}
-
-/**
- * 真 AgentSession + inMemory SessionManager + faux 模型。
- * responses：本轮及后续轮次的脚本化应答（可用 async factory 做闸门）。
- */
-export async function createPiTestSession(
-  responses: Array<unknown> = [],
-): Promise<PiTestSession> {
-  const pi = await loadPiSdk();
-  const faux = await createFaux();
-  if (responses.length > 0) faux.setResponses(responses);
-  const dir = mkdtempSync(join(tmpdir(), "pi-mesh-contract-"));
-  const sm = pi.SessionManager.inMemory(dir);
-  const { session } = await pi.createAgentSession({
-    cwd: dir,
-    agentDir: dir,
-    model: faux.getModel() as never,
-    noTools: "all",
-    sessionManager: sm,
-  });
-  registerFauxInto(session, faux);
-  const events: PiTestSession["events"] = [];
-  session.subscribe((e: { type: string }) => events.push(e));
   return {
-    pi,
-    session,
-    sm,
-    faux,
-    dir,
-    events,
-    dispose() {
-      try {
-        session.dispose();
-      } catch {
-        // dispose 竞态不阻断清理
-      }
-      rmSync(dir, { recursive: true, force: true });
-    },
+    models,
+    model: { provider: model.provider, modelId: model.id },
+    provider: faux.provider,
+    state: faux.state,
+    setResponses: (r) => faux.setResponses(r),
+    appendResponses: (r) => faux.appendResponses(r),
+    getModel: () => faux.getModel(),
+    callCount: () => faux.state.callCount,
   };
 }
 
-/** 轮询直到条件满足（起轮 → streaming 之间有窗口，sleep 固定值会脆） */
-export async function waitFor(cond: () => boolean, ms = 10_000): Promise<void> {
+/** 轮询直到条件满足（起轮 / 工具落位之间只有毫秒级窗口，sleep 固定值会脆）。条件可为异步。 */
+export async function waitFor(
+  cond: () => boolean | Promise<boolean>,
+  ms = 10_000,
+): Promise<void> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    if (cond()) return;
-    await new Promise((r) => setTimeout(r, 25));
+    if (await cond()) return;
+    await new Promise((r) => setTimeout(r, 10));
   }
   throw new Error("waitFor: condition not met within " + ms + "ms");
 }
 
-export function customEntries(sm: any): any[] {
-  return sm.getEntries().filter((e: any) => e.type === "custom_message");
+/** durable 会话面：会话里可读的转录条目（structural，避免把 pi-durable 类型拖进 core 契约背景）。 */
+export interface DurableSessionSurface {
+  root: {
+    entries(
+      opts: { order: "ascending" | "descending" },
+      limit: number,
+      cursor?: unknown,
+      ctx?: unknown,
+    ): Promise<{ items: Array<{ id: number; kind: string; data?: unknown }>; next?: unknown }>;
+  };
+  ctx?: unknown;
 }
 
 /**
- * 往 session 的扩展运行器上挂一组扩展钩子（与 stream-port.injectContext 同机制：
- * 直接 push 带 handlers Map 的扩展对象，emit 时会按扩展数组顺序逐个执行）。
- * handlers: { [事件名]: [(event) => ...结果] }，多钩子按序入同一 Map。
+ * 最小可过 durable-port `narrowDurableSession` 的假会话（无真 pi）。锁/租约/超时类
+ * 用例只需 warm 成功与 deliver 落一个当场 done 的 submission，不需要真实转录。
  */
-export function installExtensionHooks(
-  session: any,
-  handlers: Record<string, Array<(event: any) => unknown>>,
-  path = "probe:hooks",
-): void {
-  const runner = session.extensionRunner;
-  if (!runner || !Array.isArray(runner.extensions)) {
-    throw new Error("pi 1.1.0 session 未暴露 extensionRunner.extensions，扩展钩子注入面不可用");
+export function fakeDurableSession(): unknown {
+  return {
+    ctx: {},
+    root: {
+      submit: async () => ({ status: async () => ({ status: "done", entry: 1 }) }),
+      watch: async () => ({
+        value: { entries: [], docs: {} },
+        start: () => {},
+        stop: async () => {},
+      }),
+      entries: async () => ({ items: [], next: undefined }),
+      waitForIdle: async () => {},
+    },
+    registry: { install: () => {} },
+    harness: { closed: new Promise<never>(() => {}) },
+    configure: async () => {},
+    close: async () => {},
+  };
+}
+
+/** 读会话全部条目（升序全量），供「某 envelopeId 的 mesh.msg 恰好 N 条」这类断言。 */
+export async function customEntries(session: DurableSessionSurface): Promise<
+  Array<{ id: number; kind: string; data?: unknown }>
+> {
+  const out: Array<{ id: number; kind: string; data?: unknown }> = [];
+  let cursor: unknown;
+  for (;;) {
+    const page = await session.root.entries({ order: "ascending" }, 1000, cursor, session.ctx);
+    out.push(...page.items);
+    if (!page.next) break;
+    cursor = page.next;
   }
-  runner.extensions.push({
-    path,
-    resolvedPath: path,
-    hidden: true,
-    handlers: new Map(Object.entries(handlers)),
-    tools: new Map(),
-    messageRenderers: new Map(),
-    commands: new Map(),
-    flags: new Map(),
-    shortcuts: new Map(),
-  });
+  return out;
 }

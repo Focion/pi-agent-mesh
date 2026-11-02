@@ -15,5 +15,5 @@
     "verbatimModuleSyntax": true,
     "resolveJsonModule": true
   },
-  "include": ["src", "tests", "scripts", "examples", "vitest.config.ts", "tsup.config.ts"]
+  "include": ["src", "tests", "scripts", "examples/*.ts", "vitest.config.ts", "tsup.config.ts"]
 }

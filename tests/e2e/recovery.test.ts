@@ -13,12 +13,12 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMesh } from "../../src/index.js";
 import type { MeshHost, SessionFactory } from "../../src/index.js";
-import type { Envelope, Grade } from "../../src/core/types.js";
+import type { Envelope, Grade, SubmissionHandle } from "../../src/core/types.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "e2e-session" }),
+  create: async () => ({ session: {}, runtimeRef: "e2e-session" }),
   open: async () => ({ session: {} }),
 };
 
@@ -29,9 +29,9 @@ class NoTurnPort extends FakeStreamPort {
     rendered: string,
     envelope: Envelope,
     grade: Grade,
-    _opts?: { triggerTurn?: boolean },
-  ): Promise<{ entryId?: string }> {
-    return super.deliver(endpointId, rendered, envelope, grade, {});
+    opts?: { triggerTurn?: boolean; deliveryId?: string; attempt?: number },
+  ): Promise<SubmissionHandle> {
+    return super.deliver(endpointId, rendered, envelope, grade, { ...opts, triggerTurn: false });
   }
 }
 
@@ -48,7 +48,7 @@ async function makeWorld(dbPath: string, port: FakeStreamPort): Promise<{
     dbPath,
     policies: { sessionFactory: stubSessionFactory },
     streamPort: port,
-    limits: { handoffTimeoutMs: 1000 },
+    limits: {},
     devMode: true,
   });
   await host.registerAccount({
@@ -102,7 +102,7 @@ describe("D03 authoritative recovery e2e (§8.4)", () => {
       dbPath,
       policies: { sessionFactory: stubSessionFactory },
       streamPort: port,
-      limits: { handoffTimeoutMs: 1000 },
+      limits: {},
       devMode: true,
     });
     try {
@@ -151,7 +151,7 @@ describe("D03 authoritative recovery e2e (§8.4)", () => {
       dbPath,
       policies: { sessionFactory: stubSessionFactory },
       streamPort: port2,
-      limits: { handoffTimeoutMs: 1000 },
+      limits: {},
       devMode: true,
     });
     try {

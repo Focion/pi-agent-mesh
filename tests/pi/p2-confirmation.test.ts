@@ -2,12 +2,9 @@
 // W08 · I09 · P2 最终输入确认（真实 SDK + faux，§7.6 / W01 探针确认点）。
 //
 // 保护的设计决定：P2 的「delivered」唯一判据是注入体进入真实 LLM 调用的最终输入
-// —— 通过同一扩展的 context_with_system 处理器观测到 customType==="mesh.inbox" 的那
-// 一条。装 hook（injectContext）≠ 确认；不起轮 ⇒ 观测零次 ⇒ 永不确认（停在 blocked，
-// 不伪造绿灯）。确认回调绑定端点与回合代次（turnGeneration）。
-//
-// pi 1.1.0 实测机制（W01 探针）：context_with_system 在所有 context 处理器跑完、
-// system 前缀恢复后看到完整 transcript；此钩子找不到注入体即静默。
+// —— 通过 durable 的 beforeRequest 钩子观测到 injectContext 设入的注入体（读可变
+// rec.injection）。装 hook（injectContext）≠ 确认；不起轮 ⇒ 观测零次 ⇒ 永不确认
+// （停在 blocked，不伪造绿灯）。确认回调绑定端点与回合代次（turnGeneration）。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -20,41 +17,15 @@ import type {
   Envelope,
   SessionFactory,
 } from "../../src/core/types.js";
-import { PiStreamPort } from "../../src/pi/stream-port.js";
-import { loadPiSdk } from "../../src/pi/pi-sdk.js";
-import {
-  createFaux,
-  loadFauxCompat,
-  registerFauxInto,
-  waitFor,
-  type FauxCore,
-} from "../helpers/pi-session.js";
+import { PiStreamPort } from "../../src/pi/durable-port.js";
+import { createPiSessionFactory } from "../../src/pi/session-factory.js";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { createFaux, waitFor, type Faux } from "../helpers/pi-session.js";
 
-// ── 测试工厂：每端点一条真 inMemory pi 流（同 stream-port.test.ts 装配）───
+// ── 测试工厂：createPiSessionFactory 高级路径 + faux provider（同 stream-port.test.ts）───
 
-async function createTestFactory(faux: FauxCore, dir: string): Promise<SessionFactory> {
-  const pi = await loadPiSdk();
-  const make = async (id: string) => {
-    const sm = pi.SessionManager.inMemory(join(dir, id));
-    const { session } = await pi.createAgentSession({
-      cwd: dir,
-      agentDir: dir,
-      model: faux.getModel() as never,
-      noTools: "all",
-      sessionManager: sm,
-    });
-    registerFauxInto(session, faux);
-    return { session, piSessionId: `mem:${id}` };
-  };
-  return {
-    async create(ctx) {
-      return make(ctx.endpoint.id);
-    },
-    async open(ctx) {
-      const r = await make(ctx.endpoint.id);
-      return { session: r.session };
-    },
-  };
+async function createTestFactory(faux: Faux, dir: string): Promise<SessionFactory> {
+  return createPiSessionFactory({ stateDir: dir, models: faux.models, model: faux.model });
 }
 
 function makeAccount(id: string): Account {
@@ -67,7 +38,7 @@ function makeEndpoint(id: string, accountId: string): Endpoint {
     accountId,
     topology: { kind: "unified" },
     state: "cold",
-    piSessionId: null,
+    runtimeRef: null,
     lease: "shared",
     leaseUntil: null,
     lastActiveAt: null,
@@ -90,7 +61,7 @@ function makeEnvelope(id: string): Envelope {
 }
 
 let dir: string;
-let faux: FauxCore;
+let faux: Faux;
 let port: PiStreamPort;
 let accounts: Map<string, Account>;
 let endpoints: Map<string, Endpoint>;
@@ -115,7 +86,7 @@ beforeEach(async () => {
     },
     setEndpointSession: (id, sid) => {
       const e = endpoints.get(id);
-      if (e) e.piSessionId = sid;
+      if (e) e.runtimeRef = sid;
     },
     setEndpointLease: () => {},
     setEndpointLock: () => {},
@@ -139,7 +110,7 @@ function addEndpoint(id = "ep_b", accountId = "acct_b"): Endpoint {
 }
 
 describe("P2 最终输入确认（I09）：装 hook ≠ 确认；起轮才确认", () => {
-  it("不起轮 ⇒ context_with_system 观测零次 ⇒ onInjectionConfirmed 零次（停在 blocked）", async () => {
+  it("不起轮 ⇒ beforeRequest 观测零次 ⇒ onInjectionConfirmed 零次（停在 blocked）", async () => {
     const ep = addEndpoint();
     await port.warm(ep.id, "shared");
     port.injectContext(ep.id, "P2-INBOX-SNIPPET");
@@ -148,13 +119,12 @@ describe("P2 最终输入确认（I09）：装 hook ≠ 确认；起轮才确认
     expect(faux.state.callCount).toBe(0);
   });
 
-  it("起一轮 ⇒ 观测到 mesh.inbox ⇒ onInjectionConfirmed 恰一次（绑定回合代次）", async () => {
-    const compat = await loadFauxCompat();
-    faux.setResponses([compat.fauxAssistantMessage("ok")]);
+  it("起一轮 ⇒ 观测到注入体 ⇒ onInjectionConfirmed 恰一次（绑定回合代次）", async () => {
+    faux.setResponses([fauxAssistantMessage("ok")]);
     const ep = addEndpoint();
     await port.warm(ep.id, "shared");
     port.injectContext(ep.id, "P2-INBOX-SNIPPET");
-    // 触发真实一轮（faux 应答）；注入体进入最终输入 ⇒ context_with_system 观测确认
+    // 触发真实一轮（faux 应答）；注入体进入最终输入 ⇒ beforeRequest 观测确认
     await port.deliver(ep.id, "wake", makeEnvelope("m_1"), "steer", {
       triggerTurn: true,
     });
@@ -164,8 +134,7 @@ describe("P2 最终输入确认（I09）：装 hook ≠ 确认；起轮才确认
   });
 
   it("双端点：只触发一端轮 ⇒ 只有该端点确认，另一端不确认（不互相确认）", async () => {
-    const compat = await loadFauxCompat();
-    faux.setResponses([compat.fauxAssistantMessage("ok")]);
+    faux.setResponses([fauxAssistantMessage("ok")]);
     const ep1 = addEndpoint("ep_1", "acct_b");
     const ep2 = addEndpoint("ep_2", "acct_b");
     await port.warm(ep1.id, "shared");

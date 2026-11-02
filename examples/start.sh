@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# mesh-demo 一键启动（放在 demo/ 下，从任意目录调用都可）。
+# mesh-demo 一键启动（放在 examples/ 下，从任意目录调用都可）。
 #
 # 它把散落的启动前置步骤打包成一条命令：
 #   1. 依赖检查    node_modules 缺失 → 自动 npm install
 #   2. 配置检查    demo.config.json 缺失 → 自动从 demo.config.example.json 复制
-#   3. 构建检查    dist 缺失/过时或 --build → 自动 npm run build（demo 从 dist 导入）
+#   3. 构建检查    dist 缺失/过时或 --build → 自动 npm run build（demo 从 ../dist 导入）
 #   4. 端口清理    目标端口被占用 → 先 SIGTERM 后 SIGKILL 关闭占用进程
-#   5. 前台启动    exec node demo/src/server.ts（Ctrl+C / SIGTERM 直接终止）
+#   5. 前台启动    exec node examples/src/server.ts（Ctrl+C / SIGTERM 直接终止）
 #
 # 用法：
-#   bash demo/start.sh [--build] [--port <n>] [--no-kill]
+#   bash examples/start.sh [--build] [--port <n>] [--no-kill]
 #     --build     强制重建 dist（默认仅在缺失时构建）
 #     --port <n>  指定端口（优先级高于 MESH_DEMO_PORT，默认 8787）
 #     --no-kill   端口被占用时不自动杀进程，直接报错退出
+#
+# 唯一的启动入口：等价于 npm run demo:start。
 #
 # Node 需 ≥ 22.19（demo 用原生 TS type-stripping 直接跑 .ts）。
 # 真正跑起来还需 LLM 凭据（见 src/config.ts：无密钥会 fail-fast 退出）。
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# 定位仓库根：本脚本在 demo/ 下 → ROOT = demo/..
+# 定位仓库根：本脚本在 examples/ 下 → ROOT = examples/..
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
@@ -37,7 +39,7 @@ while [[ $# -gt 0 ]]; do
       if [[ $# -lt 2 ]]; then echo "[demo] 缺少 --port 端口值" >&2; exit 2; fi
       PORT="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,25p' "${BASH_SOURCE[0]}"; exit 0 ;;
+      sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "[demo] 未知参数：$1（支持 --build / --port <n> / --no-kill）" >&2; exit 2 ;;
   esac
 done
@@ -68,13 +70,13 @@ if [[ ! -d node_modules ]]; then
 fi
 
 # ── 2. 配置文件检查（缺失则从 example 复制，并提示改成本机凭据）───────────────
-if [[ ! -f demo/demo.config.json ]]; then
-  if [[ -f demo/demo.config.example.json ]]; then
-    cp demo/demo.config.example.json demo/demo.config.json
-    echo "[demo] 已从 demo.config.example.json 生成 demo/demo.config.json"
+if [[ ! -f examples/demo.config.json ]]; then
+  if [[ -f examples/demo.config.example.json ]]; then
+    cp examples/demo.config.example.json examples/demo.config.json
+    echo "[demo] 已从 demo.config.example.json 生成 examples/demo.config.json"
     echo "[demo] ⚠️  请按需修改 llm.model / llm.providers，并配置凭据（llm.apiKey 或 llm.apiKeyEnv，本面板不读 ~/.pi）。"
   else
-    echo "[demo] 缺少 demo/demo.config.json 且无 example 可复制。" >&2
+    echo "[demo] 缺少 examples/demo.config.json 且无 example 可复制。" >&2
     exit 1
   fi
 fi
@@ -119,10 +121,23 @@ if command -v lsof >/dev/null 2>&1; then
     fi
   fi
 else
-  echo "[demo] 未找到 lsof，跳过端口检测；冲突时服务器会报 EADDRINUSE" >&2
+  if command -v fuser >/dev/null 2>&1; then
+    # Linux fallback（无 lsof）
+    if fuser "${PORT}/tcp" >/dev/null 2>&1; then
+      if [[ "$NO_KILL" == 1 ]]; then
+        echo "[demo] 端口 ${PORT} 已被占用（fuser 检测），--no-kill 已指定，退出。" >&2
+        exit 1
+      fi
+      echo "[demo] 端口 ${PORT} 被占用，fuser -k 关闭…"
+      fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
+      sleep 0.5
+    fi
+  else
+    echo "[demo] 未找到 lsof/fuser，跳过端口检测；冲突时服务器会报 EADDRINUSE" >&2
+  fi
 fi
 
 # ── 5. 前台启动（exec：Ctrl+C / SIGTERM 直接终止服务器进程）───────────────────
 export MESH_DEMO_PORT="$PORT"
 echo "[demo] 启动 → http://localhost:${PORT}"
-exec node demo/src/server.ts
+exec node examples/src/server.ts

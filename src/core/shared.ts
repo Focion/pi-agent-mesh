@@ -114,6 +114,25 @@ export class SharedSpace implements SharedSpaceContract {
     this.d = deps;
   }
 
+  /** A20：共享对象写事务统一走 Store.tx（IMMEDIATE + 时钟检测）；无 store 时退化为
+   *  BEGIN IMMEDIATE（测试/最小装配）。绕开裸 db.transaction（DEFERRED）的陈旧读风险。 */
+  private tx<T>(fn: () => T): T {
+    if (this.d.store) return this.d.store.tx(fn);
+    this.d.db.exec("BEGIN IMMEDIATE");
+    try {
+      const out = fn();
+      this.d.db.exec("COMMIT");
+      return out;
+    } catch (err) {
+      try {
+        this.d.db.exec("ROLLBACK");
+      } catch {
+        // rollback 失败不掩盖原错误。
+      }
+      throw err;
+    }
+  }
+
   // ── 读 ─────────────────────────────────────────────────────────────────
 
   async get(
@@ -125,6 +144,12 @@ export class SharedSpace implements SharedSpaceContract {
     const account = this.requireAccount(as);
     const obj = this.readObject(spaceId, key);
     if (!obj) return null;
+    // A34/§18.6：read 的 ACL 判定先于一切 null 返回（tombstone / 版本缺失）。墓碑仍带
+    // 自身 ACL；若先返回 null 再判 ACL，无权方可用「null vs SPACE_FORBIDDEN」区分
+    // 「键不存在/已删」与「存在但无权」，泄露键是否存在。读旧版本与读当前值走同一次
+    // ACL 判定（§18.6）；此处的 meta 仅用于权限 ctx，不含 resolved data 不影响判定。
+    await this.assertAllowed(obj, account, "read", spaceId, this.metaFrom(obj));
+
     if (version === undefined && obj.tombstoned === 1) return null;
 
     let data: unknown;
@@ -246,7 +271,7 @@ export class SharedSpace implements SharedSpaceContract {
     const oldAclFp = aclFingerprint(oldAcl);
     const now = isoNow();
 
-    const write = this.d.db.transaction((): { version: number } => {
+    const result = this.tx((): { version: number } => {
       const cur = this.readObject(spaceId, key);
       // 事务内复验（§4.2）：版本与授权依据都没变才写——异步授权后的竞态由此闭合（I20）。
       if (expected !== undefined) {
@@ -287,7 +312,6 @@ export class SharedSpace implements SharedSpaceContract {
       this.pruneVersions(spaceId, key, nextVersion);
       return { version: nextVersion };
     });
-    const result = write();
 
     this.d.events.emit("shared_object_changed", {
       spaceId,
@@ -322,7 +346,7 @@ export class SharedSpace implements SharedSpaceContract {
     const maxLen = opts.maxLen;
     const now = isoNow();
 
-    const write = this.d.db.transaction((): { version: number } => {
+    const result = this.tx((): { version: number } => {
       const cur = this.readObject(spaceId, key);
       // 事务内复验授权依据（acl 变了即拒绝）；读-改-写同事务源于并发追加不丢（§18.3）。
       const curAcl = cur
@@ -368,7 +392,6 @@ export class SharedSpace implements SharedSpaceContract {
       this.pruneVersions(spaceId, key, nextVersion);
       return { version: nextVersion };
     });
-    const result = write();
 
     this.d.events.emit("shared_object_changed", {
       spaceId,
@@ -393,7 +416,7 @@ export class SharedSpace implements SharedSpaceContract {
 
     const nextVersion = existing.version + 1;
     const now = isoNow();
-    const write = this.d.db.transaction(() => {
+    this.tx(() => {
       // 事务内复验：对象未被并发改写（版本未变）才打墓碑（§4.2）。
       const cur = this.readObject(spaceId, key);
       if (!cur || cur.tombstoned === 1 || cur.version !== existing.version) {
@@ -408,7 +431,6 @@ export class SharedSpace implements SharedSpaceContract {
         .run(nextVersion, opts.as, now, spaceId, key);
       this.recordVersion(spaceId, key, nextVersion, null, opts.as, now);
     });
-    write();
 
     this.d.events.emit("shared_object_changed", {
       spaceId,

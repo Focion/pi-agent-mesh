@@ -17,11 +17,14 @@ if (!lockPath) {
   process.exit(2);
 }
 
-/** 本进程启动时刻（与 EndpointLock.procStartedAt 同源：ps -p <pid> -o lstart=）。 */
+/** 本进程启动时刻（与 EndpointLock.procStartedAt 同源：ps -p <pid> -o lstart=）。
+ *  固定 TZ=UTC + LC_ALL=C，与 lock.ts 的 A20 修正对齐——否则两边在时区/语言上不一致，
+ *  ownerIsLive 的字符串比对会误判持锁者「死」。 */
 function procStartedAt() {
   try {
     return execFileSync("ps", ["-p", String(process.pid), "-o", "lstart="], {
       encoding: "utf8",
+      env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
     }).trim();
   } catch {
     return "";
@@ -35,6 +38,9 @@ const lockInfo = {
   acquiredAt: new Date().toISOString(),
   leaseUntil: null,
   procStartedAt: procStartedAt(),
+  // A13：实例锁在 sameHost 下以 mode="multi" 记入锁文件，sameHost 共存检查
+  // （multi + shared + multi + shared）依赖它；缺省会被 normalizeLockInfo 归为 single。
+  mode: "multi",
 };
 
 mkdirSync(dirname(lockPath), { recursive: true });

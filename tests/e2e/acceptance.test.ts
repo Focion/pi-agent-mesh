@@ -15,8 +15,10 @@
 // 成员恒定超预算 ⇒ 广播不产生原文份数、不唤醒。只有 expect:"reply" 指向的人
 // 因「被请求答复 ⇒ 本条按预算内投」跃迁而醒来。
 //
-// FakeStreamPort.deliver 同步回吐 entry_appended；triggerTurn 经 queueMicrotask
-// 回吐 turn_end——断言前必须 flush 一个宏任务（§23.5）。
+// FakeStreamPort.deliver 的 triggerTurn → endTurn 走 setTimeout（确保 markDelivered
+// 先于 endTurn 执行）。每个 send 后必须 flush 让 endTurn 完成，否则忙流合并
+// （§7.8）会让后续 send 的 triggerTurn 被降为 false。flush 用 setTimeout 确保
+// 当前 macrotask 内的所有微任务已完成、endTurn 已触发。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { mkdtempSync } from "node:fs";
@@ -35,7 +37,7 @@ import { assertInvariants } from "../helpers/invariants.js";
 
 /** sessionFactory 是唯一必填槽（§12.1）；e2e 只用 FakeStreamPort，永不被调 */
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "e2e-session" }),
+  create: async () => ({ session: {}, runtimeRef: "e2e-session" }),
   open: async () => ({ session: {} }),
 };
 
@@ -56,7 +58,7 @@ async function makeMesh(): Promise<MeshWorld> {
     streamPort: port,
     // P2 落账的投递（queued 不消费）会在 close() 的 handoff 收敛循环里计数；
     // 收敛本身只在真实 in-flight handoff 上有意义，取 F.1 允许范围下限而非默认 30s。
-    limits: { handoffTimeoutMs: 1000 },
+    limits: {},
     devMode: true,
   });
   return { host, port };
@@ -124,7 +126,9 @@ describe("P0 acceptance (§25.1)", () => {
           text: `hello ${i}`,
         });
         messageIds.push(r.messageId);
+        await flush(); // 让 endTurn 在本轮完成，避免忙流合并吃掉后续唤醒
       }
+      // 额外 flush 确保最后一轮的 consumed 落盘
       await flush();
 
       // 10 条消息 → 10 条 delivery（每条只投给对端），全部 consumed
@@ -530,6 +534,38 @@ describe("queue claim/requeue (§17)", () => {
       expect(q2msgs[0]!.payload.text).toBe("job");
       const inbox = await host.observer.inboxOf("w2");
       expect(inbox.conversations.find((c) => c.conversationId === q2.id)?.unread).toBe(1);
+
+      await assertInvariants(host);
+    } finally {
+      await host.close();
+    }
+  });
+
+  it("A15: requeue route 被拒时原行保持投递态、不丢失", async () => {
+    const { host } = await makeMesh();
+    try {
+      await makeProducer(host, "producer");
+      await makeSpeaker(host, "w1");
+      await makeSpeaker(host, "w2");
+      const q1 = await host.createConversation({ type: "queue", creator: "producer", members: ["w1"] });
+      const r = await host.send({ from: "producer", conversationId: q1.id, kind: "task", expect: "none", text: "job" });
+      await flush();
+
+      // 原行已进入投递态（queue 不消费 → delivered）
+      let trace = await host.observer.trace(r.messageId);
+      expect(trace[0]!.state).toBe("delivered");
+
+      // 目标是 producer 不属成员的 direct 会话 → route 抛 NOT_A_MEMBER
+      const direct = await host.ensureDirect("w1", "w2");
+      await expect(host.requeue(r.messageId, direct.id)).rejects.toMatchObject({
+        code: "NOT_A_MEMBER",
+      });
+
+      // A15：先 route 后撤行 ⇒ 被拒时原消息原样保留（旧实现已先置 dropped，会丢失）
+      trace = await host.observer.trace(r.messageId);
+      expect(trace[0]!.state).not.toBe("dropped");
+      const q1msgs = await host.observer.messages({ conversationId: q1.id });
+      expect(q1msgs.some((m) => m.id === r.messageId)).toBe(true);
 
       await assertInvariants(host);
     } finally {

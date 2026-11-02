@@ -70,7 +70,7 @@ function renderEndpoints() {
         el("td", { text: (state.accounts.find((a) => a.id === e.accountId) || {}).displayName || e.accountId }),
         el("td", {}, el("span", { class: "pill st-" + e.state, text: e.state })),
         el("td", { text: e.lease || "—" }),
-        el("td", { class: "mono muted", text: shortId(e.piSessionId) }),
+        el("td", { class: "mono muted", text: shortId(e.runtimeRef) }),
         el("td", { class: "cell-actions" },
           el("button", { class: "mini", "data-act": "warm-shared", "data-id": e.id, text: "warm·共享" }),
           el("button", { class: "mini", "data-act": "warm-excl", "data-id": e.id, text: "warm·独占" }),

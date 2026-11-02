@@ -131,7 +131,7 @@ describe("envelope: router 草稿带 ext", () => {
         limits,
       }),
       sessionFactory: {
-        create: async () => ({ session: {}, piSessionId: "s" }),
+        create: async () => ({ session: {}, runtimeRef: "s" }),
         open: async () => ({ session: {} }),
       },
     };
@@ -195,7 +195,7 @@ describe("envelope: router 草稿带 ext", () => {
         limits,
       }),
       sessionFactory: {
-        create: async () => ({ session: {}, piSessionId: "s" }),
+        create: async () => ({ session: {}, runtimeRef: "s" }),
         open: async () => ({ session: {} }),
       },
     };

@@ -4,14 +4,14 @@
 
 ## 项目上下文
 
-- 项目简介：`@pi/agent-mesh` —— 构建在 pi SDK 之上的多持久 Agent 消息传递与共享状态层（v0.1.0，规范面 v1.0.2 已定稿）。
-- 技术栈：TypeScript（ESM + CJS 双产物，tsup 构建）、Node ≥ 22.19.0、better-sqlite3 存储、vitest 测试；pi SDK（`@earendil-works/pi-coding-agent` `^1.1.0`）为直接依赖、惰性加载。
+- 项目简介：`@pi/agent-mesh` —— 构建在 pi SDK 之上的多持久 Agent 消息传递与共享状态层（v0.2.0，规范面 v1.0.3 已定稿）。
+- 技术栈：TypeScript（ESM + CJS 双产物，tsup 构建）、Node ≥ 24.0.0、better-sqlite3 存储、vitest 测试；pi-durable（`@earendil-works/pi-durable` `1.4.0`）+ pi-ai（`@earendil-works/pi-ai` `1.4.0`）+ chord（`@earendil-works/chord` `1.4.0`）为直接依赖、惰性加载。
 - 入口与关键模块：
   - `src/index.ts` —— 包根装配入口（`createMesh` / `MeshHost`），唯一构造函数，可同时 import core 与 pi。
   - `src/core/**` —— mesh-core：类型契约、存储、路由、投递、工具面、策略、渲染、观测。**零 pi 依赖**（CI 门禁 G1）。
   - `src/pi/**` —— mesh-pi：pi SDK 适配（StreamPort、session 工厂、实例锁），只允许 import core 的 `types` / `util` / `contracts`（门禁 G2）。
   - `migrations/000_init.sql` —— 全量 17 表 + fts5 DDL。
-  - `demo/` —— 本地演示宿主（SSE + 静态页），非发布产物。
+  - `examples/` —— 使用示例与本地演示宿主（`quickstart.ts`、`src/` + `public/` SSE 面板），非发布产物。
   - `tests/{core,pi,e2e,helpers}` —— 单测 / pi 契约测试 / 验收测试。
 - 本地运行 / 测试命令：
 
@@ -48,10 +48,15 @@
 
 | 文档 | 说明 |
 | --- | --- |
-| [`notes/tech/2026-09-07-pi-agent-mesh-spec.md`](notes/tech/2026-09-07-pi-agent-mesh-spec.md) | **权威规范（文档版本 1.0.2）**：平台基线、架构、投递语义、存储 schema、API、不变量、决策记录与风险登记。代码里的 `§x.y` 引用都指向它。1.0.1 已按 v0.1.0 实现回填，1.0.2 收口 0.1.0 之后的规范差距（见附录 L.4）。 |
+| [`notes/tech/2026-09-07-pi-agent-mesh-spec.md`](notes/tech/2026-09-07-pi-agent-mesh-spec.md) | **权威规范（文档版本 1.0.3）**：平台基线、架构、投递语义、存储 schema、API、不变量、决策记录与风险登记。代码里的 `§x.y` 引用都指向它。1.0.1 按 v0.1.0 实现回填，1.0.2 收口悬空差距，1.0.3 durable 迁移与补偿退役（变更见附录 L.4）。 |
+| [`notes/archive/2026-10-20-execution-plan.md`](notes/archive/2026-10-20-execution-plan.md) | **已归档（2026-11-01）**：durable 迁移 + 审计修复 合并执行计划（0–17 步 + 后续收口），全部完成标准（demo:smoke 11/11 / pack ✓ / 665 test ✓）达成。 |
+| [`notes/tech/2026-10-20-audit-rulings.md`](notes/tech/2026-10-20-audit-rulings.md) | **已完成**：审计步骤 4 的四处规范裁决定案（R1–R4）与记录型裁定。代码已在步骤 5–8 实施，规范 1.0.3 文本已在迁 10 落地。 |
+| [`notes/changelog/2026-11-01-v0.2.0.md`](notes/changelog/2026-11-01-v0.2.0.md) | **v0.2.0 变更说明**：四条破坏性变更、新增、修复、能力缺口、升级步骤与回滚方式。 |
 | [`notes/archive/2026-10-19-demo-5-tab-regression-plan.md`](notes/archive/2026-10-19-demo-5-tab-regression-plan.md) | **已归档**：D6 追认 5-Tab 扩展 + 7 条冒烟口径已落地（`scripts/demo-smoke.mjs`），步骤 3（离线 seam）延迟。 |
 | [`notes/archive/2026-10-19-post-0.1.0-open-items-plan.md`](notes/archive/2026-10-19-post-0.1.0-open-items-plan.md) | **已归档**：0.1.0 后悬空的 D1–D6 与 T1–T9 已收口（结论并入规范 1.0.2 与 CHANGELOG），仅作「当时为什么这么做」的历史依据。 |
 | [`notes/archive/2026-10-12-consolidated-open-work-plan.md`](notes/archive/2026-10-12-consolidated-open-work-plan.md) | **已归档，但仍是 v0.1.0 的历史依据**：C01–C10 合同、LD1–LD8 决策、69 项去向，以及 §11 里 W00–W16 逐批的关闭记录（含偏差与剩余风险）。查「当时为什么这么做」来这里；判断当前该做什么不看它。 |
+| [`notes/archive/2026-10-19-pi-durable-migration-plan.md`](notes/archive/2026-10-19-pi-durable-migration-plan.md) | **已归档（2026-11-01）**：pi-coding-agent → pi-durable 迁移计划。步骤 1–10 全部执行完毕（详见合并执行计划）。MD1–MD10、OQ1–OQ8 决策已落成规范 Q21–Q38。 |
+| [`notes/archive/2026-10-20-audit-fix-plan.md`](notes/archive/2026-10-20-audit-fix-plan.md) | **已归档（2026-11-01）**：A01–A60 审计问题修复计划。全部 60 项已修复或移交迁移计划关闭（详见合并执行计划）。 |
 
 规范体量很大（8000+ 行），按需读章节而不是整篇：查投递行为看 §7，查表结构看 §11，查对外 API 看 §12，查不变量看 §22.1。
 

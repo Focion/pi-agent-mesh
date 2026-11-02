@@ -18,7 +18,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,7 +74,33 @@ function requireRun(cmd, argv, label) {
   ok(label);
 }
 function vitest(...argv) {
-  requireRun(process.execPath, [VITEST, "run", ...argv], `vitest run ${argv.join(" ")}`);
+  // A43：运行前校验写死的测试文件存在——改名/删除后 vitest 会按子串静默匹配 0 个文件，
+  // 不实际执行却仍 exit 0，必须先拦。
+  const fileArgs = argv.filter((a) => a.endsWith(".test.ts"));
+  const missing = fileArgs.filter((a) => !existsSync(join(ROOT, a)));
+  if (missing.length) fail(`测试文件缺失（vitest 会子串静默跳过）：${missing.join(", ")}`);
+
+  const label = `vitest run ${argv.join(" ")}`;
+  // json 报告落临时文件（不污染仓库），读回核对实际跑到的文件数（A43）。
+  const outDir = mkdtempSync(join(tmpdir(), "mesh-verify-report-"));
+  const report = join(outDir, "report.json");
+  const r = run(process.execPath, [VITEST, "run", "--reporter=default", "--reporter=json", `--outputFile.json=${report}`, ...argv]);
+  let reportJson = null;
+  try {
+    reportJson = JSON.parse(readFileSync(report, "utf8"));
+  } catch {
+    /* 报告缺失/损坏由下面兜底判定 */
+  }
+  rmSync(outDir, { recursive: true, force: true });
+
+  if (r.status !== 0) fail(`${label} 失败（exit ${r.status}）\n${r.stdout || ""}${r.stderr || ""}`);
+  if (!reportJson) fail(`${label}：无法读取 vitest json 报告。`);
+
+  const ran = [...(reportJson.testResults ?? [])].map((t) => (t.name ?? "").split("\\").join("/"));
+  const notRun = fileArgs.filter((a) => !ran.some((n) => n.endsWith(a)));
+  if (notRun.length) fail(`${label}：以下文件未被 vitest 实际执行：${notRun.join(", ")}`);
+  if ((reportJson.numTotalTestSuites ?? 0) === 0) fail(`${label}：未执行任何测试文件（numTotalTestSuites=0）。`);
+  ok(`${label}（${reportJson.numTotalTestSuites} 文件 / ${reportJson.numPassedTests ?? 0} passed）`);
 }
 
 // ── 各门 ─────────────────────────────────────────────────────────────────────
@@ -200,4 +226,10 @@ if (skipped) {
     `full 验证请去掉 --skip-* 重跑。\n`);
   process.exit(2);
 }
-process.stdout.write("\n✅ verify:local 全部通过（full，无 skip）。\n");
+// A43：--suite 只跑子集时不得宣称 full。
+const isFull = suites.length === 0 || flag("--all");
+if (isFull) {
+  process.stdout.write("\n✅ verify:local 全部通过（full，无 skip）。\n");
+} else {
+  process.stdout.write(`\n⚠ verify:local 通过（非 full：仅 --suite 子集 ${SELECTED.join(",")}）。\n`);
+}

@@ -8,77 +8,58 @@
 //    对端 poller 认领、handler 投递（收发路径正确）。
 //
 // C02：external 账号不 auto-warm、无 sink handler → NO_SINK_HANDLER park。
+//
+// durable 后端：真 PiStreamPort 直接吃 createPiSessionFactory({stateDir,models,model})
+// —— faux 已经挂在 models 上，无需再 registerFauxInto。流内容是真实 durable storage，
+// warm/outbox 只需真实建流，本用例不起轮，故 faux 不会被调用。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { createMesh } from "../../src/index.js";
 import type { MeshHost, SessionFactory } from "../../src/index.js";
-import { loadPiSdk } from "../../src/pi/pi-sdk.js";
+import { createPiSessionFactory } from "../../src/pi/session-factory.js";
 import { FakeStreamPort } from "../helpers/fake-stream-port.js";
-import { createFaux, registerFauxInto, type FauxCore } from "../helpers/pi-session.js";
+import { createFaux, type Faux } from "../helpers/pi-session.js";
 import { assertInvariants } from "../helpers/invariants.js";
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+// A45：轮询直到条件满足，替代固定 sleep（固定等待既慢又脆）。
+const waitFor = async (cond: () => boolean, ms = 5000): Promise<void> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise<void>((r) => setTimeout(r, 25));
+  }
+  throw new Error("waitFor: condition not met within " + ms + "ms");
+};
 
 const stubSessionFactory: SessionFactory = {
-  create: async () => ({ session: {}, piSessionId: "stub" }),
+  create: async () => ({ session: {}, runtimeRef: "stub" }),
   open: async () => ({ session: {} }),
 };
 
-async function createTestFactory(faux: FauxCore, dir: string): Promise<SessionFactory> {
-  const pi = await loadPiSdk();
-  return {
-    async create(ctx) {
-      const sm = pi.SessionManager.inMemory(join(dir, ctx.endpoint.id));
-      const { session } = await pi.createAgentSession({
-        cwd: dir,
-        agentDir: dir,
-        model: faux.getModel() as never,
-        noTools: "all",
-        sessionManager: sm,
-      });
-      registerFauxInto(session, faux);
-      return { session, piSessionId: `mem:${ctx.endpoint.id}` };
-    },
-    async open(ctx) {
-      const sm = pi.SessionManager.inMemory(join(dir, ctx.endpoint.id));
-      const { session } = await pi.createAgentSession({
-        cwd: dir,
-        agentDir: dir,
-        model: faux.getModel() as never,
-        noTools: "all",
-        sessionManager: sm,
-      });
-      registerFauxInto(session, faux);
-      return { session };
-    },
-  };
-}
-
 interface HostCtx {
   host: MeshHost;
-  faux: FauxCore;
+  faux: Faux;
 }
 
 async function makeHost(
   dbPath: string,
   transportOptions?: Parameters<typeof createMesh>[0]["transportOptions"],
 ): Promise<HostCtx> {
-  const cwd = join(dirname(dbPath), "sessions");
-  mkdirSync(cwd, { recursive: true });
+  const stateDir = join(dirname(dbPath), "sessions");
   const faux = await createFaux("faux-host");
-  const factory = await createTestFactory(faux, cwd);
+  const factory = createPiSessionFactory({ stateDir, models: faux.models, model: faux.model });
   const host = await createMesh({
     dbPath,
     policies: { sessionFactory: factory },
     transport: "sameHost",
     transportOptions,
-    limits: { handoffTimeoutMs: 5000 },
+    limits: {},
   });
   return { host, faux };
 }
@@ -146,7 +127,15 @@ describe("I01：写者统一后的同机归属（§19.3/§19.4）", () => {
       expect: "none",
       text: "跨进程 outbox",
     });
-    await sleep(400);
+    // 等对端 poller 认领并投递，直到给 B 的 outbox 全部 done（A45：固定 sleep 换 waitFor）。
+    await waitFor(() => {
+      const ro = new Database(dbPath, { readonly: true });
+      const rows = ro
+        .prepare("SELECT state FROM mesh_outbox WHERE target_endpoint = ?")
+        .all(epB) as Array<{ state: string }>;
+      ro.close();
+      return rows.length > 0 && rows.every((r) => r.state === "done");
+    });
     await flush();
 
     const ro = new Database(dbPath, { readonly: true });

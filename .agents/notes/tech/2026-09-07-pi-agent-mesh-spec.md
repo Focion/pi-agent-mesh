@@ -1,5 +1,5 @@
 ---
-title: Pi Agent Mesh 规范 v1.0.2
+title: Pi Agent Mesh 规范 v1.0.3
 date: 2026-09-07
 status: active
 owner: unassigned
@@ -9,6 +9,8 @@ related:
   - notes/archive/2026-10-19-post-0.1.0-open-items-plan.md
   - notes/archive/2026-10-13-mesh-llm-config-design.md
   - notes/archive/2026-10-13-pi-1.1.0-probe-findings.md
+  - notes/plan/2026-10-19-pi-durable-migration-plan.md
+  - notes/tech/2026-10-20-audit-rulings.md
 ---
 
 # Pi Agent Mesh
@@ -18,10 +20,11 @@ related:
 | 项 | 值 |
 |---|---|
 | 方案名 | **Pi Agent Mesh** |
-| 版本 | **1.0.2**（1.0.0 定稿 + 1.0.1 按 v0.1.0 实现回填 + 1.0.2 收口悬空差距，变更见附录 L.4） |
+| 版本 | **1.0.3**（1.0.0 定稿 + 1.0.1 按 v0.1.0 实现回填 + 1.0.2 收口悬空差距 + 1.0.3 durable 迁移与补偿退役，变更见附录 L.4） |
 | 状态 | 定稿（可发布）。核心功能面已冻结，扩展功能面按 §28.4 的 1.x 计划演进 |
 | 包名 | `@pi/agent-mesh`，内含两个模块 `mesh-core` / `mesh-pi` |
-| 依赖 | pi SDK（`@earendil-works/pi-coding-agent` `^1.1.0`，v0.1.0 起为直接依赖、惰性加载——见 §28.5/§29.2）、SQLite（better-sqlite3 或等价） |
+| 依赖 | pi SDK（`@earendil-works/pi-durable` `^1.3.0`，`@earendil-works/pi-ai` `^1.3.0`，`@earendil-works/chord` `^1.3.0`；v0.2.0 起为核心依赖，惰性加载保留——见 §28.5）、SQLite（better-sqlite3 或等价） |
+| 运行基线 | **Node ≥ 24**（`engines.node >=24.0.0`；pi-durable 的 `node:sqlite` 要求 ≥22.5，chord 要求 ≥23.10.0，综合取 ≥24） |
 | 语言 | TypeScript（ESM + CJS 双产物） |
 | 适用读者 | ① 要在 pi SDK 上搭多 Agent 系统的宿主开发者；② 本库的实现者与评审者；③ 运维与 SRE |
 
@@ -290,10 +293,11 @@ pi SDK 提供的是"一个能力很强的单 Agent"。要把它变成"一群能�
 
 ---
 
-## 2 平台基线：pi SDK 能力面
+## 2 平台基线：pi-durable 能力面
 
-本章是全方案的事实底座。每一条都对应一个已读到的签名或源码位置，不是推测；首次核实的探针版本是 `@earendil-works/pi-coding-agent@0.84.4`，**当前实现基线是 `1.1.0`**（v0.1.0 随 LD3 升级并重新核实，差异见 §2.3 末与 §28.5）。
-**这些是实现细节而非文档承诺**——pi 升一个小版本就可能变，所以 §23.5 有一层专门的「pi 契约测试」把它们锁住。
+本章是全方案的事实底座。**当前实现基线是 `@earendil-works/pi-durable@1.3.0` + `@earendil-works/pi-ai@1.3.0` + `@earendil-works/chord@1.3.0`**（v0.2.0 从 pi-coding-agent 迁移到 pi-durable）。迁移的详细设计见 [durable 迁移计划](notes/plan/2026-10-19-pi-durable-migration-plan.md)（MD1–MD10、OQ1–OQ8），审计裁决见 [审计裁决记录](notes/tech/2026-10-20-audit-rulings.md)（R1–R4）。pi-durable 的核心变化是用事务化 storage + `Harness.open` / `submit` / `root()` 取代 JSONL session 文件 + `AgentSession.sendCustomMessage`，使投递判据从"猜 entry 何时落地"切换到"submission 状态投影为权威"。
+
+§2.1–§2.2 保留 coding-agent 时代的能力实测记录，因为 pi-durable 的投递原语（`submit`）与 coding-agent 的投递原语（`sendCustomMessage`）存在结构性差异，旧记录仍然对理解为什么「补偿机制存在过」有价值。**§2.3（F1–F5）的补偿机制已在 v0.2.0 退役**——pi-durable 的 submission 模型提供了 `submissionStatus(id)` 精确读，不再需要 handoff 超时回退、entry 差分镜像、clearQueue 协议或自持 inFlight 计数。§2.4 的 StreamPort 接口也按新模型重写。
 
 ### 2.1 可用与不可用原语
 
@@ -445,19 +449,19 @@ const inContext = new Set(ctx.sessionManager.buildContextEntries().map(e => e.id
 2. **崩溃时重投是安全的**：分支 ①②④ 的滞留消息都在 pi 的进程内存里，而库与 pi 同进程，进程死则它们一起死——所以恢复时"`delivered` 但 `getEntry` 查不到 ⇒ 回退 `queued` 重投"不会产生重复。
 3. **合并必须发生在交给 pi 之前**：`steeringMode` / `followUpMode` 默认 `"one-at-a-time"`，每个 drain 点**只注入最老的一条**；而这两个 mode **`ctx` 上够不到，库改不了**，是宿主的构造期配置。往一条忙流连投 5 条 steer，下一个 drain 点只进 1 条。队列本身**无上限、无淘汰、无背压**（裸数组），所以要担心的不是溢出而是 drain 语义。
 
-### 2.3 五条已证伪机制（F1–F5）
+### 2.3 五条已证伪机制（F1–F5）—— v0.2.0 退役
 
-这五条是**负面知识**：曾经被当成机制写进设计、后被源码证伪的假设。保留在正式文档里的理由是它们全都"看起来合理、用错不报错"，一旦忘记就会被重新引入。
+以下五条是 pi-coding-agent 时代的**负面知识**。每条都是曾被当成机制写进设计、后被源码证伪的假设，并为弥补此差距引入了补偿代码（handoff 超时回退、entry 差分镜像、beforeClearQueue/I22 协议、inFlightCount 自持计数）。**在 pi-durable 迁移（v0.2.0）后，这些补偿机制已全部退役**——durable 的 `submit` / `submissionStatus` API 提供了权威的按 submission id 精确读，不再需要猜测 entry 是否已落地。
 
-| # | 被证伪的假设 | 它曾支撑的设计 | 改正后的做法 |
+| # | 被证伪的假设 | coding-agent 时代的改正 | durable 取代方式 |
 |---|---|---|---|
-| **F1** | `deliverAs: "nextTurn"` 是"随下次输入进上下文" | 四档投递里的 `nextTurn` 档 | **该档删除**。`_pendingNextTurnMessages` 全库只有一处消费点，位于 `prompt()` 构建提示词的过程中；而库从不调 `prompt()`（I19）⇒ 投给 `nextTurn` 的消息**永远不进上下文、永远不落盘、进程退出即丢失**，而 delivery 行会停在 `delivered` 却其实什么都没送到。本库只有三档：`steer` / `followUp` / `silent` |
-| **F2** | `AgentSettledEvent` 带载荷，可用它归因 `consumed` | `consumed` 的推进机制 | 载荷是空的 `{ type: "agent_settled" }` 且一次 run 只发一次 ⇒ 改用 **`entry_appended`（归因）+ `turn_end`（确认）** 两事件配对 |
-| **F3** | pi 的队列深度可观测，可用它做背压 | 背压与降档 | `pendingMessageCount` 对库消息恒为 0，**但 `clearQueue()` 能销毁它们** ⇒ 背压改为库自持 `inFlight` 计数；`clearQueue` 加 **I22** 的协议 + 检测双层防护 |
-| **F4** | 扩展层有 `findEntries` / `EntryQuery` / `afterSeq`，`SessionEntry` 有 `seq` | I22 的检测手段、崩溃恢复核对、镜像表定位、Q20 的权威划分 | 四者都不存在 ⇒ `StreamPort.hasEntries` 落到 `ctx.sessionManager.getEntry(id)`，**按 id 逐条问，无游标**，窗口是全历史 |
-| **F5** | `sendCustomMessage` 返回即落盘 | `delivered` 的判据 | 五分支里只有 ③⑤ 返回即落盘 ⇒ 判据改为 `entry_appended`；中间窗口留在 `queued` + `handoff_at`，超 `handoffTimeoutMs` 回退重投 |
+| **F1** | `deliverAs: "nextTurn"` 可用 | 删除该档，只用 steer/followUp/silent 三档 | durable 的 `submit({triggerTurn})` 是 input/write 正交控制，无需 `deliverAs` |
+| **F2** | `AgentSettledEvent` 带载荷 | 改用 entry_appended + turn_end 配对 | durable `submissionStatus(id)` 精确返回 `placed/done/unanswered`，`watch()` 提供整视图差分，不再依赖事件猜状态 |
+| **F3** | pi 的队列深度可观测 | 自持 inFlight 计数 + beforeClearQueue/I22 协议 | durable `submit` 在 entry 落盘前不返回 entryId；`port.status().inFlight` 由端口实现从 `pi.inbox` 深度真实读，库不自己维护 |
+| **F4** | 扩展层有 findEntries 游标 | hasEntries 按 id 逐条问 | 不变。durable 的 `entries()` 仍按 id 逐条查，无游标 |
+| **F5** | sendCustomMessage 返回即落盘 | 判据改为 entry_appended + handoff 超时回退 | durable `submit` 返回 `{submissionId, status}`；`deliver` 当场拿 submission 状态投影，`delivered` ← `status ∈ {placed, done}`（§9 F-A），不再需要 handoff 猜测 |
 
-**同构的第六个坑**（未编号，但同类）：`appendCustomEntry`（落 `type: "custom"`）与 `appendCustomMessageEntry`（落 `type: "custom_message"`）差一个词、行为相反，**且用错不报错**——`custom` 条目在盘上、查得到、就是永远不进上下文。任何"要被 Agent 看到"的投递都**不得**用 `appendCustomEntry`。
+本节保留在正文而非归档至附录的原因：它们解释「为什么旧代码里有那些补偿逻辑」，以及迁移步骤（迁 8–迁 9）中每一条删除动作背后的 F* 对应关系。库 v0.2.0 之后的读者无需关心这些机制，只需知道它们存在过并被取代。
 
 > **为什么这一节要进正式文档：** 这五条不是文档承诺，是实现细节。pi 升一个小版本就可能变。§23.5 的 pi 契约测试的职责因此不是"验证库对"，而是**在 pi 变了的那一刻立刻红一次**，避免库沿着一个已经失效的假设继续跑。每条契约测试的注释必须写明它保护的是哪条设计决定。这层测试要在 P0 第一周就跑起来（M-R30）。
 
@@ -475,9 +479,9 @@ const inContext = new Set(ctx.sessionManager.buildContextEntries().map(e => e.id
 | hook 覆盖矩阵（P2 / 崩溃恢复选点） | `agent_start`·`turn_*`·`message_*`·`agent_settled`·`agent_before_settle`·`context`·`context_with_system` 点亮；`entry_appended` 不覆盖 `sendCustomMessage`（只走 `appendCustomEntry`/boundary）；`before_agent_start` 只走用户 prompt 路径（I19 ⇒ 库永不触发）；provider HTTP 钩子（`before_provider_request` / `provider_stream_event`）在 faux 下不点亮，**不得**选作确认点 | `tests/pi/probe-hooks.test.ts` |
 | 磁盘 session 的 create / open（§8.6） | **确定**。`SessionManager.create()` 在 `newSession()` 即把 `getSessionFile()` 置为非空路径（`?? getSessionId()` 永不回退）；文件本体延迟到首条 user/assistant 消息后落盘；按同路径 `open()` 恢复同一 sessionId | `tests/pi/probe-disk-session.test.ts` |
 
-### 2.4 `StreamPort`：锁定的 10 个方法
+### 2.4 `StreamPort`：锁定的 11 个方法（v0.2.0）
 
-`StreamPort` 是 `mesh-core` 与 pi SDK 之间**唯一**的接口。它恰好 10 个方法，一个不多一个不少；`mesh-core` 对 pi 的全部依赖都收敛在这里。
+`StreamPort` 是 `mesh-core` 与 pi SDK 之间**唯一**的接口。v0.2.0 起由 durable 端口实现（`src/pi/durable-port.ts`），恰好 11 个方法，一个不多一个不少；`mesh-core` 对 pi 的全部依赖都收敛在这里。
 
 ```ts
 interface StreamPort {
@@ -485,10 +489,11 @@ interface StreamPort {
   evict(endpointId: string): Promise<void>;
 
   deliver(endpointId: string, rendered: string, envelope: Envelope, grade: Grade,
-          opts?: { triggerTurn?: boolean }): Promise<{ entryId?: string }>;
-        // ↑ 第五参不是 wake: boolean：grade（怎么投）与 triggerTurn（是否起一轮）正交（§7.1）。
-        //   entryId 可能为 undefined —— 对方在跑时消息先进 pi 的内存队列，条目还不存在（F5）。
-        //   ⇒ 调用方不得把 resolve 当作 delivered，判据是 onEntry（§7.9）。
+          opts?: { triggerTurn?: boolean; deliveryId?: string; attempt?: number })
+          : Promise<SubmissionHandle>;
+        // ↑ 返回 { submissionId, status, entryId? }（§9 F-A：input 型 status ∈ queued|placed|done，
+        //   write 型 status ∈ queued|done；placed/done 即 entry 已落盘 / 已进上下文）。
+        //   deliver() 的返回不代表 delivered——判据是 submissionStatus（§7.9）。
 
   nudge(endpointId: string, cue: string | CustomMessage,
         opts?: { deliverAs?: "steer" | "followUp"; triggerTurn?: boolean }): Promise<void>;
@@ -499,25 +504,40 @@ interface StreamPort {
 
   injectContext(endpointId: string, text: string): Unsubscribe;   // §7.6 P2 路径
 
+  submissionStatus(endpointId: string, submissionId: string): Promise<SubmissionRecord | null>;
+        // ↑ v0.2.0 新增：按 submission id 精确读 durable 的权威状态投影。
+        //   返回 {id, status∈queued|placed|done|unanswered, entryId?, type∈input|write}；
+        //   null = 未找到（submissionId 不存在于该端点）。
+
   status(endpointId: string): { state: EndpointState; busy: boolean; inFlight: number;
                                 idleMs?: number };
-        // ↑ inFlight 来自 mesh_deliveries 自持计数，不是 SDK 的 pendingMessageCount（F3）
-        //   idleMs 可选（v0.1.0 新增）：端点空闲时长，供 §15.2 派生 online / idle 用；
-        //   端口给不出时缺省，Presence 退回按端点状态派生
+        // ↑ inFlight 由端口实现从 pi.inbox 深度真实读，不是库自持计数（F3 已退役）
 
   hasEntries(endpointId: string, entryIds: string[]): Promise<Set<string>>;
-        // ↑ 返回其中"仍存在于该 stream"的子集。I22 存在性核对与崩溃恢复核对的唯一手段。
-        //   mesh-pi 侧实现 = entryIds.filter(id => ctx.sessionManager.getEntry(id) !== undefined)。
-        //   pi 侧没有 customType 过滤、没有 afterSeq 游标、SessionEntry 也没有 seq（F4），
-        //   所以这里是"按 id 逐条问"而不是"按游标增量拉"——这是接口只能长这样的原因，不是简化。
+        // ↑ 返回其中"仍存在于该 stream"的子集。崩溃恢复核对的辅助手段（durable entries() 按 id 逐条问）。
 
   onEntry(h: (e: { endpointId: string; entryId: string; parentId?: string;
-                   envelopeId?: string; rawJson: string }) => void): Unsubscribe;
-        // ↑ envelopeId 从 details 取出，是 delivered 归因的唯一依据（§7.9）
+                   envelopeId?: string; entryType: string; seqInStream: number;
+                   rawJson: string }) => void): Unsubscribe;
+        // ↑ envelopeId 从 details 取出，是 delivered 归因的辅助依据（§7.9）。
+        //   v0.2.0 增加了 entryType 与 seqInStream 字段以支持 durable 的 watch() 差分镜像。
 
   onTurnEnd(h: (e: { endpointId: string }) => void): Unsubscribe;   // §7.9 → consumed
+
+  dispose(): Promise<void>;
+        // ↑ v0.2.0 新增：强制卸载该端口管理的全部流（A21 close 强制卸载）。
 }
 ```
+
+**coding-agent 时代的差异（信息性，非规范要求）**：
+
+| 差异 | coding-agent（v0.1.0） | durable（v0.2.0） |
+|---|---|---|
+| `deliver` 返回 | `{ entryId? }`（entryId 可能为 undefined） | `SubmissionHandle { submissionId, status, entryId? }` |
+| delivered 判据 | `entry_appended` 事件（猜 entry 是否落地） | `submissionStatus(id)` 权威投影 |
+| 背压来源 | 库自持 `inFlightCount`（F3） | `port.status().inFlight`（端口实现从 real inbox 深度读出） |
+| entry 窗口 | `handoff_at` 时间 + `handoffTimeoutMs` 超时回退（F5） | submission 状态机：`queued` → `placed/done/unanswered`，无需超时猜测 |
+| 崩溃恢复 | hasEntries + handoff_at 双向核对 | submissionStatus 按 id 精确读（A03/A04） |
 
 > **为什么是 `onTurnEnd` 而不是 `onSettled`**：`agent_settled` 的 payload 是空的且一次 run 只发一次，无法回答"这一轮包含哪几条 delivery"（F2）。归因靠 `onEntry` 的 `envelopeId`，确认靠随后的 `onTurnEnd`。
 
@@ -1277,18 +1297,18 @@ inFlight(endpointId) = count(deliveries
 | `→ queued` | Mailbox 定档完成 | `deliveries(message_id, endpoint_id)` |
 | `→ parked` | 端口不可用（冷流、`exclusive` 租约被占、`EndpointSelector` 选不出端、`SinkHandler` 未注册、`StreamPort` 超时）——**等待重投，不是失败** | 同上 |
 | `parked → queued` | `warm()` 成功 / 租约释放 / 该账号下次被激活 / 宿主显式 `warm(endpointId)`；超过 `parkTtlMs` 则转 `dropped(TTL_EXPIRED)` | 同上 |
-| `→ delivered` | **`entry_appended`（拿到 `entryId`）** / `context` 注入完成 / `note()` 完成。**不是** `sendCustomMessage` 返回 | 同上 |
-| `→ consumed` | 该 endpoint 的 `turn_end`，且该轮期间此 delivery 已 `delivered`；`sink` / `external` 由 `markConsumed()` 推进 | 同上 |
+| `→ delivered` | `submissionStatus` 返回 `placed` 或 `done`（§9 F-A：input 型 `placed` 即 entry 已落盘/进上下文，write 型跳过 placed 直落 `done`）。**不是** `deliver()` 返回 | `deliveries(message_id, endpoint_id)` |
+| `→ consumed` | input 型：`submissionStatus` 返回 `done`（该轮完整结束，entry 已进最终 transcript）；write 型：`turn_end`（write 本轮完成）。`sink` / `external` 由 `markConsumed()` 推进 | 同上 |
 | `→ dropped(folded)` | 被折叠进摘要 | 同上 |
 | `→ dropped(reason)` | 带原因码（§7.10） | 同上 |
 
 **五处必须解释清楚的地方：**
 
-**① `delivered` 的判据是 `entry_appended`，不是 `sendCustomMessage` 返回**（F5）。五个分支里只有 ③⑤ 返回即落盘；②（对方在跑 + 唤醒）和 ④（对方在跑 + 不唤醒）都是先进 pi 的**进程内存队列**，分别到"下一个 drain 点"和"本轮结束"才落 JSONL。若以 resolve 为判据，库会在条目尚不存在时就宣称 `delivered`——而 `delivered` 是有下游承诺的（`consumed(partial)` 判定、指标、`beforeClearQueue` 回退范围）。所以：
-
-- `deliver()` 调用后、`entry_appended` 到达前，delivery **留在 `queued`**，另记一个 `handoff_at` 时间戳供诊断（**它不是状态**）；
-- 这段窗口内进程崩溃 ⇒ pi 的内存队列与库同生共死（同进程）⇒ 恢复时重投**不会重复**；
-- 窗口异常长（超过 `handoffTimeoutMs`，默认 30s）而 `entry_appended` 始终不来 ⇒ 计 `delivery_handoff_timeout` 并回退 `queued` 重投——这通常意味着对方那一轮永远不会结束（挂死）或宿主调了 `clearQueue()`。
+**① `delivered` 的判据是 `submissionStatus`，不是 `deliver()` 返回**（F5 已退役）。durable 的 `submit` 分两型：
+  - **input 型**（`triggerTurn: true`）：`deliver()` 返回 `{submissionId, status: "placed"}` → 即标记 `delivered`。`submissionStatus` 随后推进到 `done` → `consumed`。
+  - **write 型**（`triggerTurn: false`）：`deliver()` 返回 `{submissionId, status: "done"}` → 即标记 `delivered`。需要在下一个 `turn_end` 推进 `consumed`。
+  - 两种类型下，`deliver()` 的 promise resolve 都不代表 entry 已落地——`queued` 状态的 submission 表示 entry 尚在 durable inbox 中，待 subsequent processing 后进入 placed/done。
+  ⇒ 库在 `renderAndDeliver` 后立即读 `submissionStatus` 确认状态，按 §9 F-A 规则推进 delivered/consumed。
 
 **② `parked` 是必需的第五态。** 只有 `queued → delivered | dropped` 时，"冷流暂时没起来"和"这条消息永久失败"会落进同一个终态，重启后无法区分该不该重投。`parked` 是**非终态**，且**有 TTL**（`parkTtlMs`，默认 1h）——没有 TTL 的挂起等于静默丢失。
 
@@ -1296,9 +1316,9 @@ inFlight(endpointId) = count(deliveries
 
 **④ `consumed(partial)`**：接收方轮次被 `abort()` 打断。**库仍推进到 `consumed`**（消息确实进过上下文），但打上 `partial` 标记，宿主的下游判定可以据此决定要不要采用。**压缩不是 `partial` 的成因**——压缩只追加 `CompactionEntry`、不动已有 entry，被压缩的消息确实完整进过一次上下文。
 
-**⑤ 两条非常规回退边：**
+**⑤ `delivered → queued` 补偿边（v0.2.0 替代 I22）：**
 - `queue` 会话：`delivered → claimed → acked`，`claimed` 超时回 `queued` 供其他消费者重新竞争。这是**正常路径上**唯一允许 `delivered` 之后回退的类型，因为竞争消费的语义就是"没 ack 等于没消费"。
-- **`beforeClearQueue`（I22）对任意类型**都会把 `delivered` 未 `consumed` 的投递回退到 `queued`，因为 pi 的 `clearQueue()` 会销毁还没进 JSONL 的消息。这不是状态机的常规边，是宿主主动打断时的补偿边——实现时必须允许这条回退，否则 I22 无法落地。
+- **submission 对账重投**（替代 I22/beforeClearQueue）：崩溃恢复 (`reconcileDelivered`) 按 `submission_id` 读 `submissionStatus`，若返回 `unanswered`（无 entry）→ `delivered → queued` 重投并计 `queue_cleared_detected`。这是对账驱动的补偿边，取代 coding-agent 时代需要宿主配合的 `beforeClearQueue` 协议。A08 场景覆盖此路径。
 
 ### 7.10 原因码总表
 
@@ -2369,6 +2389,8 @@ CREATE VIRTUAL TABLE mesh_messages_fts USING fts5(
 
 `mesh_messages_fts` 用 `content=''`（外部内容表模式，不重复存正文）+ `tokenize='trigram'`。选 trigram 是因为它对中文做子串匹配不需要分词器，代价是索引体积较大；宿主**可以**在初始化时关闭全文检索（见附录 F），此时该表不创建。写入 fts 与写入 `mesh_messages` 在**同一事务**内。
 
+> **备注（A20）——FTS 表 rowid 是「非权威隐式 id」，宿主对库执行 `VACUUM` 会令全文索引错配。** 该表不回存正文（contentless），靠 `rowid` 关联到 `mesh_messages` 的**隐式 rowid**（回填语句 `INSERT INTO mesh_messages_fts (rowid, text) SELECT m.rowid, … FROM mesh_messages m`）。而 `mesh_messages.id` 是 `TEXT PRIMARY KEY`（**不是** `INTEGER PRIMARY KEY`），其隐式 rowid 由 SQLite 分配、非权威：`VACUUM`/`REINDEX`/转储重载这类重建库的操作会按新顺序重排行、改写隐式 rowid，导致 FTS 索引里的 `rowid` 与源表错配——`search` 要么漏检、要么命中错误消息。因此：**库自身从不执行 `VACUUM`**（§风险登记「WAL 文件膨胀」行同样禁止）；宿主在离线维护/迁移期若确实 `VACUUM` 过库文件，必须随后 `DROP TABLE mesh_messages_fts` 并靠启动时的 `reconcileFts` 回填重建，否则不得信任全文检索结果。
+
 不变量：
 - **I3**：`UNIQUE (conversation_id, seq)` —— 同会话 `seq` 严格递增无重复。这是最后一道保险，即使分配逻辑写错也只会插入失败，不会静默产生重复 `seq`。
 - **I4**：`UNIQUE (idempotency_key)` —— 同一条消息不被路由两次。
@@ -2402,7 +2424,7 @@ CREATE TABLE mesh_deliveries (
   redeliver_reason TEXT,                       -- 迁移 004：为何重投（§23.1 trace）
   parked_reason TEXT, parked_at TEXT,          -- parked 诊断与 parkTtl 判定
   note        TEXT,                            -- 定档留痕：不唤醒 / 降档的抑制原因（§23.1）
-  queued_at TEXT, handoff_at TEXT, delivered_at TEXT, consumed_at TEXT,
+  queued_at TEXT, delivered_at TEXT, consumed_at TEXT,
   state_changed_at TEXT NOT NULL,              -- 最近一次跃迁时刻
   UNIQUE (message_id, endpoint_id)             -- M5 后半：按 endpoint 而非 account
 );
@@ -2432,9 +2454,8 @@ CREATE INDEX ix_delivery_claim ON mesh_deliveries(state, claim_until)
 | `attempts` / `claim_until` | `queue` 竞争消费用（§17）。`claim_until` 覆盖**两个窗口**：`delivered` 时是"待领"窗口，`claimed` 时是"持有"窗口；任一到期都走回收（`attempts + 1` → 重投或死信） |
 | `claimed_by` / `claimed_at` | 领取者与领取时刻。**归属落在 delivery 行而不是消息正文**：早期实现用 `json_set(payload,'$.claim',…)` 改写正文，既违反消息不可变（I11）又让 `seal` 失效（§22.4 对 payload 取摘要）。`attempts` 兼作租约代次——回收 / 重投即 +1，旧代的 ack 不再被接受 |
 | `claim_error` | 末次 nack 的错误，死信时保留，供 §17.7 追溯"消费者是不是在同一条消息上反复崩溃" |
-| `note` / `redeliver_reason` | 两条**正交**的留痕轴，`observer.trace` 都会回传（§23.1）：`note` 解释"为什么这次不唤醒 / 降了档"（`mute` / `dnd` / `offline` / `no_cap` / `activation`），定档时写；`redeliver_reason` 解释"为什么又投了一次"（`entry_vanished` / `handoff_timeout` / `claim_timeout` / 原 `parked_reason`），重投站点写。定档**不得**覆盖重投原因 |
+| `note` / `redeliver_reason` | 两条**正交**的留痕轴，`observer.trace` 都会回传（§23.1）：`note` 解释"为什么这次不唤醒 / 降了档"（`mute` / `dnd` / `offline` / `no_cap` / `activation`），定档时写；`redeliver_reason` 解释"为什么又投了一次"（`entry_vanished` / `claim_timeout` / 原 `parked_reason`），重投站点写。定档**不得**覆盖重投原因 |
 | `parked_reason` / `parked_at` | `parked` 的诊断与 TTL 判定。`parked_at` + `parkTtlMs`（默认 1h）到期转 `dropped(TTL_EXPIRED)`——**没有 TTL 的挂起等于静默丢失** |
-| `handoff_at` | `deliver()` 已调用、`entry_appended` 尚未到达的时刻。**它不是状态**，delivery 此间仍留在 `queued`。超过 `handoffTimeoutMs`（默认 30s）计 `delivery_handoff_timeout` 并回退重投（§7.9①） |
 | `state_changed_at` | **NOT NULL**，最近一次跃迁时刻。回放 `InboxView`（§23）按它做时间过滤——没有这一列就只能靠四个分散的 `*_at` 猜"当时是什么状态" |
 
 四条索引各有明确用途：`ux_delivery_noep` 补 NULL 去重的漏；`ix_delivery_inflight` 是背压计数的唯一路径（`state IN ('queued','delivered')`）；`ix_delivery_parked` 服务 `parkTtlMs` 扫描；`ix_delivery_claim` 服务 claim 超时扫描，覆盖待领与持有两个窗口。三条部分索引都只覆盖少数活跃行，不随历史增长。
@@ -2595,11 +2616,11 @@ CREATE TABLE mesh_counters (                   -- Observer 指标（§23）
 
 | 字段 | 说明 |
 |---|---|
-| `name` | 计数器名。取值集合以附录 E 为权威（**23 个** = 16 行表内计数 + 7 个派生比值的分子分母），`devMode` 下写入未登记的名字直接抛错 |
-| `bucket` | **小时粒度**的时间桶（`YYYY-MM-DDTHH`）。选小时是成本与分辨率的折中：一天 24 行 × 23 个计数器 ≈ 550 行/天，足以画趋势又不需要清理策略 |
+| `name` | 计数器名。取值集合以附录 E 为权威（**22 个** = 15 行表内计数 + 7 个派生比值的分子分母），`devMode` 下写入未登记的名字直接抛错 |
+| `bucket` | **小时粒度**的时间桶（`YYYY-MM-DDTHH`）。选小时是成本与分辨率的折中：一天 24 行 × 22 个计数器 ≈ 550 行/天，足以画趋势又不需要清理策略 |
 | `value` | 只增。归零靠新桶，**不得**原地重置 |
 
-登记的计数器（权威表在附录 E）：`dedup_hit` `wake_throttled` `backpressure_downgrade` `seq_gap` `blind_write` `request_timeout` `invariant_violated` `fanout_warn` `inbox_overflow` `policy_degraded` `parked_total` `queue_cleared_detected` `delivery_handoff_timeout` `park_expired` `claim_timeout` `fold_events`；派生用的分子分母 `wake_per_message_idle` `wake_per_message_busy` `verbatim_copies` `messages_total` `deliveries_total` `silent_grade` `cold_hit`。
+登记的计数器（权威表在附录 E）：`dedup_hit` `wake_throttled` `backpressure_downgrade` `seq_gap` `blind_write` `request_timeout` `invariant_violated` `fanout_warn` `inbox_overflow` `policy_degraded` `parked_total` `queue_cleared_detected` `park_expired` `claim_timeout` `fold_events`；派生用的分子分母 `wake_per_message_idle` `wake_per_message_busy` `verbatim_copies` `messages_total` `deliveries_total` `silent_grade` `cold_hit`。
 
 计数器的写入与它所记录的状态跃迁**在同一事务内**——否则崩溃会让指标与账本永久对不上。
 
@@ -2806,7 +2827,6 @@ export interface MeshHost {
   nudge(endpointId: string, cue: string,
         opts?: { deliverAs?: "steer" | "followUp"; triggerTurn?: boolean }): Promise<void>;
   injectContext(endpointId: string, text: string): Unsubscribe;           // P2 钩子，§7.6
-  beforeClearQueue(endpointId: string): Promise<void>;                    // I22 协议，§7.9
 
   // ── 共享空间（§18）─────────────────────────────────────
   shared: {
@@ -4923,10 +4943,10 @@ PRAGMA wal_autocheckpoint = 1000;
 | 部署 | 建议值 | 理由 |
 |---|---|---|
 | 单进程 | `1000` ms | 只有进程内队列，理论上不该 busy；非零值仅用于兜底 checkpoint 抖动 |
-| 多进程同机（N ≤ 4） | `5000` ms（默认） | 单个写事务的目标是 < 10ms，5s 足够排队；同时远小于 `handoffTimeoutMs`（30s），不会把 busy 伪装成交接超时 |
+| 多进程同机（N ≤ 4） | `5000` ms（默认） | 单个写事务的目标是 < 10ms，5s 足够排队。交接基于 submission 状态机而非超时 |
 | 多进程同机（N > 4） | `5000` ms 不变，改为降低写频率 | 继续加大只会把冲突变成长尾延迟。此规模**应当**先合并写事务、或改用单进程内嵌 |
 
-上界原则：**`busy_timeout` 必须显著小于 `handoffTimeoutMs` 与 `policyTimeoutMs` 之外的任何业务超时**，否则一次锁等待会表现成一次假的投递失败，排障时指向错误的方向。`busy_timeout` 耗尽后的 `SQLITE_BUSY` **必须**作为写失败向上抛（`send` 抛错给调用方），**不得**静默丢弃或降级成 `parked`——发送方必须知道自己没成功。
+上界原则：**`busy_timeout` 必须显著小于 `policyTimeoutMs` 之外的任何业务超时**，否则一次锁等待会表现成一次假的投递失败，排障时指向错误的方向。`busy_timeout` 耗尽后的 `SQLITE_BUSY` **必须**作为写失败向上抛（`send` 抛错给调用方），**不得**静默丢弃或降级成 `parked`——发送方必须知道自己没成功。
 
 ### 19.6 故障场景与恢复动作
 
@@ -5201,12 +5221,12 @@ interface AccessControlPolicy {
 | **I19** | 库**不得**自己发起 LLM 轮次 | 构建期 + 代码结构：CI 检查库源码不 import 任何模型客户端，**且不得出现 `.prompt(`**；唯一可能触发轮次的出口是 `StreamPort.deliver({ triggerTurn })`，由 Mailbox 依 `activation` 结果填写 | CI 静态扫描；§23.5 集成层：`silent` 档位下 pi 侧不得产生新轮次 |
 | **I20** | 唤醒**必须**有速率上限 | 运行时：`mesh_inboxes.last_woke_at` + 唤醒规则 A3 强制降档（§7.3） | 附录 E 计数器：每消息平均唤醒数（目标 ≤1.2，分闲/忙统计）；§23.5 属性测试：洪泛输入下唤醒数不随消息数线性增长 |
 | **I21** | 九个策略槽**必须**都有超时与确定的降级方向；超时或抛错**必须**发 `policy_degraded` | 构建期 + 运行时：所有槽调用统一走 `withPolicyTimeout(slot, fn)`（`policyTimeoutMs` 默认 50ms）；CI 检查任何 `PolicySlots` 成员的调用点若绕过它则构建失败 | §23.5 单元层：为每个槽注入"慢 1s"与"抛错"两种桩，断言降级方向与 `policy_degraded { slot, reason, degradedTo }` 事件成对出现 |
-| **I22** | `clearQueue()` **不得**静默销毁库消息：宿主调 pi `clearQueue()` 前**必须**先调 `host.beforeClearQueue(endpointId)`，把 `delivered` 未 `consumed` 的投递回退为 `queued` | 协议（预防）+ 运行时（检测）：`deliver` 时记录 `entry_id`，下次投递前用 `StreamPort.hasEntries`（§2.2⑦）做存在性核对，缺失即自动回退并记 `queue_cleared_detected` | §23.5 集成层：不调 `beforeClearQueue` 直接清队列的场景，断言消息最终仍被消费一次，且计数器 `queue_cleared_detected` 自增 |
-| **I23** | mesh 的 `context` 钩子**必须**最后注册 | 运行时 + 测试：`mesh-pi` 安装时断言注册顺序，若发现其它扩展在 mesh 之后注册了 `context`，抛 `invariant_violated` | §23.5 回归测试**必须**长期盯住这条：pi 的 `context` 是 last-writer-wins 且对 `structuredClone` 生效（§2.4），**不能**靠优先级参数 |
+| **I22** | ~~退役~~（v0.2.0）。`clearQueue()` 不静默销毁库消息的协议曾在 coding-agent 时代必需（pi 的 `clearQueue()` 会摧毁未落盘消息，F3）。durable 的 `submit` 在 entry 落盘前不返回 entryId，`submissionStatus` 按 id 精确读，不再需要 `beforeClearQueue` 补偿。库 v0.2.0 不提供 `beforeClearQueue`，`delivered → queued` 回退边改为由 submission 对账（`unanswered` 无 entry）驱动 | 退役（机制性冗余） | A08：`queue_cleared_detected` 计数器保留，在 submission 对账检出 entry 消失时自增 |
+| **I23** | mesh 的 `context` 钩子**必须**最后注册 | 运行时 + 测试：durable 的 `watch()` 在安装 `context` 钩子时仍走注册顺序断言；durable 扩展模型下钩子覆盖的风险低于 coding-agent（durable 扩展按 `Extension` 工厂注册，优先级机制不同），但 I23 精神不变——mesh 的上下文注入**必须**不被其它扩展静默覆盖 | §23.5 回归测试**必须**长期盯住这条；`devMode` 下在每次 `context` 回调后校验 mesh 注入是否存活，不存活即发 `invariant_violated` |
 
 **I12 / I13 / I14 / I16 靠代码结构而不是运行时检查，这是最强的一类**，因为它让"违反"变成编译不过或根本没有 API 可调，而不是变成一条需要有人去看的告警。设计新不变量时的优先顺序**应当**是：能用代码结构表达就不用 CI，能用 CI 就不用 DB 约束，能用 DB 约束就不用运行时检查，运行时检查是最后手段。
 
-**I21 / I22 / I23 是一组，它们保护的都不是库内部一致性，而是"库对宿主的假设不被悄悄推翻"**——I21 保护策略槽接缝（宿主代码可能慢、可能崩、可能返回垃圾），I22 保护 pi 队列接缝（宿主可能清队列），I23 保护 pi 扩展接缝（第三方扩展可能覆写上下文注入）。前 20 条的失效表现为数据错乱，这三条的失效表现为**功能静默消失**：消息没送到、上下文没注入、策略从没生效过，而所有表看起来都是一致的。五条已证伪的 SDK 机制（F1–F5，§2.3）全部落在这类接缝上，所以这三条不是可选加固项，而是**必须**项。
+**I21 / I23 是一组，它们保护的都不是库内部一致性，而是"库对宿主的假设不被悄悄推翻"**——I21 保护策略槽接缝（宿主代码可能慢、可能崩、可能返回垃圾），I23 保护 pi 扩展接缝（第三方扩展可能覆写上下文注入）。前 20 条的失效表现为数据错乱，这两条的失效表现为**功能静默消失**：消息没送到、上下文没注入、策略从没生效过，而所有表看起来都是一致的。I22 在 v0.2.0 退役——durable 的 submission 模型消除了 clearQueue 静默销毁库消息的风险路径。
 
 按强制强度分组，23 条的分布是这样的——这张图比表格更能说明库的加固重心在哪：
 
@@ -5385,7 +5405,7 @@ key  = 由宿主提供，仅库进程内存持有，不落库
 | 不做 | 为什么不做 | 宿主该在哪一层补 |
 |---|---|---|
 | **内容审核 / 敏感词 / 注入分类器** | 内容判断是领域判断（M1），库没有领域知识；更重要的是它给出**虚假的安全感**——拦住大部分已知措辞会让宿主以为剩下的也被管住了，从而省掉「不给工具、收紧 `caps`」这些真正有效的动作（§22.3） | `accessControl` 槽（拒绝发送）或工具层（拒绝执行）。审核结果**可以**写进 `ext`，库照搬不解释 |
-| **速率限制到 API 粒度 / 用量计费** | 库只在两个**花钱**的点限流：唤醒（I20/A3）与 `@all`。其余操作（读收件箱、查历史、读共享对象）廉价，为它们加限流只增加复杂度和一类新的误伤，不改变成本曲线。计费需要价格模型与账户体系，两者都是宿主的知识 | 宿主的 API 网关或工具包装层做配额；库提供的 23 个计数器（附录 E）足以支撑外部计量 |
+| **速率限制到 API 粒度 / 用量计费** | 库只在两个**花钱**的点限流：唤醒（I20/A3）与 `@all`。其余操作（读收件箱、查历史、读共享对象）廉价，为它们加限流只增加复杂度和一类新的误伤，不改变成本曲线。计费需要价格模型与账户体系，两者都是宿主的知识 | 宿主的 API 网关或工具包装层做配额；库提供的 22 个计数器（附录 E）足以支撑外部计量 |
 | **端到端加密 / 传输层 TLS / 消息内容加密** | 攻击者能读 DB 就能读进程内的密钥，库层加密只是把明文搬了个位置；1.0.0 的 Transport 只支持同机多进程，走同一文件系统的 SQLite，TLS 无处安放（§19） | 真正需要机密性时**应当**加密整个 DB 文件（宿主 / OS 层，如全盘加密或 SQLCipher）；将来若有跨机器 Transport，由那个实现负责通道安全 |
 | **多租户强隔离** | 库提供的是**分区**（§22.2）不是**隔离边界**：宿主进程持有 DB 句柄、`seal` 密钥与 pi session 句柄，账号分区防的是误用不是攻击。声称支持多租户会让人把互不信任的租户放进同一个进程，而库无法承担那个承诺 | 一租户一进程 + 一个 DB 文件，靠操作系统做隔离；跨租户通讯用宿主自己的受控通道，不要靠一个共享的 mesh 实例 |
 | **审计签名链**（哈希链 / 防篡改日志） | `seal` 是逐条独立的 HMAC，能检测单条被改，**不能**检测整段被删（§22.4）。做真正的链式签名需要单调计数器、密钥轮换与外部锚定——那是一个审计系统的规模，不是消息库的职责 | 需要抗抵赖审计时，把库的 15 个事件（附录 C）导出到外部的 append-only 审计存储，在那里建链 |
@@ -5417,8 +5437,7 @@ SELECT * FROM (
     FROM mesh_messages WHERE id = :messageId
   UNION ALL SELECT 'queued', queued_at, account_id, endpoint_id, grade, woke, path,
          NULL                                    FROM d WHERE queued_at    IS NOT NULL
-  UNION ALL SELECT 'handoff', handoff_at, account_id, endpoint_id, grade, woke, path,
-         'deliver() 已调，entry_appended 未到'   FROM d WHERE handoff_at   IS NOT NULL
+  -- v0.2.0: handoff UNION 分支已退役（handoff_at 列删除）；提交状态通过 submission_id 查询
   UNION ALL SELECT 'parked', parked_at, account_id, endpoint_id, grade, woke, path,
          parked_reason                           FROM d WHERE parked_at    IS NOT NULL
   UNION ALL SELECT 'delivered', delivered_at, account_id, endpoint_id, grade, woke, path,
@@ -5517,9 +5536,9 @@ SELECT m.conversation_id, m.seq, d.grade, d.path,
 
 ### 23.3 计数器
 
-全部住在 `mesh_counters(name, bucket, value)`，按小时分桶，语义统一是"这件事发生了几次"。**本节这张表就是 `mesh_counters.name` 的完整取值集合，共 23 个**：16 个事件计数 + 7 个派生指标的分子分母。`devMode` 下写入未登记的名字直接抛错（同 `drop_reason` 的处理，§7.10）。读取入口 `observer.counters(names?, since?)`。
+全部住在 `mesh_counters(name, bucket, value)`，按小时分桶，语义统一是"这件事发生了几次"。**本节这张表就是 `mesh_counters.name` 的完整取值集合，共 22 个**：15 个事件计数 + 7 个派生指标的分子分母。`devMode` 下写入未登记的名字直接抛错（同 `drop_reason` 的处理，§7.10）。读取入口 `observer.counters(names?, since?)`。
 
-**A 组：16 个事件计数**
+**A 组：15 个事件计数**
 
 | 名称 | 语义 | 来源 | 正常区间 | 异常时看 |
 |---|---|---|---|---|
@@ -5538,7 +5557,6 @@ SELECT m.conversation_id, m.seq, d.grade, d.path,
 | `park_expired` | `parked` 超 `parkTtlMs` 转 `dropped(TTL_EXPIRED)` 的次数 | TTL 清扫（§7.9②） | 0 | §7.9：有投递彻底等丢了 |
 | `claim_timeout` | `queue` 领取后未 ack、租约到期被重新竞争的次数 | `claimed → queued`（§17） | 低 | §17：消费者在"领了不干" |
 | `queue_cleared_detected` | 存在性核对发现条目被 `clearQueue()` 销毁的次数 | `hasEntries` 核对（I22） | 0 | §7.9⑤：宿主绕过了 `beforeClearQueue`，库靠核对救回来了但不该常态化 |
-| `delivery_handoff_timeout` | 交给 pi 后 `handoffTimeoutMs`（默认 30s）内没收到 `entry_appended` 的次数 | 交接窗口超时（§7.9①） | 0 | §7.9①：三个可能——对方那一轮挂死、宿主调了 `clearQueue()`、或宿主 drain 语义是 `one-at-a-time` 且久无 drain 点 |
 
 `invariant_violated` 与 `policy_degraded` 是**唯二"必须 0"**的计数器：前者意味着代码或数据已经坏了，后者意味着宿主的策略实际上没在生效。其余计数器都是调优信号，不是错误信号——把它们全部当错误报警会淹掉这两个真正重要的。
 
@@ -6044,7 +6062,7 @@ Fold(k) = b_summary / (k · b)     # 折叠压缩比，k 越大收益越大
 
 症状 → 先看什么 → 调哪个旋钮 → 副作用。**副作用列必须一起读**——每个旋钮都在拿别的东西换成本。
 
-「看什么」一列只使用附录 E 登记的 23 个计数器名。**计数器只按小时分桶、没有标签维度**（附录 E），所以需要按会话、按原因、按成员拆分的诊断**必须**走 `mesh_deliveries` 的 SQL 或事件流（§12.5），本列已按此区分。
+「看什么」一列只使用附录 E 登记的 22 个计数器名。**计数器只按小时分桶、没有标签维度**（附录 E），所以需要按会话、按原因、按成员拆分的诊断**必须**走 `mesh_deliveries` 的 SQL 或事件流（§12.5），本列已按此区分。
 
 | 症状 | 看什么 | 调什么 | 副作用 |
 |---|---|---|---|
@@ -6062,7 +6080,7 @@ Fold(k) = b_summary / (k · b)     # 折叠压缩比，k 越大收益越大
 | `parked` 大量超期转丢弃 | `park_expired` | 提 `parkTtlMs`（1h），或修复导致长期 park 的根因 | 提 TTL 会让过期消息在真正投递时已经失去时效性 |
 | 流频繁 `warming ⇄ cold` 抖动 | `endpoint_state_changed` 事件频次（无对应计数器） | 提 `idleEvictMs`（10min → 30min） | 常驻内存上升；单进程能承载的账号数下降 |
 | `hot` 流数偏高、内存吃紧 | `select count(*) from mesh_streams where state='hot'`（gauge，库不提供计数器） | 降 `idleEvictMs` | 冷启动更频繁，首条消息延迟上升（要走 `warm`） |
-| 交接超时非零 | `delivery_handoff_timeout` | **先查 pi 侧**是否挂死；不要盲目提 `handoffTimeoutMs`（30s） | 提超时只会延长故障暴露时间 |
+| 交接超时（v0.2.0 已退役） | ~~`delivery_handoff_timeout`~~（v0.2.0 移除） | submission 状态机替代：`submissionStatus` 返回 `queued` 超过预期时长即异常 | 查 endpoint 是否 `busy` 或 `unavailable` |
 | 策略在悄悄失效 | `policy_degraded`（**正常区间必须 0**） | 优化该策略实现使其在 50ms 内返回；**不建议**提 `policyTimeoutMs` | 提超时会把投递路径的尾延迟直接放大到该值 |
 | `dedup_hit` 非零且多进程 | `dedup_hit` | 检查是否两个进程都认领了同一端点（`exclusive` 租约缺失，§19） | — |
 | `queue` 任务反复被回收 | `claim_timeout`，配 `mesh_deliveries.attempts` 分布 | 提 `claimTtlMs`（5min），或加大任务粒度减少消费者数 | 提租约会让真正崩掉的消费者占着任务更久 |
@@ -6218,7 +6236,7 @@ Fold(k) = b_summary / (k · b)     # 折叠压缩比，k 越大收益越大
 | Observer | 完全只读 + `PRAGMA query_only` 强制（§12.4） |
 | 轨迹 | `trace` 强制记 note；`replay`（**零 LLM 调用**，含 InboxView 重建与 `injected` 重建）；`forkAt` |
 | 断言 | 全部 16 条 SQL 可判定断言 C1–C16（§23.4） |
-| 计数器 | 全部 23 个计数器 + §24 的派生成本指标 |
+| 计数器 | 全部 22 个计数器 + §24 的派生成本指标 |
 | 开发模式 | `devMode` 额外检查 |
 | 多进程传输 | `SqliteOutboxTransport` + `mesh_outbox` 表 + `mesh_outbox` 工具 |
 | 事件 | 全部 15 个事件；**事件处理器抛异常不得影响投递** |
@@ -6659,7 +6677,6 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 | 旋钮 | 默认 | 作用 | 调大的后果 | 调小的后果 | 章节 |
 |---|---|---|---|---|---|
 | `policyTimeoutMs` | `50` | 九个策略槽**统一**的单次调用超时；超时按规定方向降级并发 `policy_degraded`（I21） | 扇出路径被宿主策略拖慢，且被放大 N 倍——群里一条消息要问 N 次 `DeliveryPolicy` | 正常策略被误判超时，系统悄悄跑在兜底逻辑上（`policy_degraded` 升高） | §20 |
-| `handoffTimeoutMs` | `30_000` | 交给 pi 之后等 `entry_appended` 的上限；超时记 `delivery_handoff_timeout` 并回退为 `queued` | 卡死的一轮长时间占住在途配额，收件人看起来"投出去了但没反应" | 对方轮次尚未结束就被判超时 ⇒ 重投 ⇒ 依赖幂等键去重（M5），`dedup_hit` 升高 | §7.9 |
 | `parkTtlMs` | `3_600_000` | `parked` 的存活上限；超过转 `dropped(TTL_EXPIRED)` 并记 `park_expired` | 投不出去的消息长期沉底，`parked_total` 不归零，占用在途配额 | 端点只是短暂不可用（重启、迁移）就把消息判死，真丢消息 | §7.9 |
 | `idleEvictMs` | `600_000` | 流空闲多久后驱逐（`waitForIdle` 之后释放；队列非空**不得**驱逐） | 常驻热流多、内存高；`cold_hit` 下降，`silent + cold` 的省钱路径失效 | 反复冷启动，每次热化都要重建上下文，延迟与 token 双升 | §8.3 |
 | `exclusiveLeaseTtlMs` | `60_000` | 独占租约的强制释放时限 | 持有者崩溃后其它进程等待更久才能接手 | 长时间 GC 停顿会被误判为持有者死亡 ⇒ **双写者**，这是最危险的一个方向 | §8.2 |
@@ -6703,7 +6720,7 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 | `maxHistoryOnJoin` | `number` | `0` | 入会时注入上下文的历史条数，**仅 `historyVisibility: "full"` 下有意义**。默认 0 = 不注入，因为"能查到"与"自动进上下文"是两件事 | §9.4 |
 | `openJoin` | `boolean` | `false` | `false` 时 `join()` 一律 `reject(JOIN_DENIED)`，只能被 `addMember` 拉进来 | §9.3 |
 
-**两个不是本库旋钮但会改变本库行为的宿主侧设置**，运维时必须知道它们的存在：pi 的 `steeringMode` 与 `followUpMode` 默认是 `"one-at-a-time"`，即每个 drain 点只注入一条待投消息；这两个设置在 `ctx` 上够不到，**库无法读取也无法设置**。后果是：往一条忙流连投 5 条，"投出去了"与"对方看到了"之间可能隔好几轮。库的对策是把折叠做在交给 pi **之前**（§7.6），使交出去的条数本身就少；运维侧的对策是建议宿主把两个 mode 设为 `"all"` 并承担"一轮里注入多条"的上下文代价。**库启动时若拿不到该配置，不得假设它是 `"all"`。** 观测信号是 `delivery_handoff_timeout` 与 `delivered` 相对 `queued(handoff_at 已设)` 的时差 p99。
+**两个不是本库旋钮但会改变本库行为的宿主侧设置**，运维时必须知道它们的存在：pi 的 `steeringMode` 与 `followUpMode` 默认是 `"one-at-a-time"`，即每个 drain 点只注入一条待投消息；这两个设置在 `ctx` 上够不到，**库无法读取也无法设置**。后果是：往一条忙流连投 5 条，"投出去了"与"对方看到了"之间可能隔好几轮。库的对策是把折叠做在交给 pi **之前**（§7.6），使交出去的条数本身就少；运维侧的对策是建议宿主把两个 mode 设为 `"all"` 并承担"一轮里注入多条"的上下文代价。**库启动时若拿不到该配置，不得假设它是 `"all"`。** 观测信号通过 `deliveries_total` 与投递延迟 p99 监控。
 
 ### 27.2 部署与容量
 
@@ -6795,13 +6812,13 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 | 3 | **唤醒风暴**：账单陡增，`每消息平均唤醒数` 突破 1.2 | `wake_per_message_idle` / `wake_per_message_busy`、`wake_throttled` | `busy` 分支非 0 = 对方在跑却另起了一轮（合并唤醒失效）；`idle` 分支高 = `ActivationPolicy` 太激进，或 Agent 在互相 `expect:"reply"` 形成回路 | 检查 `ActivationPolicy` 是否把 `mentions` 当唤醒判据（**唯一判据是 `expect`**，§7.3）；必要时调低 `wakeRateLimit`，但那是止血不是修复 |
 | 4 | **上下文爆掉**：单轮 token 异常高，或模型报上下文超限 | `verbatim_copies` / `messages_total`（目标 ≤3）、`原文率`（目标 <0.25） | `verbatimGapK` 或 `maxVerbatimConversations` 调得太大；或同一条消息被重复注入（镜像 + P2 + Renderer 各一份 = 3 份，再多就是重复） | 把两个预算旋钮调回默认；若 `每消息平均原文份数` > 3 则是**重复注入的 bug**（M5 的隐性违反），不是配置问题 |
 | 5 | **`seq_gap` 频发** | `seq_gap`，以及该会话 `mesh_messages` 的 `seq` 连续性 | 多进程下 Transport 乱序（正常，靠接收端排序吸收）；或有事务未提交/回滚留下空洞；或 `topic` 新订阅者的 `from_seq` 没设对，导致假缺口 | 偶发可忽略（`seqGapTimeoutMs` 会兜住）。持续升高时查是否有长事务；`topic` 场景查 `mesh_subscriptions.from_seq` |
-| 6 | **`delivery_handoff_timeout` > 0** | 该计数器 + `delivered` 相对 `handoff_at` 的时差 p99 | 三个可能：对方那一轮挂死；宿主调了 `clearQueue()`；宿主的 drain 语义是 `one-at-a-time` 且长时间没有 drain 点 | 先看 `queue_cleared_detected` 区分第二种；排除后建议宿主把 `steeringMode` / `followUpMode` 设为 `"all"`（27.1 末段）。**不要**先调大 `handoffTimeoutMs`——那只是让症状晚出现 |
+| 6 | **投递延迟异常**：消息在 `queued` 与 `delivered` 之间停留时间过长 | `deliveries_total` + 投递延迟 p99 | 对方 agent 处理慢；宿主的 drain 语义是 `one-at-a-time` 且长时间没有 drain 点；或对方端点不在线 | 建议宿主把 `steeringMode` / `followUpMode` 设为 `"all"`（27.1 末段）。<br/>**v0.2.0 注意**：`delivery_handoff_timeout` 计数器与 `handoffTimeoutMs` 字段已在 v0.2.0 退役——投递不再基于超时猜测。 |
 | 7 | **`policy_degraded` 频发** | 该计数器 + 各槽耗时 p99 | 某个策略槽超过 `policyTimeoutMs`：常见是策略里做了 I/O、查了数据库、或调了模型 | 策略槽**必须**是纯计算或纯内存查表。修策略，**不要**调大 `policyTimeoutMs`——扇出路径上这个值会被放大 N 倍 |
 | 8 | **抢不到锁 / endpoint 变 `unavailable`** | `endpoint_state_changed` 事件、`.lock` 文件、§23.4 的"锁一致"断言 | 另一个进程持有该 endpoint 的 stream 锁；或上次进程崩溃后锁未释放 | 判据**必须**是"进程真的不存在"（`kill -0` 失败）才能强制接管，**绝不"顺手接管"**（M3）。库拒绝启动该 endpoint 是正确行为，不是 bug |
 | 9 | **SQLite 写锁竞争**：投递延迟上升但 CPU 空闲 | 事务等待时间、`SQLITE_BUSY` 频率 | 单写者队列是唯一全局串行点；常见诱因是大群扇出、共享对象过大、或运维脚本在跑全表 `DELETE` | 确认扇出在单事务内批量插入；把裁剪移到低峰期分批；大对象拆小（`sharedObjectMaxBytes`）；必要时把广播场景改用 `topic` |
 | 10 | **库文件膨胀** | 按表统计行数与页数 | 九成情况是 `mesh_stream_entries`（`raw_json` 全量）或 `mesh_shared_versions`（版本无限） | 按 27.3 配裁剪，逐条对照"不得破坏的六样东西"；`VACUUM INTO` 到新文件回收空间（原地 `VACUUM` 会长时间持锁） |
 | 11 | **折叠过于激进**：Agent 总说"我只看到摘要" | `fold_events`、`inbox_overflow` | `maxPending` / `maxPendingBytes` 太小；或对方消费太慢导致在途长期贴着上限 | 区分两者：`inbox_overflow` 高 = 消息量超过消费能力（要减源头）；`fold_events` 高而 `inbox_overflow` 不高 = 阈值配小了（要调阈值） |
-| 12 | **重启后消息重复** | `dedup_hit` | 恢复时把 `delivered` 的投递回退重投了——这是**设计内行为**，重复由幂等键在应用侧吸收（M5） | `dedup_hit` 偶发正常；持续升高说明 `handoffTimeoutMs` 太短或恢复核对没问到 pi（自定义 `StreamPort` 会让核对失效，§2.4） |
+| 12 | **重启后消息重复** | `dedup_hit` | 恢复时把 `delivered` 的投递回退重投了——这是**设计内行为**，重复由幂等键在应用侧吸收（M5） | `dedup_hit` 偶发正常；持续升高说明恢复核对没问到 pi（自定义 `StreamPort` 会让核对失效，§2.4） |
 | 13 | **重启后消息丢失** | `queue_cleared_detected`、`park_expired`、`invariant_violated` | ① 宿主绕过 `beforeClearQueue()` 直接调了 `clearQueue()`，销毁了库已投递的消息（I22）；② `parked` 等满 TTL 被判死 | ①：库靠 `hasEntries` 存在性核对能救回来，但**不该常态化**——修宿主的调用协议；②：调大 `parkTtlMs` 或修好端点选择。**真丢消息是唯一违反核心承诺的故障类别，必须查到根因** |
 | 14 | **请求永远等不到应答** | `request_timeout`、`mesh_pending_acks` 里 `state='open'` 的行 | 设施 Agent 响应慢（`ackTimeoutMs` 太短）；或它根本没在听（`initiate` 白名单挡住了它的应答）；或应答的 `correlationId` 配错 | 查 §23.4 的"待应答无泄漏"断言；确认设施账号的 `initiate` 含 `"response"`（I7） |
 
@@ -7647,7 +7664,7 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `LEASE_HELD` | 目标 Endpoint 被 `exclusive` 租约占用（应答期间不许插话） | Mailbox（§8.2） | 同上；租约释放后立即回 `queued` | 正常。若长期不释放，检查 `exclusiveLeaseTtlMs`（默认 60s）是否被调得过大——租约**必须**有超时 |
 | `NO_SINK_HANDLER` | 目标是 `sink` 但宿主未 `registerSinkHandler` | Mailbox（§6.3） | 同上 | **宿主装配缺陷**：注册 handler 后积压会自动重投。启动自检里应当覆盖这一项 |
 | `SINK_REFUSED` | sink 连续拒收 | `SinkHandler` 返回值 | 同上 | 查下游（UI / 真人通道）是否离线或过载。这条区别于 `NO_SINK_HANDLER`：handler 在，但它说"现在不行" |
-| `PORT_TIMEOUT` | `StreamPort` 调用超时 | `Stream` / `StreamPort` | 同上 | 结合 `delivery_handoff_timeout` 与 `handoffTimeoutMs`（默认 30s）判断对端那一轮是否挂死 |
+| `PORT_TIMEOUT` | `StreamPort` 调用超时 | `Stream` / `StreamPort` | 同上 | 通过 `submissionStatus` 检查该端点当前状态；持续 PAT 说明对端挂死 |
 | `NO_SESSION` | 造 session 失败（宿主的 `SessionFactory`，或库按 `llm` 装配的那个） | `SessionFactory` | 同上，但该 Endpoint 的**全部**投递都会堆积 | **唯一要告警的 `parked` 原因。** 它意味着该 Endpoint 完全无法承接投递，积压只会单向增长；不修就等着 1h 后成批 `TTL_EXPIRED` |
 
 ### `dropped(reason)`——八个
@@ -7697,7 +7714,7 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 
 ## 附录 E 计数器表
 
-`mesh_counters` 的 `name` 列取值集合以本附录为权威（§11.7 的 DDL 注释指向这里）：**共 23 个**——E.1 的 16 个表内计数行，加 E.2 里作为派生指标分子/分母的 7 个。写入未登记的名字在 `devMode` 下直接抛错，理由与原因码相同（附录 D）：一个没登记的计数器名等于一类永远没人看的指标。
+`mesh_counters` 的 `name` 列取值集合以本附录为权威（§11.7 的 DDL 注释指向这里）：**共 22 个**——E.1 的 15 个表内计数行，加 E.2 里作为派生指标分子/分母的 7 个。写入未登记的名字在 `devMode` 下直接抛错，理由与原因码相同（附录 D）：一个没登记的计数器名等于一类永远没人看的指标。
 
 全部计数器**按小时分桶**（`bucket` 为 `YYYY-MM-DDTHH`），语义统一是"这件事在这个小时里发生了几次"，单调不减、只增不改。**没有 gauge、没有直方图**——需要分位数的宿主自己从事件流（§12.5）里算，库不承担时序数据库的职责。
 
@@ -7720,7 +7737,6 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `park_expired` | 计数 | `parked` 超 `parkTtlMs` 转 `dropped(TTL_EXPIRED)` 的次数 | `parked_at` 超期扫描 | 0 | §7.9 |
 | `claim_timeout` | 计数 | `queue` 领取后未 `ack`、租约到期被重新竞争的次数 | `claim_until < now` 且状态仍 `claimed` | 低 | §17 |
 | `fold_events` | 计数 | 折叠动作实际执行的次数 | 折叠流程完成一次 | 低 | §7.5 |
-| `delivery_handoff_timeout` | 计数 | 交给 pi 后 `handoffTimeoutMs` 内未收到 `entry_appended` 的次数 | `handoff_at` 超期且无 `entry_id` | 0 | §7.9① |
 
 三条读表规则：
 
@@ -7798,7 +7814,6 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `requestChainMaxDepth` | number | `8` | 层 | 同步请求链的最大深度，超出 `reject(REQUEST_CYCLE)` 并带 `detail: "depth_exceeded"`——即使无环，逐层累加的等待也会撑破 `exclusiveLeaseTtlMs` | 1–64 | §14.5 |
 | `maxAttempts` | number | `3` | 次 | `queue` 重投上限，耗尽落 `dropped(MAX_ATTEMPTS)` | 1–100 | §17 |
 | `policyTimeoutMs` | number | `50` | 毫秒 | **九个策略槽统一超时**（I21）。超时按规定方向降级并**必须**发 `policy_degraded` | 1–1000 | §20、§12.1 |
-| `handoffTimeoutMs` | number | `30000` | 毫秒 | `deliver()` 后等 `entry_appended` 的上限，超时回退 `queued` 并记 `delivery_handoff_timeout` | 1000–600000 | §7.9① |
 | `sweepIntervalMs` | number | `30000` | 毫秒 | 运行期周期清扫的间隔（`parked` TTL、claim 回收、outbox 对账、sink 退避重投）。**调度不重叠**：上一轮未跑完就跳过本轮；`close()` 停表 | `0`（禁用）或 1000–86.4×10⁶ | §7.9② |
 | `sinkBackoffBaseMs` | number | `1000` | 毫秒 | `SinkHandler` 拒收后的首次退避间隔，之后按 `base × 2^(attempts−1)` 指数增长 | 1–86.4×10⁶ | §21.2 |
 | `sinkBackoffMaxMs` | number | `30000` | 毫秒 | 退避间隔上限——**指数退避必须有上限**，否则一次长时间下线会让恢复后的首投延迟到不可接受 | ≥`sinkBackoffBaseMs`，≤86.4×10⁶ | §21.2 |
@@ -7850,7 +7865,7 @@ injectContext(endpointId: string, text: string): Unsubscribe;
 | `followUpMode` | pi 侧构造期配置 | `"one-at-a-time"` | 同上。队列本身无上限、无淘汰、无背压，所以背压计数**必须**由库自持（F3） | §7.8 |
 | `topology` | 每个 Endpoint 注册时指定 | `"unified"` | 三值之一（`unified` / `perConversation` / `pooled`）。**注册后不得改**——改拓扑的正确做法是废弃旧 endpoint、新建一个（I2） | §8.1 |
 
-`steeringMode` / `followUpMode` 若被宿主改成批量 drain 语义，库的顺序保证**不受影响**（顺序由 `seq` 与连续段判定保证，不依赖 drain 粒度），但 `delivery_handoff_timeout` 的正常区间会变——批量 drain 下 handoff 窗口更短。这是集成时**必须**确认的一项（§26）。
+`steeringMode` / `followUpMode` 若被宿主改成批量 drain 语义，库的顺序保证**不受影响**（顺序由 `seq` 与连续段判定保证，不依赖 drain 粒度）。在 v0.2.0 中投递不再依赖超时猜测，因此 drain 粒度对投递可靠性没有直接影响。批量 drain 仅影响代理人感知延迟。这是集成时**必须**确认的一项（§26）。
 
 ### F.5 命名对照
 
@@ -8046,7 +8061,6 @@ CREATE TABLE mesh_deliveries (
   claimed_by    TEXT, claimed_at TEXT, claim_error TEXT,   -- 迁移 003（§17）
   redeliver_reason TEXT,                              -- 迁移 004：为何重投（§23.1）
   parked_at TEXT, queued_at TEXT, delivered_at TEXT, consumed_at TEXT,
-  handoff_at    TEXT,                                 -- deliver() 已调、entry_appended 未到
   state_changed_at TEXT NOT NULL,                     -- 最近一次跃迁时刻（回放过滤列）
   note          TEXT,                                 -- 非默认决策的原因（§23.1）
   UNIQUE (message_id, endpoint_id)                    -- M5 后半：按 endpoint 而非 account
@@ -8146,7 +8160,7 @@ CREATE TABLE mesh_outbox (                      -- SqliteOutboxTransport 用（�
 );
 CREATE INDEX ix_outbox_ready ON mesh_outbox(state, delivery_id) WHERE state = 'ready';
 
-CREATE TABLE mesh_counters (                    -- name 的取值集合见附录 E（23 个）
+CREATE TABLE mesh_counters (                    -- name 的取值集合见附录 E（22 个）
   name   TEXT NOT NULL,
   bucket TEXT NOT NULL,                         -- 小时粒度：YYYY-MM-DDTHH
   value  INTEGER NOT NULL DEFAULT 0,
@@ -8527,7 +8541,7 @@ pi session 的条目是**单会话视角**的，问不出"这条消息在 7 个�
 | 平台依赖 | `@earendil-works/pi-coding-agent` **`^1.1.0`**（直接依赖、惰性加载，§29.2）；Node.js **≥ 22.19.0** |
 | 存储依赖 | SQLite（better-sqlite3 或等价），需 fts5 支持 |
 | 实现语言 | TypeScript（ESM + CJS 双产物） |
-| 冻结范围 | 三档投递、投递状态机、原因码、15 个事件、17 张表 + 1 张 FTS 表、九个策略槽、`StreamPort` 的 10 个方法、23 个计数器、14 个 Agent 工具 |
+| 冻结范围 | 三档投递、投递状态机、原因码、15 个事件、17 张表 + 1 张 FTS 表、九个策略槽、`StreamPort` 的 10 个方法、22 个计数器、14 个 Agent 工具 |
 
 "定稿"的含义是：上述冻结范围内的接口与语义在 1.x 内**不得**做破坏性变更；表结构**只加列不改列、不删列**（M-R25）。冻结范围之外的部分（渲染、摘要实现、开放问题 O1–O8）可在 1.x 内演进。
 
@@ -8569,9 +8583,11 @@ pi session 的条目是**单会话视角**的，问不出"这条消息在 7 个�
 
 | 版本 | 日期 | 状态 | 变更 |
 |---|---|---|---|
-| **1.0.0** | 2026-09-06 | 定稿 | **首个发布版本。** 完整规定：三档投递与档位映射矩阵、投递状态机（含 `parked` 旁路非终态）、三类互不复用的原因码、`expect` 作为唤醒唯一判据、投递集 = 未读集、溢出折叠、三条进上下文路径、四种会话形态、三种流拓扑、九个策略槽与统一 50ms 超时的定向降级、八个组件与两个横切层、`StreamPort` 的 10 个方法、17 张表 + FTS、15 个事件、23 个计数器、16 条 SQL 断言、14 个 Agent 工具、23 条不变量、20 条决策记录、30 条风险、8 条开放问题 |
+| **1.0.0** | 2026-09-06 | 定稿 | **首个发布版本。** 完整规定：三档投递与档位映射矩阵、投递状态机（含 `parked` 旁路非终态）、三类互不复用的原因码、`expect` 作为唤醒唯一判据、投递集 = 未读集、溢出折叠、三条进上下文路径、四种会话形态、三种流拓扑、九个策略槽与统一 50ms 超时的定向降级、八个组件与两个横切层、`StreamPort` 的 10 个方法、17 张表 + FTS、15 个事件、22 个计数器、16 条 SQL 断言、14 个 Agent 工具、23 条不变量、20 条决策记录、30 条风险、8 条开放问题 |
 | **1.0.1** | 2026-10-19 | 定稿 | **按 v0.1.0 实现回填，无新增功能面。** 平台基线 0.84.4 → `^1.1.0` 并登记 `agent_settled.aborted`、三个生产确认点（§2.3 末、§28.5、§29.2、附录 L.1）；pi 由 optional peer 改为直接依赖 + 惰性加载（§29.2）；`createMesh` 入参拆成 `MeshOptions`（core）与 `CreateMeshOptions`（包根，含 `llm` / `runtime`），`sessionFactory` 在包根变为二选一（§12.1、§12.3、§20.1、附录 H）；`MeshOptions` 补 `transportOptions` / `fts` / `walMaxBytes` / `mentionAllCap` / `busyTimeoutMs` / `recoverDeadEndpoints` / `seal`（§12.1、附录 F.2）；`MeshHost` 补 `setTopic` / `reclaimEndpoint`，`shared.*` 签名按实现回填（§12.2）；`Limits` 26 → 30 项（§12.1、附录 F.1、附录 H）；三张表补 7 列 + `ix_delivery_claim` 扩成两态，迁移模型改为"世代号 + 逐脚本盖章"（§11.1、§11.4、§28.3、附录 G）；`mute` 由 `dropped(MUTED)` 改为"保留 Inbox + 强制 `silent` + 不唤醒"（§7.10、附录 D）；C3 断言给 `partial = 1` 开例外、C10 改活 owner 判定（§23.4）；`forkAt` 标记为 unsupported、`replay` 收窄为基础转写（§12.4）；§12.6 补 ⑥⑦ 两组公共类型（端口 / 工具面辅助投影、LLM 与运行时配置）。**两处已知实现差距**（9 个事件缺 `endpointId`、`wake_per_message_busy` 无自增点）在正文就地标注并登记进 `notes/archive/2026-10-19-post-0.1.0-open-items-plan.md`，**未**改写规范要求 |
 | **1.0.2** | 2026-10-19 | 定稿 | **收口 0.1.0 之后的规范差距（D1/D2/D3、T2/T3/T8/T9）。** D1：§12.5 事件 `endpointId` 由「每个事件都携带（硬要求）」收窄为「带端点语义的事件才携带」——6 个端点半身事件保留 `endpointId`，其余 9 个事件归因到 `accountId`/`by`/`from`（附录 C 同步）；D2：§12.6⑤ 删除 `MeshEvent`/`MeshEventMeta` 判别联合（破坏性，配套 `notes/changelog/2026-10-19-v0.1.0-open-items.md`）；D3：附录 E 恢复 `wake_per_message_busy` 自增点（`renderAndDeliver` 在「醒来但 busy」时 +1 的 canary）；T2：C15 断言与 §12.2 管理员护栏统一盯 `setCaps`（附录 D 的 `NO_ADMIN_LEFT` 同步）；T3：§7.10/§9.5 静音冷流语义由 `silent+cold → parked` 改为「只写 Inbox，delivery 留 queued，不 park 不丢正文」；T8：附录 F.1 `outboxDoneRetentionMs` 标注保留窗口起算点是 `claimed_at` 而非精确 `done_at`；T9：§14.4 `abandoned` 的「发起方账号注销」分支标注无触发路径 |
+
+| **1.0.3** | 2026-10-26 | 定稿 | **durable 迁移与补偿退役（v0.2.0）。四类破坏性变更，三种补偿机制删除。** 平台基线从 pi-coding-agent@1.1.0 迁移到 pi-durable@1.3.0 + pi-ai@1.3.0 + chord@1.3.0（MD1–MD10、OQ1–OQ8 落成决策编号 Q21–Q38，见下文）；运行基线抬至 Node ≥ 24（`engines.node >=24.0.0`）。**StreamPort 契约重构（§2.4）**：方法数 10→11，`deliver` 返回 `SubmissionHandle {submissionId, status, entryId?}`（取代 `{entryId?}`）；新增 `submissionStatus(endpointId, submissionId)` 权威投影读；新增 `dispose()` 强制卸载（A21）。**投递判据改读 submission（§7.9）**：`delivered` 判据从 `entry_appended` 事件改为 `submissionStatus` 返回 `placed`/`done`（§9 F-A）；`consumed` 按 input/write 两型分流；崩溃恢复（§8.4）从 `hasEntries` + handoff_at 双向核对改为 `submissionStatus` 按 id 精确读（A03/A04）。**补偿机制退役（F1–F5，§2.3）**：handoff 超时回退（F5）、entry 差分镜像（F2）、`beforeClearQueue`/I22 协议（F3）、`inFlightCount` 自持计数（F3）全部删除；I22 标记为退役，`delivered→queued` 补偿边改为由 submission 对账（`unanswered` 无 entry）驱动（A08/A09）。**端点标识重构（迁 5）**：`piSessionId`→`runtimeRef`（`{storagePath, conversationId}` 的 JSON 包装）；增量子迁移 `005_runtime_ref.sql` 随后并入基线 `000_init.sql`（`mesh_endpoints.pi_session_id`→`runtime_ref`，`mesh_deliveries` 加 `submission_id`/`attempt`，`mesh_stream_entries` 主键改 `(runtime_ref, entry_id)`）；`RuntimeRef` 类型公开导出 + `decodeRuntimeRef`/`encodeRuntimeRef` 辅助函数。**后续收口（2026-11-01）**：`handoffTimeoutMs`（RuntimeLimits）/`handoffAt`（DeliveryTrace）随后完全移除（类型、校验、默认值、observer 内部行类型、~25 测试文件）；`handoff_at` 列从 `mesh_deliveries` DDL 删除（基线 `000_init.sql`）；`delivery_handoff_timeout` 计数器移除；`handoffTimeoutMs` 运行时限制移除；增量迁移 001–005 并入基线，不再独立维护。**规范裁决落文（R1–R4）**：R1 cursor_seq 高水位（消费推进不越过非终态 seq）；R2 folded_to_seq 权威（由 fold 路径落盘，恢复只读不修）+ SCHEMA_VERSION 未知迁移戳拒绝；R3 根入口值导出 MeshRejectError + tsup splitting 统一类身份；R4 §5.2 投递集优先（定向消息非收件人不可见，附录 J O2 从「未决」改「已决」）。**安全加固（步骤 2–8）**：A01 多端点反查按 endpoint_id 定位；A02 fanout 逐收件人 try/catch + sweep routed 滞留重投；A11 outbox 状态回写带 CAS；A15 FTS 写回退；A22 能力校验前移抢锁前 + 装配回滚；A26 全写入口 assertOpen + close 等在途 sweep；A30 定向可见性过滤；A32 建群准入夹紧；A33 outbox 回源验签；A34 渲染转义 + shared ACL + 大小上限。**破坏性变更（四条合并）**：① `engines.node >=24`；② `RuntimeConfig.resources` 废弃（显式抛错）；③ `piSessionId`→`runtimeRef`（API 改名，历史数据通过迁移脚本升级）；④ coding-agent JSONL session 文件不平移（v0.1.0 的历史 session 不能在 v0.2.0 上直接恢复）。详见 `CHANGELOG.md`。 |
 
 1.0.0 之后的版本记录追加在此表，格式不变。1.x 的功能路线见 §28.4，其中开放问题 O1–O8 的预计版本见附录 J。**破坏性变更**若不可避免，**必须**在此表标注并给出迁移脚本（§28.3）。
 

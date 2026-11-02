@@ -134,19 +134,19 @@ describe("registry branch coverage：endpoint 拓扑投影", () => {
     store.close();
   });
 
-  it("registerPooledEndpoints 按槽位写入 piSessionIds", async () => {
+  it("registerPooledEndpoints 按槽位写入 runtimeRefs", async () => {
     const { store, registry } = makeRegistry();
     await seedAccount(registry, "A");
     const eps = await registry.registerPooledEndpoints("A", 2, "none", ["pi-0", "pi-1"]);
-    expect(eps.map((e) => e.piSessionId)).toEqual(["pi-0", "pi-1"]);
+    expect(eps.map((e) => e.runtimeRef)).toEqual(["pi-0", "pi-1"]);
     store.close();
   });
 
-  it("registerPooledEndpoints 省略 piSessionIds → piSessionId null", async () => {
+  it("registerPooledEndpoints 省略 runtimeRefs → runtimeRef null", async () => {
     const { store, registry } = makeRegistry();
     await seedAccount(registry, "A");
     const eps = await registry.registerPooledEndpoints("A", 1);
-    expect(eps[0]!.piSessionId).toBeNull();
+    expect(eps[0]!.runtimeRef).toBeNull();
     store.close();
   });
 });
@@ -387,6 +387,56 @@ describe("registry branch coverage：成员与 seq 边界", () => {
     const { store, registry } = makeRegistry();
     expect(registry.allocateSeq("no-conv")).toBe(1);
     expect(registry.currentSeq("no-conv")).toBe(0);
+    store.close();
+  });
+});
+
+// ─── lookupAccounts 先过滤后 LIMIT（A34-2）─────────────────────────────────
+// 旧实现「先 ORDER BY created_at DESC LIMIT limit 再在 JS 里 filter」会在旧账号
+// 命中 query/capabilities 时被新账号挤掉，漏结果。修复后过滤下沉进 SQL WHERE。
+describe("registry: lookupAccounts 先过滤后 LIMIT（A34）", () => {
+  it("query 过滤先于 LIMIT：命中旧账号不再被更新账号挤掉", async () => {
+    const { store, registry } = makeRegistry();
+    // 命中账号更旧，不命中账号更新
+    for (let i = 0; i < 5; i++) await seedAccount(registry, `target-${i}`);
+    for (let i = 0; i < 20; i++) await seedAccount(registry, `noise-${i}`);
+    const got = registry.lookupAccounts({ query: "target", limit: 20 });
+    expect(got.map((a) => a.id).sort()).toEqual([
+      "target-0",
+      "target-1",
+      "target-2",
+      "target-3",
+      "target-4",
+    ]);
+    store.close();
+  });
+
+  it("capabilities 过滤先于 LIMIT：命中能力的旧账号不丢", async () => {
+    const { store, registry } = makeRegistry();
+    for (let i = 0; i < 5; i++) {
+      await registry.registerAccount({
+        id: `coder-${i}`,
+        displayName: `coder-${i}`,
+        endpointClass: "stream",
+        capabilities: ["translate"],
+      });
+    }
+    for (let i = 0; i < 20; i++) await seedAccount(registry, `other-${i}`);
+    const got = registry.lookupAccounts({ capabilities: ["translate"], limit: 20 });
+    expect(got.map((a) => a.id).sort()).toEqual([
+      "coder-0",
+      "coder-1",
+      "coder-2",
+      "coder-3",
+      "coder-4",
+    ]);
+    store.close();
+  });
+
+  it("limit 封顶后仍先过滤：命中数超 limit 时只回前 limit 个命中", async () => {
+    const { store, registry } = makeRegistry();
+    for (let i = 0; i < 10; i++) await seedAccount(registry, `p-${i}`);
+    expect(registry.lookupAccounts({ query: "p-", limit: 4 })).toHaveLength(4);
     store.close();
   });
 });

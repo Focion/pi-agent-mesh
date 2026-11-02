@@ -825,11 +825,11 @@ describe("MeshObserver.streamEntries", () => {
     greenWorld(db);
     insEndpoint(db, { id: "e1", acct: "a2", state: "hot" });
     db.prepare(
-      "INSERT INTO mesh_streams (pi_session_id, endpoint_id, account_id, created_at) VALUES (?,?,?,?)",
+      "INSERT INTO mesh_streams (runtime_ref, endpoint_id, account_id, created_at) VALUES (?,?,?,?)",
     ).run("ps1", "e1", "a2", isoNow());
     for (let i = 1; i <= 4; i++) {
       db.prepare(
-        "INSERT INTO mesh_stream_entries (entry_id, pi_session_id, parent_id, seq_in_stream, entry_type, " +
+        "INSERT INTO mesh_stream_entries (entry_id, runtime_ref, parent_id, seq_in_stream, entry_type, " +
           "raw_json, mesh_message_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
       ).run(
         "en" + i,
@@ -855,7 +855,7 @@ describe("MeshObserver.streamEntries", () => {
 // ─── counters ─────────────────────────────────────────────────────────────
 
 describe("MeshObserver.counters", () => {
-  it("sums buckets, zero-fills all 23 names, adds queueDepth", async () => {
+  it("sums buckets, zero-fills all 24 names, adds queueDepth", async () => {
     greenWorld(db);
     store.bumpCounter("messages_total", 3);
     store.bumpCounter("dedup_hit", 2);
@@ -906,7 +906,7 @@ describe("MeshObserver misc", () => {
     greenWorld(db);
     insEndpoint(db, { id: "e1", acct: "a2", state: "hot" });
     db.prepare(
-      "INSERT INTO mesh_streams (pi_session_id, endpoint_id, account_id, created_at) VALUES (?,?,?,?)",
+      "INSERT INTO mesh_streams (runtime_ref, endpoint_id, account_id, created_at) VALUES (?,?,?,?)",
     ).run("ps1", "e1", "a2", isoNow());
     store.bumpCounter("messages_total", 1);
 

@@ -56,7 +56,7 @@ function makeHarness(
       limits,
     }),
     sessionFactory: {
-      create: async () => ({ session: {}, piSessionId: "pi-test" }),
+      create: async () => ({ session: {}, runtimeRef: "pi-test" }),
       open: async () => ({ session: {} }),
     },
   };
@@ -291,6 +291,21 @@ describe("router: idempotency", () => {
       msg("A", conv.id, { clientToken: "t2", text: "second" }),
     );
     expect(r2.seq).toBe(r1.seq + 1);
+    h.store.close();
+  });
+
+  it("empty clientToken is not a stable idempotency key: two distinct sends yield two messages (A31)", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A");
+    await addAcc(h, "B");
+    const conv = await h.registry.ensureDirect("A", "B");
+    // openai-compatible 服务端可能回空 toolCallId："" 不可作为幂等键。两次不同 payload
+    // 的空 token 发送必须各成一条消息，而不是都命中第一条（瘦身前的 `??` 会让 "" 成为键）。
+    const r1 = await h.router.route(msg("A", conv.id, { clientToken: "", text: "first" }));
+    const r2 = await h.router.route(msg("A", conv.id, { clientToken: "", text: "second" }));
+    expect(r2.messageId).not.toBe(r1.messageId);
+    expect(r2.seq).toBe(r1.seq + 1);
+    expect(counter(h, "messages_total")).toBe(2);
     h.store.close();
   });
 
@@ -726,6 +741,28 @@ describe("router: expect and pending_acks", () => {
       .prepare("SELECT COUNT(*) AS n FROM mesh_pending_acks")
       .get() as { n: number };
     expect(n.n).toBe(0);
+    h.store.close();
+  });
+
+  it("self-filled correlationId colliding with an existing pending_ack → ARG_INVALID (A34)", async () => {
+    const h = makeHarness();
+    const convId = await group3(h);
+    const first = await h.router.route(
+      msg("A", convId, { expect: "ack", to: ["B"] }),
+    );
+    const existingId = first.correlationId!;
+    // A 再次以同一 correlationId 发起新请求：A 不是该 pending_ack 的 to_account，
+    // 不计入应答（replyOf=null），撞 mesh_pending_acks 主键应被干净拒绝，而非抛
+    // 原始 Sqlite UNIQUE 错误。
+    await expect(
+      h.router.route(
+        msg("A", convId, {
+          expect: "ack",
+          to: ["B"],
+          correlationId: existingId,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "ARG_INVALID" });
     h.store.close();
   });
 });
