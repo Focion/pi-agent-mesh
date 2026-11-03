@@ -4,8 +4,8 @@
 
 ## 项目上下文
 
-- 项目简介：`@pi/agent-mesh` —— 构建在 pi SDK 之上的多持久 Agent 消息传递与共享状态层（v0.2.0，规范面 v1.0.3 已定稿）。
-- 技术栈：TypeScript（ESM + CJS 双产物，tsup 构建）、Node ≥ 24.0.0、better-sqlite3 存储、vitest 测试；pi-durable（`@earendil-works/pi-durable` `1.4.0`）+ pi-ai（`@earendil-works/pi-ai` `1.4.0`）+ chord（`@earendil-works/chord` `1.4.0`）为直接依赖、惰性加载。
+- 项目简介：`@pi/agent-mesh` —— 构建在 pi SDK 之上的多持久 Agent 消息传递与共享状态层（v0.2.0，规范面 v1.0.4 已定稿）。
+- 技术栈：TypeScript（ESM + CJS 双产物，tsup 构建）、Node ≥ 24.0.0、better-sqlite3 存储、vitest 测试；pi-durable（`@earendil-works/pi-durable` `1.5.0`）+ pi-ai（`@earendil-works/pi-ai` `1.5.0`）+ chord（`@earendil-works/chord` `1.5.0`）+ pi-schema（`@earendil-works/pi-schema` `1.5.0`）为直接依赖、惰性加载。pi 1.5 起条目镜像与轮次边界由 `harness.observeCommits()` 提交观察驱动（取代 watch 差分），端口 warm 末尾才 `resume()`（详见变更说明与规范 §2.4）。
 - 入口与关键模块：
   - `src/index.ts` —— 包根装配入口（`createMesh` / `MeshHost`），唯一构造函数，可同时 import core 与 pi。
   - `src/core/**` —— mesh-core：类型契约、存储、路由、投递、工具面、策略、渲染、观测。**零 pi 依赖**（CI 门禁 G1）。
@@ -48,7 +48,9 @@
 
 | 文档 | 说明 |
 | --- | --- |
-| [`notes/tech/2026-09-07-pi-agent-mesh-spec.md`](notes/tech/2026-09-07-pi-agent-mesh-spec.md) | **权威规范（文档版本 1.0.3）**：平台基线、架构、投递语义、存储 schema、API、不变量、决策记录与风险登记。代码里的 `§x.y` 引用都指向它。1.0.1 按 v0.1.0 实现回填，1.0.2 收口悬空差距，1.0.3 durable 迁移与补偿退役（变更见附录 L.4）。 |
+| [`notes/tech/2026-09-07-pi-agent-mesh-spec.md`](notes/tech/2026-09-07-pi-agent-mesh-spec.md) | **权威规范（文档版本 1.0.4）**：平台基线、架构、投递语义、存储 schema、API、不变量、决策记录与风险登记。代码里的 `§x.y` 引用都指向它。1.0.1 按 v0.1.0 实现回填，1.0.2 收口悬空差距，1.0.3 durable 迁移与补偿退役，1.0.4 pi 1.5.0 兼容适配（变更见附录 L.4）。 |
+| [`notes/changelog/2026-11-02-pi-1-5-upgrade.md`](notes/changelog/2026-11-02-pi-1-5-upgrade.md) | **pi 1.5.0 升级变更说明**：平台基线 1.4.0 → 1.5.0 精确锁定、observeCommits 提交观察、确认完成屏障与 `eligibleEntryIds` 消费边界、`progressPersistWithinMs` 默认 0、DDL 不变；含使用者影响、升级步骤与回滚边界。 |
+| [`notes/archive/2026-11-03-pi-1-5-upgrade-plan.md`](notes/archive/2026-11-03-pi-1-5-upgrade-plan.md) | **已归档（2026-11-03）**：pi 1.5.0 兼容适配计划。全部执行并验证完成（683 通过 + 2 跳过，全门禁绿，DDL 不变），结果见 pi 1.5.0 变更说明与规范附录 L.4 1.0.4。 |
 | [`notes/archive/2026-10-20-execution-plan.md`](notes/archive/2026-10-20-execution-plan.md) | **已归档（2026-11-01）**：durable 迁移 + 审计修复 合并执行计划（0–17 步 + 后续收口），全部完成标准（demo:smoke 11/11 / pack ✓ / 665 test ✓）达成。 |
 | [`notes/tech/2026-10-20-audit-rulings.md`](notes/tech/2026-10-20-audit-rulings.md) | **已完成**：审计步骤 4 的四处规范裁决定案（R1–R4）与记录型裁定。代码已在步骤 5–8 实施，规范 1.0.3 文本已在迁 10 落地。 |
 | [`notes/changelog/2026-11-01-v0.2.0.md`](notes/changelog/2026-11-01-v0.2.0.md) | **v0.2.0 变更说明**：四条破坏性变更、新增、修复、能力缺口、升级步骤与回滚方式。 |

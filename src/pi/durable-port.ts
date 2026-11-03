@@ -7,29 +7,41 @@
 //  - deliver 以 `triggerTurn`（§7.3 的 woke 判定）为主键：`true` → `input`（空闲起轮、
 //    忙时 queued）；`false`（含 silent、catch-up 固化、忙流降档）→ 带 model 的 `write`
 //    （空闲当场 `done` 不起轮、忙时下一边界落位）。entry 落盘前不返回 entryId，正在进
-//    行处由 watch 差分镜像补 (deliver 返回 ≠ delivered，F5)。
-//  - 状态从 `value` 推导，不逐条重放 ops。busy = `view.docs["pi.live"].run` 有值；busy→idle
-//    边界发 turnEnd（此阶段不区分 abort）。consumed 判据改读 submission（迁 8：deliver 返回
-//    submissionId+status，对账按 submission id 精确读，取代 hasEntries 的全量 entry 扫描）。
+//    行处由提交观察镜像补（deliver 返回 ≠ delivered，F5）。
+//  - pi 1.5：状态与条目从 `harness.observeCommits()` 的已落盘提交（CommitPublication）
+//    推导，取代 watch 差分镜像（1.5 的 watch 回调合并 + 50/100 滚动窗口不再保证
+//    条目通知与 busy→idle 边界不遗漏）。advance 同步只记录；每端点串行 drain 在
+//    Session 调用栈外按提交顺序消费：先条目镜像（收集确认 Promise 并等待，完成屏障），
+//    再应用 pi.live 状态并判定轮次边界（busy→idle 与旧 run→新 run 换手都覆盖）。
+//    turnEnd 事件携带 eligibleEntryIds（该边界已通知条目的快照）供消费事务过滤。
+//  - busy 判据：pi.live 的 run 存在即忙；run 身份按 inputs 集合跟踪（taskId 换代不换
+//    身份）。consumed 判据改读 submission（迁 8：deliver 返回 submissionId+status）。
 //  - submissionStatus → `harness.submission(id)` 精确读一条权威投影（取代 hasEntries）。
 //    deliver 的 requestId = `<deliveryId>:<attempt>`（无则回退 envelope.id，nudge/note 不用 deliver）。
+//    pi 1.5 的 continue 提交投影显式报不支持（mesh 契约只有 input/write）。
 //  - injectContext → warm 时装/卸 `GenerationHooks.beforeRequest` 钩子，读可变 rec.injection；
 //    确认在钩子内同步 onInjectionConfirmed（MD4/OQ1；mesh 账本落确认）。
-//  - evict → `waitForIdle` 后 `harness.close()`（§9 F-I）。A21：`dispose()` 强制卸载全部流
-//    （force 跳过 hasUnconsumed）并等待进行中的 warm。
+//  - evict → `waitForIdle` 后 detach 观察、收敛 drain、`harness.close()`、释放锁（§9 F-I）。
+//    A21：`dispose()` 强制卸载全部流（force 跳过 hasUnconsumed）并等待进行中的 warm。
+//  - 启动顺序（pi 1.5）：factory 不再 resume；warm 在配置/root → 提交观察与基线 → P2 注入
+//    → runtimeRef/租约/状态就绪之后才 `harness.resume()`；后半段失败回滚（关 session、放锁）。
 //
 // 不写 queueDepth / clearQueue / prompt / sendUserMessage / forkFrom（I22/I19/F3）。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { join } from "node:path";
+import type { WatchEnd } from "@earendil-works/chord";
 import type {
-  ConversationView,
-  ConversationWatch,
+  CommitObservation,
+  CommitPublication,
+  Cursor,
   EntryId,
   EntryRecord,
+  LiveState,
   Submission,
   SubmissionId,
   SubmissionRecord as PiSubmissionRecord,
+  SessionEnd,
 } from "@earendil-works/pi-durable";
 import type {
   Account,
@@ -56,6 +68,10 @@ import { EndpointLock, LockHeldError } from "./lock.js";
 
 const MESH_MESSAGE_KIND = "mesh.msg";
 const MESH_NUDGE_KIND = "mesh.nudge";
+/** pi.live 会话文档的 kind（harness/live 的 LiveDoc）；忙/轮次状态唯一权威。 */
+const LIVE_DOC_KIND = "pi.live";
+/** 基线分页大小（root.entries 升序全量分页，不用 50/100 滚动窗口当基线）。 */
+const BASELINE_PAGE = 1000;
 
 /** 带原因码的端口错误：mailbox 据 code 选 parked 原因（§7.10） */
 export class PiPortError extends Error {
@@ -148,9 +164,23 @@ interface StreamRec {
   runtimeRef: string;
   lock: EndpointLock;
   lease: MeshLease;
-  watch: ConversationWatch;
-  /** watch 维护的内存视图快照（status 同步读它，不现读文档，§2.4⑨） */
-  view: ConversationView;
+  /** observeCommits 的观察句柄（detach 幂等；detach 后无 advance/end） */
+  observation: CommitObservation;
+  /** advance 只入队（同步只记录）；drain 在 Session 调用栈外串行消费 */
+  pending: CommitPublication[];
+  /** 当前 drain 链（收敛用：evict/failure 清理等它落定） */
+  drainPromise: Promise<void> | undefined;
+  /** 基线完成后置 true；此前 drain 只排队不处理（避免半初始化期发 turnEnd） */
+  ready: boolean;
+  /** 正常 evict/dispose/失败清理已接管：观察 end / harness.closed 回调不再动作 */
+  closing: boolean;
+  /** 观察句柄已结束（迟到 advance 不入队） */
+  ended: boolean;
+  /** busy 缓存：pi.live.run 存在即忙（从提交流维护，不做整视图轮询） */
+  busy: boolean;
+  /** 当前 run 的已放置输入（LiveRun.inputs 的字符串集）：run 身份跟踪
+   *  （taskId 换代不换身份；inputs 换新 = 旧 run 换新 run 的边界） */
+  activeRunInputs: Set<string>;
   /** 已镜像的 entry id（F4：EntryId 是数字，镜像集合记 String(id)） */
   seen: Set<string>;
   seqInStream: number;
@@ -158,19 +188,11 @@ interface StreamRec {
   handoff: Set<string>;
   /** I09：准备请求代次（beforeRequest 自增），注入确认据此归属「某次真实请求」 */
   turnGeneration: number;
-  /** 上次视图的 busy 态（busy→idle 发 turnEnd） */
-  wasBusy: boolean;
   /** P2 注入体（injectContext 设置/清除，beforeRequest 钩子读它，MD4） */
   injection?: string;
   leaseTimer?: NodeJS.Timeout;
   idleTimer?: NodeJS.Timeout;
   evicting: boolean;
-}
-
-/** busy = 有一个运行中的 run 控制（LiveState.run 只在其 busy 期间存在）。 */
-function isBusy(view: ConversationView): boolean {
-  const live = view.docs["pi.live"] as { run?: unknown } | undefined;
-  return live?.run !== undefined;
 }
 
 /** mesh.msg / mesh.audit / mesh.verbatim_exit 等条目把归因键放在 data.envelopeId。 */
@@ -182,15 +204,19 @@ function envelopeIdOf(e: EntryRecord): string | undefined {
 /** 收窄 SessionFactory 产物到 durable 面（session 在 core 眼里是 unknown）。 */
 function narrowDurableSession(raw: unknown, endpointId: string): DurableSession {
   const s = raw as Partial<DurableSession> | null | undefined;
+  const harness = s?.harness as { observeCommits?: unknown; closed?: unknown; resume?: unknown } | undefined;
   const bad =
     !s ||
     typeof s !== "object" ||
     !s.ctx ||
     !s.root ||
     typeof s.root.submit !== "function" ||
-    typeof s.root.watch !== "function" ||
     typeof s.root.entries !== "function" ||
     typeof s.root.waitForIdle !== "function" ||
+    !harness ||
+    typeof harness.observeCommits !== "function" ||
+    typeof harness.resume !== "function" ||
+    !harness.closed ||
     !s.registry ||
     typeof s.registry.install !== "function" ||
     typeof s.close !== "function";
@@ -209,8 +235,16 @@ function whenBusyFor(grade: Grade): "steer" | "followUp" {
   return grade === "followUp" ? "followUp" : "steer";
 }
 
-/** pi-durable 的 SubmissionRecord → core 的权威投影（丢弃 conversationId/detail，保留判据面）。 */
+/** pi-durable 的 SubmissionRecord → core 的权威投影（丢弃 conversationId/detail，保留判据面）。
+ *  pi 1.5 的 continue 提交不在 mesh 的 input/write 契约内（SDK 内部钩子产物）：
+ *  显式报不支持，不伪装成 input/write，也不新增 continue 提交入口。 */
 function toSubmissionProjection(st: PiSubmissionRecord): SubmissionRecord {
+  if (st.type === "continue") {
+    throw new Error(
+      `mesh: pi 1.5 continue submission ${st.id} is not supported by the input/write ` +
+        `delivery contract (continue is produced by SDK-internal hooks, not by mesh delivery)`,
+    );
+  }
   const rec = st as PiSubmissionRecord & { entry?: EntryId; reason?: string };
   return {
     id: String(st.id),
@@ -227,11 +261,17 @@ function toSubmissionHandle(sub: Submission, st: PiSubmissionRecord): Submission
   return { submissionId: String(sub.id), status: p.status, entryId: p.entryId };
 }
 
+function sameSet(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
+
 export class PiStreamPort implements StreamPort {
   private readonly d: PiStreamPortDeps;
   private readonly streams = new Map<EndpointId, StreamRec>();
-  private readonly entryHandlers = new Set<(e: PortEntryEvent) => void>();
-  private readonly turnEndHandlers = new Set<(e: { endpointId: string }) => void>();
+  private readonly entryHandlers = new Set<(e: PortEntryEvent) => void | Promise<void>>();
+  private readonly turnEndHandlers = new Set<(e: { endpointId: string; eligibleEntryIds?: readonly string[] }) => void>();
   private warming = new Map<EndpointId, Promise<void>>();
 
   constructor(deps: PiStreamPortDeps) {
@@ -244,7 +284,7 @@ export class PiStreamPort implements StreamPort {
     const existing = this.streams.get(endpointId);
     if (existing) {
       // I16：热流 shared → exclusive 升级（不重建流，只切租约并同步锁文件）
-      if (lease === "exclusive" && existing.lease === "shared" && !existing.evicting) {
+      if (lease === "exclusive" && existing.lease === "shared" && !existing.evicting && !existing.closing) {
         await existing.lock.setLease("exclusive", this.d.exclusiveLeaseTtlMs ?? 60_000);
         this.applyLease(existing, "exclusive");
       }
@@ -329,41 +369,120 @@ export class PiStreamPort implements StreamPort {
       );
     }
 
-    // ③ 基线 watch（OQ5：watch 作主）；差分基准把既有的非 head 条目记为 seen。
-    const watch = await session.root.watch(session.ctx);
-    const rec: StreamRec = {
+    // ③ 后半段装配（pi 1.5 启动顺序）：观察 → 基线 → 注册流 → P2 注入 → 状态就绪 → resume。
+    //    任一失败回滚：detach 观察、关 session、放锁，端点 unavailable，不残留半装配流。
+    let rec: StreamRec | undefined;
+    try {
+      rec = await this.assembleStream(endpointId, endpoint.accountId, session, runtimeRef, lock, lease);
+      this.streams.set(endpointId, rec);
+      rec.ready = true;
+      void this.drain(rec); // 处理基线期间缓冲的提交
+      await this.installInjection(rec);
+      this.watchFailure(rec);
+      if (!endpoint.runtimeRef) d.setEndpointSession(endpointId, runtimeRef);
+      this.applyLease(rec, lease);
+      d.setEndpointState(endpointId, "hot");
+      this.resetIdleTimer(rec);
+      this.d.onWarmed?.(endpointId);
+      // resume 幂等、放最后：就绪前不调用会隐式 resume 的 waitForIdle/compact/abort
+      // （evict 的 waitForIdle 只在 hot 之后可达）。
+      rec.session.harness.resume();
+    } catch (err) {
+      if (rec) {
+        rec.closing = true;
+        this.streams.delete(endpointId);
+        try { rec.observation.detach(); } catch { /* 观察 detach 幂等，失败不阻断回滚 */ }
+        try { await withWarmDeadline(warmDeadlineMs, () => rec!.drainPromise ?? Promise.resolve()); } catch { /* 收敛失败不阻断 */ }
+      }
+      try {
+        await withWarmDeadline(warmDeadlineMs, () => session.close());
+      } catch {
+        // 关 session 失败不阻断回滚（锁必须释放）
+      }
+      await lock.release();
+      d.setEndpointLock(endpointId, null);
+      d.setEndpointState(endpointId, "unavailable");
+      if (err instanceof PiPortError) throw err;
+      throw new PiPortError(
+        "NO_SESSION",
+        `mesh-pi: stream assembly failed for endpoint ${endpointId}: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+  }
+
+  /** 观察接线 + 历史基线（pi 1.5）：先挂提交缓冲（advance 只入队），再经 root.entries
+   *  分页建立 seen 基线；基线期间的提交保留在 pending，不会被基线覆盖。busy 从 false 起，
+   *  由提交流按序建立状态（不读快照：避免「快照新于待处理提交」的倒置）。 */
+  private async assembleStream(
+    endpointId: string,
+    accountId: AccountId,
+    session: DurableSession,
+    runtimeRef: string,
+    lock: EndpointLock,
+    lease: MeshLease,
+  ): Promise<StreamRec> {
+    let rec!: StreamRec;
+    const observation = session.harness.observeCommits({
+      advance: (publication: CommitPublication) => {
+        // 同步只记录，绝不 await / 调 Session / 抛错（抛错 ⇒ listener_error 并 detach）。
+        try {
+          if (rec.closing || rec.ended) return;
+          rec.pending.push(publication);
+          void this.drain(rec);
+        } catch {
+          // advance 不抛：极端情况（如 OOM）只丢该 publication，由后续提交与对账兜底
+        }
+      },
+      end: (end: WatchEnd) => {
+        // 观察结束通道：正常关闭前 closing 已置 true（evict/dispose/failStream），
+        // 其余任何结束（session 失败 / listener_error / 外部关闭）都走失败清理。
+        if (rec.ended) return;
+        rec.ended = true;
+        if (!rec.closing && this.streams.get(endpointId) === rec) {
+          this.failStream(rec);
+        }
+      },
+    });
+    rec = {
       endpointId,
-      accountId: endpoint.accountId,
+      accountId,
       session,
       runtimeRef,
       lock,
       lease,
-      watch,
-      view: watch.value,
+      observation,
+      pending: [],
+      drainPromise: undefined,
+      ready: false,
+      closing: false,
+      ended: false,
+      busy: false,
+      activeRunInputs: new Set(),
       seen: new Set(),
       seqInStream: 0,
       handoff: new Set(),
       turnGeneration: 0,
-      wasBusy: isBusy(watch.value),
       evicting: false,
     };
-    for (const e of watch.value.entries) {
-      if (e.head !== undefined) continue; // head marker 不入镜像
-      rec.seen.add(String(e.id));
+    // 历史基线：升序全量分页（head marker 不入镜像）；重开前的既有条目进 seen，
+    // 使后续 turnEnd 的 eligibleEntryIds 覆盖重开前的 delivery（不依赖 50/100 滚窗）。
+    let cursor: Cursor | undefined;
+    for (;;) {
+      const page = await session.root.entries(
+        { order: "ascending" },
+        BASELINE_PAGE,
+        cursor,
+        session.ctx,
+      );
+      for (const e of page.items) {
+        if (e.head !== undefined) continue;
+        rec.seen.add(String(e.id));
+      }
+      if (!page.next) break;
+      cursor = page.next;
     }
-    rec.watch.start(async (value) => this.onView(rec, value));
-    this.streams.set(endpointId, rec);
-
-    // ④ P2 注入扩展（装在 registry 尾，读可变 rec.injection，MD4）
-    await this.installInjection(rec);
-    // MD8：订阅 harness 的失败通道——harness.closed reason="failed" ⇒ 端点级不可用 + requeue。
-    this.watchFailure(rec);
-
-    if (!endpoint.runtimeRef) d.setEndpointSession(endpointId, runtimeRef);
-    this.applyLease(rec, lease);
-    d.setEndpointState(endpointId, "hot");
-    this.resetIdleTimer(rec);
-    this.d.onWarmed?.(endpointId);
+    return rec;
   }
 
   private applyLease(rec: StreamRec, lease: MeshLease): void {
@@ -388,7 +507,7 @@ export class PiStreamPort implements StreamPort {
   /** force=true：A21 关闭路径，跳过 hasUnconsumed 强制卸载。 */
   async evict(endpointId: string, force = false): Promise<void> {
     const rec = this.streams.get(endpointId);
-    if (!rec || rec.evicting) return;
+    if (!rec || rec.evicting || rec.closing) return;
     const d = this.d;
     // §8.3：仍有 delivered 未 consumed ⇒ 不驱逐（A21 强制驱除除外）
     if (!force && d.hasUnconsumed?.(endpointId)) {
@@ -397,23 +516,28 @@ export class PiStreamPort implements StreamPort {
     }
     rec.evicting = true;
     d.setEndpointState(endpointId, "evicting");
+    const warmDeadlineMs = d.sessionWarmTimeoutMs ?? SESSION_WARM_TIMEOUT_MS;
     try {
       await rec.session.root.waitForIdle(rec.session.ctx);
     } catch {
       // waitForIdle 失败不阻断驱逐（session 已损坏时更要释放）
     }
+    // 停止新提交进入：detach 观察（此后无 advance/end），再收敛 drain（不丢已缓冲提交）。
     try {
-      await rec.watch.stop();
+      rec.observation.detach();
     } catch {
-      // watch.stop 失败不阻断
+      // detach 幂等
     }
+    try {
+      await withWarmDeadline(warmDeadlineMs, () => rec!.drainPromise ?? Promise.resolve());
+    } catch {
+      // 收敛失败不阻断驱逐（锁必须释放）
+    }
+    rec.closing = true;
     if (rec.leaseTimer) clearTimeout(rec.leaseTimer);
     if (rec.idleTimer) clearTimeout(rec.idleTimer);
     try {
-      await withWarmDeadline(
-        d.sessionWarmTimeoutMs ?? SESSION_WARM_TIMEOUT_MS,
-        () => rec.session.close(),
-      );
+      await withWarmDeadline(warmDeadlineMs, () => rec.session.close());
     } catch {
       // harness/storage close 失败或超时同样不阻断（§8.3 驱逐是内存管理）
     }
@@ -494,7 +618,7 @@ export class PiStreamPort implements StreamPort {
     const rec = await this.ensureHot(endpointId);
     if (this.d.devMode) rec.lock.assertHeld(endpointId);
     this.resetIdleTimer(rec);
-    if (!rec.wasBusy && opts?.triggerTurn) {
+    if (!rec.busy && opts?.triggerTurn) {
       // 空闲起轮：走自定义条目通道（I19 禁 sendUserMessage；不伪装成用户发言）
       await rec.session.root.submit(
         { type: "input", content: cue, entry: { kind: MESH_NUDGE_KIND } },
@@ -548,7 +672,7 @@ export class PiStreamPort implements StreamPort {
         inFlight: 0,
       };
     }
-    return { state: "hot", busy: rec.wasBusy, inFlight: rec.handoff.size };
+    return { state: "hot", busy: rec.busy, inFlight: rec.handoff.size };
   }
 
   // ── ⑧ submissionStatus：按 id 精确读一条权威投影（§8.4，取代 hasEntries）─
@@ -566,18 +690,18 @@ export class PiStreamPort implements StreamPort {
     try {
       return toSubmissionProjection(await sub.status(rec.session.ctx));
     } catch {
-      return null;
+      return null; // continue 等不支持的投影 / 读取失败：判未进转录，交给 reconcile 兜底
     }
   }
 
   // ── ⑨ onEntry / ⑩ onTurnEnd ───────────────────────────────────────────
 
-  onEntry(h: (e: PortEntryEvent) => void): Unsubscribe {
+  onEntry(h: (e: PortEntryEvent) => void | Promise<void>): Unsubscribe {
     this.entryHandlers.add(h);
     return () => this.entryHandlers.delete(h);
   }
 
-  onTurnEnd(h: (e: { endpointId: string }) => void): Unsubscribe {
+  onTurnEnd(h: (e: { endpointId: string; eligibleEntryIds?: readonly string[] }) => void): Unsubscribe {
     this.turnEndHandlers.add(h);
     return () => this.turnEndHandlers.delete(h);
   }
@@ -633,36 +757,89 @@ export class PiStreamPort implements StreamPort {
     })();
   }
 
-  /** MD8 失败通道：harness 自身 fatally 关闭（closed reason="failed"）时清理流并报 session_failed。
-   *  非致命失败（task_faulted / task_parked / extension_error）走装配层的 onReport，不在此。 */
+  /** MD8 失败通道：harness 自身 fatally 关闭（closed kind="failed"）时清理流并报 session_failed。
+   *  非致命失败（task_faulted / task_parked / extension_error）走装配层的 onReport，不在此。
+   *  pi 1.5：SessionEnd 按 kind 分派——closed 是正常关闭（evict 已置 closing，此处直接返回）。 */
   private watchFailure(rec: StreamRec): void {
     void (async () => {
-      const end = await rec.session.harness.closed;
-      // 常规 evict 走 session.close() 收敛到 reason="closed"；只有 "failed" 才走失败清理。
-      if (end.reason !== "failed") return;
+      const end: SessionEnd = await rec.session.harness.closed;
+      if (rec.closing) return; // 正常 evict/dispose/failStream 路径已接管
       if (this.streams.get(rec.endpointId) !== rec) return; // 已驱逐流的迟到闭门不重复处理
-      const d = this.d;
-      if (rec.leaseTimer) clearTimeout(rec.leaseTimer);
-      if (rec.idleTimer) clearTimeout(rec.idleTimer);
-      try { await rec.watch.stop(); } catch { /* session 已损坏，尽力停 */ }
-      await rec.lock.release();
-      d.setEndpointLock(rec.endpointId, null);
-      this.streams.delete(rec.endpointId);
-      d.setEndpointLease(rec.endpointId, "shared", null);
-      d.setEndpointState(rec.endpointId, "unavailable");
-      d.onDegraded?.({ reason: "session_failed", endpointId: rec.endpointId });
+      if (end.kind !== "failed") return;
+      this.failStream(rec);
     })().catch(() => {
       // harness.closed 意外 rejection 不致命：端点交由 sweep/对账兜底。
     });
   }
 
-  /** watch 差分镜像（OQ5）：从 value 整视图推导，不逐条重放 ops。 */
-  private onView(rec: StreamRec, value: ConversationView): void {
-    if (this.streams.get(rec.endpointId) !== rec) return; // 已驱逐流的迟到帧
-    rec.view = value;
+  /** 观察意外终止 / session 失败的统一清理：流立即脱表并 unavailable（绝不仍显示正常 hot），
+   *  随后收敛 drain、关闭旧写者、释放锁。幂等：closing 标记隔离一切迟到回调。 */
+  private failStream(rec: StreamRec): void {
+    if (rec.closing) return;
+    rec.closing = true;
+    rec.ended = true;
+    const d = this.d;
+    if (this.streams.get(rec.endpointId) === rec) this.streams.delete(rec.endpointId);
+    d.setEndpointState(rec.endpointId, "unavailable");
+    d.setEndpointLease(rec.endpointId, "shared", null);
+    const warmDeadlineMs = d.sessionWarmTimeoutMs ?? SESSION_WARM_TIMEOUT_MS;
+    void (async () => {
+      if (rec.leaseTimer) clearTimeout(rec.leaseTimer);
+      if (rec.idleTimer) clearTimeout(rec.idleTimer);
+      try { rec.observation.detach(); } catch { /* 幂等 */ }
+      try { await withWarmDeadline(warmDeadlineMs, () => rec.drainPromise ?? Promise.resolve()); } catch { /* 收敛失败不阻断 */ }
+      try { await withWarmDeadline(warmDeadlineMs, () => rec.session.close()); } catch { /* session 已损坏，尽力关 */ }
+      try { await rec.lock.release(); } catch { /* 锁释放失败交由 ownerIsLive 兜底 */ }
+      d.setEndpointLock(rec.endpointId, null);
+      d.onDegraded?.({ reason: "session_failed", endpointId: rec.endpointId });
+    })().catch(() => {
+      // 清理自身失败不致命：端点已 unavailable，锁交由 ownerIsLive/sweep 兜底。
+    });
+  }
 
-    // 镜像新条目（跳过 head marker：head !== undefined 即 head marker，view 自身判据）。
-    for (const e of value.entries) {
+  /** 每端点串行的提交 drain（Session 调用栈外）：一次一个提交，不合并。
+   *  条目镜像 → 等全部确认（完成屏障）→ 应用 pi.live 并判定轮次边界。 */
+  private drain(rec: StreamRec): Promise<void> {
+    const existing = rec.drainPromise;
+    if (existing) return existing;
+    const p = (async () => {
+      for (;;) {
+        const pub = rec.pending.shift();
+        if (!pub || rec.closing || !rec.ready) break;
+        try {
+          await this.applyCommit(rec, pub);
+        } catch {
+          // drain 异常不炸端口、不 detach 观察：该提交的镜像/边界由后续提交与 reconcile 兜底
+        }
+      }
+    })().finally(() => {
+      if (rec.drainPromise === p) rec.drainPromise = undefined;
+    });
+    rec.drainPromise = p;
+    return p;
+  }
+
+  /** 单提交处理：changes 顺序不定 → 先收集 root 会话的条目与 pi.live 变化，
+   *  条目按 id 升序镜像并等待确认，再应用 live 状态与轮次结束通知。 */
+  private async applyCommit(rec: StreamRec, pub: CommitPublication): Promise<void> {
+    if (rec.closing || rec.ended || this.streams.get(rec.endpointId) !== rec) return;
+    const rootId = rec.session.root.id;
+    const entries: EntryRecord[] = [];
+    let live: LiveState | undefined;
+    let liveChanged = false;
+    for (const ch of pub.changes) {
+      if (ch.type === "entry" && ch.value.conversationId === rootId) {
+        entries.push(ch.value);
+      } else if (ch.type === "document" && ch.conversationId === rootId && ch.record.kind === LIVE_DOC_KIND) {
+        liveChanged = true;
+        live = ch.kind === "change" ? (ch.value as unknown as LiveState) : {};
+      }
+    }
+    entries.sort((a, b) => a.id - b.id);
+
+    // 条目镜像（跳过 head marker）；收集 handler 返回的确认 Promise 作完成屏障。
+    const confirmations: Promise<void>[] = [];
+    for (const e of entries) {
       if (e.head !== undefined) continue;
       const id = String(e.id);
       if (rec.seen.has(id)) continue;
@@ -679,27 +856,49 @@ export class PiStreamPort implements StreamPort {
       };
       for (const h of [...this.entryHandlers]) {
         try {
-          h(evt);
+          const r = h(evt);
+          if (r != null && typeof (r as PromiseLike<unknown>).then === "function") {
+            confirmations.push(
+              Promise.resolve(r).catch(() => undefined), // 确认失败保留既有恢复/重试语义，不炸 drain
+            );
+          }
         } catch {
           // 事件处理器抛错不影响投递（§12.5）
         }
       }
     }
+    // 完成屏障：全部 entry 确认落定后才评估该提交边界的轮次结束（先 delivered 后 consumed）。
+    if (confirmations.length > 0) await Promise.all(confirmations);
 
-    // busy→idle 边界发 turnEnd（此阶段不辨 abort，consumed 判据改读 submission 属步骤 8）。
-    const busy = isBusy(value);
-    if (rec.wasBusy && !busy) {
-      rec.wasBusy = false;
+    if (!liveChanged) return;
+    if (rec.closing || rec.ended || this.streams.get(rec.endpointId) !== rec) return;
+
+    // 轮次边界：busy→idle（run 移除）与旧 run→新 run（inputs 换新非空）都发 turnEnd；
+    // 生成代际换手（taskId 变而 inputs 不变）不算边界。answer 后 inputs 空转（afterRun
+    // 阶段）不发——保持 1.4 的「run 完全结束才 turnEnd」时序，run 移除时统一发。
+    const wasBusy = rec.busy;
+    const newInputs = new Set<string>();
+    for (const sid of live?.run?.inputs ?? []) newInputs.add(String(sid));
+    const fire =
+      wasBusy &&
+      (live?.run === undefined || (newInputs.size > 0 && !sameSet(newInputs, rec.activeRunInputs)));
+    rec.busy = live?.run !== undefined;
+    rec.activeRunInputs = newInputs;
+    if (fire) {
       this.resetIdleTimer(rec);
-      for (const h of [...this.turnEndHandlers]) {
-        try {
-          h({ endpointId: rec.endpointId });
-        } catch {
-          // 同上
-        }
+      this.fireTurnEnd(rec);
+    }
+  }
+
+  private fireTurnEnd(rec: StreamRec): void {
+    // 该边界已纳入基线/entry 通知的条目 ID 快照（不含后续提交）：消费事务据此过滤。
+    const eligible = Array.from(rec.seen);
+    for (const h of [...this.turnEndHandlers]) {
+      try {
+        h({ endpointId: rec.endpointId, eligibleEntryIds: eligible });
+      } catch {
+        // 事件处理器抛错不影响后续投递（§12.5）
       }
-    } else if (busy) {
-      rec.wasBusy = true;
     }
   }
 

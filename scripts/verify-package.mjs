@@ -197,9 +197,11 @@ import { join } from "node:path";
 
 const dbPath = join(process.env.SMOKE_DB_DIR, "pi-config.db");
 
-// 1) pi 已随包真装且可解析/导入（等价 loadPiSdk() 的路径）。
+// 1) pi 已随包真装且可解析/导入（等价 loadDurableSdk() 的路径：durable + ai + schema）。
 try {
-  await import("@earendil-works/pi-coding-agent");
+  await import("@earendil-works/pi-durable");
+  await import("@earendil-works/pi-ai");
+  await import("@earendil-works/pi-schema");
 } catch (e) {
   throw new Error("pi 依赖已声明却无法解析：" + e.message);
 }
@@ -325,7 +327,7 @@ async function gateG09() {
   }
   ok(`去向：台账 ${ledger.summary.total} + 处置 ${dispIds.length} = ${total} 项全部有去向`);
 
-  // 3) 版本三重核对 === 0.1.0。
+  // 3) 版本三重核对 === package.json 声明版本（不硬编码历史版本）。
   const lock = JSON.parse(readFileSync(join(ROOT, "package-lock.json"), "utf8"));
   const storeSrc = readFileSync(join(ROOT, "src", "core", "store.ts"), "utf8");
   const libMatch = storeSrc.match(/export const LIBRARY_VERSION = "([^"]+)"/);
@@ -334,9 +336,9 @@ async function gateG09() {
     ["package-lock.json", lock.version],
     ["store.ts LIBRARY_VERSION", libMatch?.[1] ?? null],
   ];
-  const off = triple.filter(([, v]) => v !== "0.1.0");
-  if (off.length) fail(`版本并非 0.1.0：${off.map(([k, v]) => `${k}=${v}`).join("，")}`);
-  ok(`版本三重一致：${triple.map(([, v]) => v).join(" / ")} === 0.1.0`);
+  const off = triple.filter(([, v]) => v !== PKG.version);
+  if (off.length) fail(`版本并非 ${PKG.version}：${off.map(([k, v]) => `${k}=${v}`).join("，")}`);
+  ok(`版本三重一致：${triple.map(([, v]) => v).join(" / ")} === ${PKG.version}`);
 
   // 4) tarball 名单 + 泄密扫描。
   const ls = run("tar", ["-tzf", TARBALL], { cwd: ROOT });

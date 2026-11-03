@@ -26,7 +26,6 @@ import type {
   ModelThinkingLevel,
   Models,
   ProviderStreams,
-  TSchema,
 } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "../core/types.js";
 import type { EndpointId } from "../core/types.js";
@@ -155,8 +154,9 @@ export function bridgeTools(tools: ToolDefinition[], sdk: DurableSdk): ToolRegis
     durable.defineTool({
       name: t.name,
       description: t.description,
-      // mesh 侧是 JSON Schema（TypeBox 兼容）；durable 用 TypeBox schema 校验参数（步骤 12 收敛）
-      parameters: t.parameters as unknown as TSchema,
+      // mesh 侧是 JSON Schema（TypeBox 兼容）；durable 1.5 的 ToolRegistration.parameters
+      // 恒为 `object`（pi-schema 已不再从 pi-ai 导出 TSchema），直接透传即可。
+      parameters: t.parameters,
       replay: "safe",
       async execute(args, api, _ctx) {
         const r = await t.execute(api.callId, args as Record<string, unknown>, undefined, undefined, undefined);

@@ -78,7 +78,9 @@ beforeEach(async () => {
     stateDir: dir,
     idleEvictMs: 0,
   });
-  port.onEntry((e) => entries.push(e));
+  port.onEntry((e) => {
+    entries.push(e);
+  });
 });
 
 afterEach(async () => {

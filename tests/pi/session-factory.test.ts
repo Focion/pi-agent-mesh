@@ -15,8 +15,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { SessionFactory } from "../../src/core/types.js";
 import { resolveLlmConfig } from "../../src/pi/llm-config.js";
 import {
+  buildDurableSettings,
   createAssembledSessionFactory,
   createPiSessionFactory,
 } from "../../src/pi/session-factory.js";
@@ -105,5 +107,62 @@ describe("LD2 缺省装配（createAssembledSessionFactory）", () => {
         llm: resolveLlmConfig({ model: "anthropic:no-such-model", apiKey: "sk-test" }),
       }),
     ).rejects.toThrow(/MESH_UNKNOWN_MODEL/);
+  });
+});
+
+describe("pi 1.5：progress.persistWithinMs 映射（buildDurableSettings）", () => {
+  it("未提供 runtime / 未设置字段 → 恒传 progress.persistWithinMs 0（保持旧版落盘强度）", () => {
+    expect(buildDurableSettings(undefined)).toEqual({ progress: { persistWithinMs: 0 } });
+    expect(buildDurableSettings({})).toEqual({ progress: { persistWithinMs: 0 } });
+  });
+
+  it("显式 progressPersistWithinMs 透传；retry/timeout/compaction 映射不变", () => {
+    expect(buildDurableSettings({ progressPersistWithinMs: 1000 }).progress).toEqual({
+      persistWithinMs: 1000,
+    });
+    expect(
+      buildDurableSettings({ timeout: 5000, progressPersistWithinMs: 1000 }),
+    ).toEqual({
+      progress: { persistWithinMs: 1000 },
+      stream: { timeoutMs: 5000 },
+    });
+    expect(buildDurableSettings({ retry: { enabled: true, maxRetries: 2 } })).toEqual({
+      progress: { persistWithinMs: 0 },
+      retry: { enabled: true, maxRetries: 2 },
+    });
+  });
+});
+
+describe("pi 1.5 启动顺序：factory 不 resume，由端口 warm 末尾 resume", () => {
+  it("factory create/open 不调用 harness.resume（调度保持 paused，resume 归 port warm 末尾）", async () => {
+    const dir = tmp();
+    const faux = await createFaux("faux-order");
+    const base = createPiSessionFactory({ stateDir: dir, models: faux.models, model: faux.model });
+    let resumeCalls = 0;
+    const wrapResume = (session: unknown): void => {
+      const harness = (session as { harness: { resume(): void } }).harness;
+      const orig = harness.resume.bind(harness);
+      harness.resume = () => {
+        resumeCalls += 1;
+        orig();
+      };
+    };
+    const spying: SessionFactory = {
+      create: async (c) => {
+        const r = await base.create(c);
+        wrapResume(r.session);
+        return r;
+      },
+      open: async (c) => {
+        const r = await base.open(c);
+        wrapResume(r.session);
+        return r;
+      },
+    };
+    const { session, runtimeRef } = await spying.create(ctx());
+    expect(runtimeRef).toBeTruthy();
+    expect(resumeCalls).toBe(0); // factory 不 resume（pi 1.5：submit 等进度调用会隐式 resume，但工厂本身不得启用调度）
+    await (session as { close(): Promise<void> }).close();
+    expect(resumeCalls).toBe(0);
   });
 });

@@ -794,8 +794,11 @@ export interface StreamPort {
   status(endpointId: string): PortStatus;
   /** §8.4：按 submission id 精确读一条权威投影。端点冷/记录不存在 → null。 */
   submissionStatus(endpointId: string, submissionId: string): Promise<SubmissionRecord | null>;
-  onEntry(h: (e: PortEntryEvent) => void): Unsubscribe;
-  onTurnEnd(h: (e: { endpointId: string }) => void): Unsubscribe;
+  onEntry(h: (e: PortEntryEvent) => void | Promise<void>): Unsubscribe;
+  /** turnEnd 事件：eligibleEntryIds（可选）是该轮边界已纳入基线/entry 通知的条目 ID 快照
+   *  （pi 1.5 完成屏障：Mailbox 消费事务只选中 entry_id 在此集合的 delivered 行；
+   *   缺省保留原行为）。 */
+  onTurnEnd(h: (e: { endpointId: string; eligibleEntryIds?: readonly string[] }) => void): Unsubscribe;
 }
 
 // ─── ⑨ Transport（§19.2：四个成员的窄接口）───────────────────────────────

@@ -3202,3 +3202,70 @@ describe("audit batch1: A01/A02/A06", () => {
     h.store.close();
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// turnEnd eligibleEntryIds 消费边界（pi 1.5）：消费事务只选 entry_id 在该边界
+// 条目快照内的 delivered 行（entry_id 为空的 P2/P3 行不受影响）；不传该字段
+// （自定义/Fake port）保留原全量行为。
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("mailbox: turnEnd eligibleEntryIds 消费边界", () => {
+  it("只消费 eligible 集合内的 delivered 行；游标只前移到已消费 seq", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A", { presence: "available" });
+    await addAcc(h, "B", { presence: "available" });
+    const conv = await h.registry.ensureDirect("A", "B");
+    const epB = await addHotEndpoint(h, "B");
+    const a = seedMessageDelivery(h, conv.id, "B", { seq: 1, endpointId: epB.id, state: "delivered", path: "P1", grade: "followUp", entryId: "e1" });
+    const b = seedMessageDelivery(h, conv.id, "B", { seq: 2, endpointId: epB.id, state: "delivered", path: "P1", grade: "followUp", entryId: "e2" });
+
+    h.mailbox.handleTurnEnd(epB.id, ["e1"]);
+    expect(deliveryRow(h, a.msgId, "B").state).toBe("consumed");
+    expect(deliveryRow(h, b.msgId, "B").state).toBe("delivered"); // 不在快照：不提前消费
+    const inboxQ = () =>
+      h.db
+        .prepare<[string, string], { cursor_seq: number }>(
+          "SELECT cursor_seq FROM mesh_inboxes WHERE account_id = ? AND conversation_id = ?",
+        )
+        .get("B", conv.id)!;
+    expect(inboxQ().cursor_seq).toBe(1); // 游标只随已消费行前移，不跳到 seq 2
+
+    h.mailbox.handleTurnEnd(epB.id, ["e1", "e2"]);
+    expect(deliveryRow(h, b.msgId, "B").state).toBe("consumed");
+    expect(inboxQ().cursor_seq).toBe(2);
+    h.store.close();
+  });
+
+  it("entry_id 为空的行（P2/P3）不受过滤影响；空快照不消费任何 entry 行", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A", { presence: "available" });
+    await addAcc(h, "B", { presence: "available" });
+    const conv = await h.registry.ensureDirect("A", "B");
+    const epB = await addHotEndpoint(h, "B");
+    const a = seedMessageDelivery(h, conv.id, "B", { seq: 1, endpointId: epB.id, state: "delivered", path: "P1", grade: "followUp", entryId: "e1" });
+    const p3 = seedMessageDelivery(h, conv.id, "B", { seq: 2, endpointId: epB.id, state: "delivered", path: "P3", grade: "silent", entryId: null });
+
+    h.mailbox.handleTurnEnd(epB.id, []); // 空快照：有 entry 的行一律不动
+    expect(deliveryRow(h, a.msgId, "B").state).toBe("delivered");
+
+    h.mailbox.handleTurnEnd(epB.id, ["e1"]); // P3 行 entry_id 为 null → 照常消费
+    expect(deliveryRow(h, a.msgId, "B").state).toBe("consumed");
+    expect(deliveryRow(h, p3.msgId, "B").state).toBe("consumed");
+    h.store.close();
+  });
+
+  it("不传 eligibleEntryIds（自定义/Fake port 老行为）→ 保留原全量消费", async () => {
+    const h = makeHarness();
+    await addAcc(h, "A", { presence: "available" });
+    await addAcc(h, "B", { presence: "available" });
+    const conv = await h.registry.ensureDirect("A", "B");
+    const epB = await addHotEndpoint(h, "B");
+    const a = seedMessageDelivery(h, conv.id, "B", { seq: 1, endpointId: epB.id, state: "delivered", path: "P1", grade: "followUp", entryId: "e1" });
+    const b = seedMessageDelivery(h, conv.id, "B", { seq: 2, endpointId: epB.id, state: "delivered", path: "P1", grade: "followUp", entryId: "e2" });
+
+    h.mailbox.handleTurnEnd(epB.id);
+    expect(deliveryRow(h, a.msgId, "B").state).toBe("consumed");
+    expect(deliveryRow(h, b.msgId, "B").state).toBe("consumed");
+    h.store.close();
+  });
+});

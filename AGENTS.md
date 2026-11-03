@@ -12,7 +12,7 @@
 
 ## 项目与目录
 
-`@pi/agent-mesh` 是基于 pi SDK 的多持久 Agent 消息传递与共享状态层。使用 TypeScript、better-sqlite3、Vitest 与 tsup；发布 ESM、CJS 和类型声明；pi SDK（`@earendil-works/pi-coding-agent` `^1.1.0`）为直接依赖、惰性加载（core-only 使用者不加载 pi）。
+`@pi/agent-mesh` 是基于 pi SDK 的多持久 Agent 消息传递与共享状态层。使用 TypeScript、better-sqlite3、Vitest 与 tsup；发布 ESM、CJS 和类型声明；pi SDK（`@earendil-works/pi-durable`、`@earendil-works/pi-ai`、`@earendil-works/chord`、`@earendil-works/pi-schema`，均为精确版本 1.5.0）为直接依赖、惰性加载（core-only 使用者不加载 pi）。
 
 | 路径 | 职责 |
 | --- | --- |

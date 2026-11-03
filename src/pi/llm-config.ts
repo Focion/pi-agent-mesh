@@ -65,6 +65,9 @@ export interface RuntimeConfig {
   timeout?: number; // provider 请求超时（ms）
   compaction?: { enabled?: boolean; reserveTokens?: number; keepRecentTokens?: number };
   resources?: RuntimeResources;
+  /** pi 1.5 progress 落盘窗口（ms，非负安全整数）。缺省 0：保持与旧版相近的
+   *  每-partial 持久化强度；宿主可显式放宽（如 1000）以减写放大。 */
+  progressPersistWithinMs?: number;
 }
 
 /**
@@ -248,6 +251,19 @@ export function resolveLlmConfig(
  * 静默失效，而是显式拒绝（破坏性变更进 changelog）。缺省 false（隔离）仍合法。
  */
 export function validateRuntimeConfig(runtime: RuntimeConfig | undefined): void {
+  if (runtime?.progressPersistWithinMs !== undefined) {
+    const ms = runtime.progressPersistWithinMs;
+    if (
+      typeof ms !== "number" ||
+      !Number.isSafeInteger(ms) ||
+      ms < 0
+    ) {
+      throw new MeshConfigError(
+        "MESH_BAD_CONFIG",
+        `runtime.progressPersistWithinMs 须为非负安全整数，收到 ${JSON.stringify(ms)}`,
+      );
+    }
+  }
   const resources = runtime?.resources;
   if (!resources) return;
   for (const [key, on] of Object.entries(resources) as Array<
@@ -291,6 +307,7 @@ export function configFingerprint(
     timeout: runtime?.timeout ?? null,
     compaction: runtime?.compaction ?? null,
     resources: runtime?.resources ?? null,
+    progressPersistWithinMs: runtime?.progressPersistWithinMs ?? null,
   };
   return sha256Hex(JSON.stringify({ llm: llmShape, runtime: rtShape }));
 }

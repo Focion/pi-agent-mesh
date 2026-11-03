@@ -30,7 +30,7 @@ export const GAP_LEDGER: GapEntry[] = [
   { id: "I06", summary: "ext/data/attachments 首投/重试/跨进程/投影四处一致", files: ["tests/core/envelope.test.ts"], assertions: ["envelope ext/data/attachments preserved across paths"] },
   { id: "I07", summary: "seal 启用入口 + 消费前验签（篡改即拒并告警）", files: ["tests/core/seal.test.ts"], assertions: ["seal can be enabled", "tampered message rejected before consume"] },
   { id: "I08", summary: "原文字节预算/LRU/读史记账在真实链路生效", files: ["tests/core/mailbox.test.ts"], assertions: ["per-conversation byte budget enforced", "LRU eviction and read-history accounting effective"] },
-  { id: "I09", summary: "P2 按最终输入确认；双端点不互认；P3 不进正文", files: ["tests/pi/p2-confirmation.test.ts", "tests/pi/probe-p2-input.test.ts"], assertions: ["P2 confirmed against final input set", "sibling endpoints don't confirm each other"] },
+  { id: "I09", summary: "P2 按最终输入确认；双端点不互认；P3 不进正文", files: ["tests/pi/p2-confirmation.test.ts"], assertions: ["P2 confirmed against final input set", "sibling endpoints don't confirm each other"] },
   { id: "I10", summary: "CATCHUP 摘要先持久化再推进消费", files: ["tests/pi/catchup.test.ts"], assertions: ["summary persisted and fed to next turn before consumption"] },
   { id: "I11", summary: "请求端点绑定/exclusive/回程定向/abandoned 恰好一次终态", files: ["tests/core/request-answer.test.ts", "tests/e2e/request-answer.test.ts", "tests/e2e/request-cross-process.test.ts"], assertions: ["requester gets exactly one correct terminal state", "cross-process and archive acks have one terminal state"] },
   { id: "I12", summary: "claim 校验/信封不可变/turn_end 不消费任务/重派/死信", files: ["tests/core/queue-claim.test.ts", "tests/core/mailbox.test.ts"], assertions: ["only the legal current claimant advances", "envelope immutable; redelivery and dead-letter traced"] },

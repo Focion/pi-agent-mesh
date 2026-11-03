@@ -896,7 +896,7 @@ export async function createMesh(options: CreateMeshOptions): Promise<MeshHost> 
 
   port.onEntry((e) => mailbox.handleEntryAppended(e));
   port.onTurnEnd((e) => {
-    mailbox.handleTurnEnd(e.endpointId);
+    mailbox.handleTurnEnd(e.endpointId, e.eligibleEntryIds);
     refreshInjection(e.endpointId);
   });
 

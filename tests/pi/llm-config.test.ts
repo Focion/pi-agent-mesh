@@ -9,6 +9,7 @@ import {
   MeshConfigError,
   configFingerprint,
   resolveLlmConfig,
+  validateRuntimeConfig,
   type LlmConfig,
   type ResolvedLlm,
   type RuntimeConfig,
@@ -107,6 +108,34 @@ describe("resolveLlmConfig：凭据 fail-fast（LD4）", () => {
   it("thinkingLevel 透传", () => {
     const r = resolveLlmConfig({ model: "anthropic:claude-opus-5-5", apiKey: "k", thinkingLevel: "high" });
     expect(r.thinkingLevel).toBe("high");
+  });
+});
+
+describe("validateRuntimeConfig：progressPersistWithinMs（pi 1.5）", () => {
+  it("缺省 undefined / 非负安全整数（0、1000）合法", () => {
+    expect(() => validateRuntimeConfig(undefined)).not.toThrow();
+    expect(() => validateRuntimeConfig({})).not.toThrow();
+    expect(() => validateRuntimeConfig({ progressPersistWithinMs: 0 })).not.toThrow();
+    expect(() => validateRuntimeConfig({ progressPersistWithinMs: 1000 })).not.toThrow();
+  });
+
+  it("负数 / 小数 / 非安全整数 / 非数字 → MESH_BAD_CONFIG", () => {
+    for (const bad of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, "1000" as never, null as never]) {
+      try {
+        validateRuntimeConfig({ progressPersistWithinMs: bad });
+        expect.unreachable();
+      } catch (e) {
+        expect(e).toBeInstanceOf(MeshConfigError);
+        expect((e as MeshConfigError).code).toBe("MESH_BAD_CONFIG");
+        expect((e as Error).message).toContain("progressPersistWithinMs");
+      }
+    }
+  });
+
+  it("resources 废弃开关校验不受新字段影响", () => {
+    expect(() =>
+      validateRuntimeConfig({ progressPersistWithinMs: 0, resources: { skills: true } }),
+    ).toThrow(/runtime.resources.skills 已废弃/);
   });
 });
 

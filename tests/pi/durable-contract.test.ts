@@ -13,8 +13,8 @@ import {
   fauxAssistantMessage,
   fauxProvider,
   fauxToolCall,
-  Type,
 } from "@earendil-works/pi-ai";
+import { obj, str } from "@earendil-works/pi-schema";
 import {
   createRegistry,
   defineExtension,
@@ -486,7 +486,7 @@ describe("CT-D11 mesh 工具 replay:safe 后执行中崩溃重开以同一 callI
     const crashy = defineTool({
       name: "crashy",
       description: "blocks on first call, to simulate an execution interrupted by process death",
-      parameters: Type.Object({ v: Type.String() }),
+      parameters: obj({ v: str() }),
       replay: "safe",
       async execute(args, api) {
         callIds.push(api.callId);

@@ -1,5 +1,5 @@
 ---
-title: Pi Agent Mesh 规范 v1.0.3
+title: Pi Agent Mesh 规范 v1.0.4
 date: 2026-09-07
 status: active
 owner: unassigned
@@ -20,10 +20,10 @@ related:
 | 项 | 值 |
 |---|---|
 | 方案名 | **Pi Agent Mesh** |
-| 版本 | **1.0.3**（1.0.0 定稿 + 1.0.1 按 v0.1.0 实现回填 + 1.0.2 收口悬空差距 + 1.0.3 durable 迁移与补偿退役，变更见附录 L.4） |
+| 版本 | **1.0.4**（1.0.0 定稿 + 1.0.1 按 v0.1.0 实现回填 + 1.0.2 收口悬空差距 + 1.0.3 durable 迁移与补偿退役 + 1.0.4 pi 1.5.0 兼容适配，变更见附录 L.4） |
 | 状态 | 定稿（可发布）。核心功能面已冻结，扩展功能面按 §28.4 的 1.x 计划演进 |
 | 包名 | `@pi/agent-mesh`，内含两个模块 `mesh-core` / `mesh-pi` |
-| 依赖 | pi SDK（`@earendil-works/pi-durable` `^1.3.0`，`@earendil-works/pi-ai` `^1.3.0`，`@earendil-works/chord` `^1.3.0`；v0.2.0 起为核心依赖，惰性加载保留——见 §28.5）、SQLite（better-sqlite3 或等价） |
+| 依赖 | pi SDK（`@earendil-works/pi-durable` `1.5.0`，`@earendil-works/pi-ai` `1.5.0`，`@earendil-works/chord` `1.5.0`，`@earendil-works/pi-schema` `1.5.0`，均为精确版本；v0.2.0 起为核心依赖，惰性加载保留——见 §28.5）、SQLite（better-sqlite3 或等价） |
 | 运行基线 | **Node ≥ 24**（`engines.node >=24.0.0`；pi-durable 的 `node:sqlite` 要求 ≥22.5，chord 要求 ≥23.10.0，综合取 ≥24） |
 | 语言 | TypeScript（ESM + CJS 双产物） |
 | 适用读者 | ① 要在 pi SDK 上搭多 Agent 系统的宿主开发者；② 本库的实现者与评审者；③ 运维与 SRE |
@@ -295,7 +295,7 @@ pi SDK 提供的是"一个能力很强的单 Agent"。要把它变成"一群能�
 
 ## 2 平台基线：pi-durable 能力面
 
-本章是全方案的事实底座。**当前实现基线是 `@earendil-works/pi-durable@1.3.0` + `@earendil-works/pi-ai@1.3.0` + `@earendil-works/chord@1.3.0`**（v0.2.0 从 pi-coding-agent 迁移到 pi-durable）。迁移的详细设计见 [durable 迁移计划](notes/plan/2026-10-19-pi-durable-migration-plan.md)（MD1–MD10、OQ1–OQ8），审计裁决见 [审计裁决记录](notes/tech/2026-10-20-audit-rulings.md)（R1–R4）。pi-durable 的核心变化是用事务化 storage + `Harness.open` / `submit` / `root()` 取代 JSONL session 文件 + `AgentSession.sendCustomMessage`，使投递判据从"猜 entry 何时落地"切换到"submission 状态投影为权威"。
+本章是全方案的事实底座。**当前实现基线是 `@earendil-works/pi-durable@1.5.0` + `@earendil-works/pi-ai@1.5.0` + `@earendil-works/chord@1.5.0` + `@earendil-works/pi-schema@1.5.0`（1.0.4 起精确锁定；v0.2.0 发布时基线为 1.3.0，v0.2.0 从 pi-coding-agent 迁移到 pi-durable）**。迁移的详细设计见 [durable 迁移计划](notes/plan/2026-10-19-pi-durable-migration-plan.md)（MD1–MD10、OQ1–OQ8），审计裁决见 [审计裁决记录](notes/tech/2026-10-20-audit-rulings.md)（R1–R4）。pi-durable 的核心变化是用事务化 storage + `Harness.open` / `submit` / `root()` 取代 JSONL session 文件 + `AgentSession.sendCustomMessage`，使投递判据从"猜 entry 何时落地"切换到"submission 状态投影为权威"。**pi 1.5 起，条目镜像与轮次边界改由 `harness.observeCommits()` 提交观察驱动**（取代 1.3/1.4 的 watch 差分）：observer 只同步记录 publication、串行 drain 在 Session 调用栈外消费（按 root conversation 过滤）、历史基线用 `root.entries` 分页、busy 与轮次边界按 `pi.live` 的 run 身份判定；接口细节与 warm/恢复顺序见 §2.4。
 
 §2.1–§2.2 保留 coding-agent 时代的能力实测记录，因为 pi-durable 的投递原语（`submit`）与 coding-agent 的投递原语（`sendCustomMessage`）存在结构性差异，旧记录仍然对理解为什么「补偿机制存在过」有价值。**§2.3（F1–F5）的补偿机制已在 v0.2.0 退役**——pi-durable 的 submission 模型提供了 `submissionStatus(id)` 精确读，不再需要 handoff 超时回退、entry 差分镜像、clearQueue 协议或自持 inFlight 计数。§2.4 的 StreamPort 接口也按新模型重写。
 
@@ -479,13 +479,13 @@ const inContext = new Set(ctx.sessionManager.buildContextEntries().map(e => e.id
 | hook 覆盖矩阵（P2 / 崩溃恢复选点） | `agent_start`·`turn_*`·`message_*`·`agent_settled`·`agent_before_settle`·`context`·`context_with_system` 点亮；`entry_appended` 不覆盖 `sendCustomMessage`（只走 `appendCustomEntry`/boundary）；`before_agent_start` 只走用户 prompt 路径（I19 ⇒ 库永不触发）；provider HTTP 钩子（`before_provider_request` / `provider_stream_event`）在 faux 下不点亮，**不得**选作确认点 | `tests/pi/probe-hooks.test.ts` |
 | 磁盘 session 的 create / open（§8.6） | **确定**。`SessionManager.create()` 在 `newSession()` 即把 `getSessionFile()` 置为非空路径（`?? getSessionId()` 永不回退）；文件本体延迟到首条 user/assistant 消息后落盘；按同路径 `open()` 恢复同一 sessionId | `tests/pi/probe-disk-session.test.ts` |
 
-### 2.4 `StreamPort`：锁定的 11 个方法（v0.2.0）
+### 2.4 `StreamPort`：锁定的 10 个方法（v0.2.0，1.0.4 更新）
 
-`StreamPort` 是 `mesh-core` 与 pi SDK 之间**唯一**的接口。v0.2.0 起由 durable 端口实现（`src/pi/durable-port.ts`），恰好 11 个方法，一个不多一个不少；`mesh-core` 对 pi 的全部依赖都收敛在这里。
+`StreamPort` 是 `mesh-core` 与 pi SDK 之间**唯一**的接口。v0.2.0 起由 durable 端口实现（`src/pi/durable-port.ts`），恰好 10 个方法，一个不多一个不少；`mesh-core` 对 pi 的全部依赖都收敛在这里。1.0.4 更新：`hasEntries` 从接口删除（崩溃恢复只走 `submissionStatus` 对账）、`dispose` 退出接口（A21 强制卸载保留为 durable 端口实现细节，由 `close()` 鸭子类型调用），`onEntry` 处理器放宽为可返回 Promise（确认完成屏障）、`onTurnEnd` 事件增加 `eligibleEntryIds` 快照，观察实现由 watch 差分改为 `observeCommits()`（见接口块后的说明）。
 
 ```ts
 interface StreamPort {
-  warm(endpointId: string, lease?: "shared" | "exclusive"): Promise<void>;  // 默认 exclusive（M3，§8.3）
+  warm(endpointId: string, lease?: MeshLease): Promise<void>;  // 默认 exclusive（M3，§8.3）
   evict(endpointId: string): Promise<void>;
 
   deliver(endpointId: string, rendered: string, envelope: Envelope, grade: Grade,
@@ -495,7 +495,7 @@ interface StreamPort {
         //   write 型 status ∈ queued|done；placed/done 即 entry 已落盘 / 已进上下文）。
         //   deliver() 的返回不代表 delivered——判据是 submissionStatus（§7.9）。
 
-  nudge(endpointId: string, cue: string | CustomMessage,
+  nudge(endpointId: string, cue: string,
         opts?: { deliverAs?: "steer" | "followUp"; triggerTurn?: boolean }): Promise<void>;
         // ↑ 宿主驱动自己的 Agent（Q15）：走同一条写入通道保证 M3，但不入账、不产生 delivery
 
@@ -505,29 +505,36 @@ interface StreamPort {
   injectContext(endpointId: string, text: string): Unsubscribe;   // §7.6 P2 路径
 
   submissionStatus(endpointId: string, submissionId: string): Promise<SubmissionRecord | null>;
-        // ↑ v0.2.0 新增：按 submission id 精确读 durable 的权威状态投影。
+        // ↑ 按 submission id 精确读 durable 的权威状态投影。
         //   返回 {id, status∈queued|placed|done|unanswered, entryId?, type∈input|write}；
-        //   null = 未找到（submissionId 不存在于该端点）。
+        //   null = 未找到。**pi 1.5 的 continue 投影显式报不支持**：返回 null，
+        //   不伪装成 input/write、不为 continue 提交新增条目（§9 F-A）。
 
-  status(endpointId: string): { state: EndpointState; busy: boolean; inFlight: number;
-                                idleMs?: number };
-        // ↑ inFlight 由端口实现从 pi.inbox 深度真实读，不是库自持计数（F3 已退役）
+  status(endpointId: string): PortStatus;   // { state, busy, inFlight, idleMs? }（类型见 §12.6⑥）
+        // ↑ inFlight 是端口自持的 handoff 计数（§7.8；非 SDK 的 pendingMessageCount，F3 已退役）；
+        //   busy 由提交观察维护的 pi.live 状态派生（live.run 存在 ⇒ busy）。
 
-  hasEntries(endpointId: string, entryIds: string[]): Promise<Set<string>>;
-        // ↑ 返回其中"仍存在于该 stream"的子集。崩溃恢复核对的辅助手段（durable entries() 按 id 逐条问）。
+  onEntry(h: (e: PortEntryEvent) => void | Promise<void>): Unsubscribe;
+        // ↑ 条目镜像（byte-fidelity），envelopeId 是 delivered 归因的辅助依据（§7.9）。
+        //   1.0.4：处理器返回值构成**确认完成屏障**——Mailbox 推进 delivered 的消费
+        //   必须 await 该 promise（先 delivered 后 consumed，§7.9⑥）。
 
-  onEntry(h: (e: { endpointId: string; entryId: string; parentId?: string;
-                   envelopeId?: string; entryType: string; seqInStream: number;
-                   rawJson: string }) => void): Unsubscribe;
-        // ↑ envelopeId 从 details 取出，是 delivered 归因的辅助依据（§7.9）。
-        //   v0.2.0 增加了 entryType 与 seqInStream 字段以支持 durable 的 watch() 差分镜像。
-
-  onTurnEnd(h: (e: { endpointId: string }) => void): Unsubscribe;   // §7.9 → consumed
-
-  dispose(): Promise<void>;
-        // ↑ v0.2.0 新增：强制卸载该端口管理的全部流（A21 close 强制卸载）。
+  onTurnEnd(h: (e: { endpointId: string; eligibleEntryIds?: readonly string[] }) => void): Unsubscribe;
+        // ↑ §7.9 → consumed。1.0.4：事件携带该轮边界内已纳入基线/entry 通知的条目 ID 快照
+        //   （pi 1.5 完成屏障）；Mailbox 消费事务只选 entry_id 在此集合内的 delivered 行，
+        //   entry_id 为 null 的 P3 行不受过滤。自定义 / Fake 端口不传该字段 ⇒ 保留
+        //   原有全量消费行为（§7.9⑥）。
 }
 ```
+
+**pi 1.3/1.4 watch → pi 1.5 `observeCommits`（1.0.4）**：条目镜像与轮次边界不再由 `watch()` 差分驱动，改为 `harness.observeCommits()` 提交观察。约束与顺序：
+
+- observer 的 `advance(publication)` **只同步记录**：不得 await、不得调 Session、不得抛错（抛错会以 `listener_error` 摘除观察器）；
+- **串行 drain** 在 Session 调用栈外逐个消费 publication，按 root conversation 过滤；早于 live 状态的 entry 先处理；
+- 历史基线用 `root.entries` 分页读取，**不依赖 50/100 窗口**（窗口外条目不再漏镜像）；
+- busy→idle 与旧 run→新 run 边界按 `pi.live` 的 run 身份（inputs 集合）判定；
+- `harness.resume()` 在 **warm 末尾**才调用（观察器挂好、基线就绪之后），warm 后半段失败须回滚：摘除 stream、detach 观察器、释放单写者锁；
+- 观察器 `end` 在任意关闭时触发——非正常终止（`session closed` 异常路径）必须走 `unavailable` + 降级通道（`onDegraded`），不得表现为正常热态。
 
 **coding-agent 时代的差异（信息性，非规范要求）**：
 
@@ -535,9 +542,9 @@ interface StreamPort {
 |---|---|---|
 | `deliver` 返回 | `{ entryId? }`（entryId 可能为 undefined） | `SubmissionHandle { submissionId, status, entryId? }` |
 | delivered 判据 | `entry_appended` 事件（猜 entry 是否落地） | `submissionStatus(id)` 权威投影 |
-| 背压来源 | 库自持 `inFlightCount`（F3） | `port.status().inFlight`（端口实现从 real inbox 深度读出） |
+| 背压来源 | 库自持 `inFlightCount`（F3） | `port.status().inFlight`（端口自持 handoff 计数，§7.8；非 SDK 的 pendingMessageCount） |
 | entry 窗口 | `handoff_at` 时间 + `handoffTimeoutMs` 超时回退（F5） | submission 状态机：`queued` → `placed/done/unanswered`，无需超时猜测 |
-| 崩溃恢复 | hasEntries + handoff_at 双向核对 | submissionStatus 按 id 精确读（A03/A04） |
+| 崩溃恢复 | hasEntries + handoff_at 双向核对 | submissionStatus 按 id 精确读（A03/A04）；`hasEntries` 已于 1.0.4 从接口删除 |
 
 > **为什么是 `onTurnEnd` 而不是 `onSettled`**：`agent_settled` 的 payload 是空的且一次 run 只发一次，无法回答"这一轮包含哪几条 delivery"（F2）。归因靠 `onEntry` 的 `envelopeId`，确认靠随后的 `onTurnEnd`。
 
@@ -550,7 +557,7 @@ interface StreamPort {
 | 3 | **session 托管的归属变成可退出的决定**：宿主坚持自管 session？实现自己的 `StreamPort` 即可，`mesh-core` 一行不改 |
 | 4 | **对冲平台演进风险**：pi 将来自带 peer 消息能力时，换 `StreamPort` 实现即可，库的价值（唤醒策略 / 未读 / 群语义 / 共享空间）不受影响 |
 
-**自定义 `StreamPort` 的代价必须明确**：`replay`（§23.2）、崩溃恢复的双向核对（§8.4）、`.lock` 单写者（M3）三项都依赖 `onEntry` 提供的 byte-fidelity 镜像。宿主的实现若不提供 `onEntry`，库会在启动时**降级并警告**：这三项保证失效。库不假装它们还成立。
+**自定义 `StreamPort` 的代价必须明确**：`replay`（§23.2）依赖 `onEntry` 提供的 byte-fidelity 镜像，投递消费归因（§7.9）依赖 `onEntry` 与 `onTurnEnd` 的配对，`.lock` 单写者（M3）由端口的 warm/evict 租约保证。宿主的实现若不提供 `onEntry`，库会在启动时**降级并警告**：这些保证失效。`onTurnEnd` 不传 `eligibleEntryIds` 的自定义端口退化为全量消费（§7.9⑥，不丢投递、只损失边界精度）。库不假装这些保证还成立。
 
 ---
 ## 3 架构
@@ -1302,7 +1309,7 @@ inFlight(endpointId) = count(deliveries
 | `→ dropped(folded)` | 被折叠进摘要 | 同上 |
 | `→ dropped(reason)` | 带原因码（§7.10） | 同上 |
 
-**五处必须解释清楚的地方：**
+**六处必须解释清楚的地方：**
 
 **① `delivered` 的判据是 `submissionStatus`，不是 `deliver()` 返回**（F5 已退役）。durable 的 `submit` 分两型：
   - **input 型**（`triggerTurn: true`）：`deliver()` 返回 `{submissionId, status: "placed"}` → 即标记 `delivered`。`submissionStatus` 随后推进到 `done` → `consumed`。
@@ -1319,6 +1326,13 @@ inFlight(endpointId) = count(deliveries
 **⑤ `delivered → queued` 补偿边（v0.2.0 替代 I22）：**
 - `queue` 会话：`delivered → claimed → acked`，`claimed` 超时回 `queued` 供其他消费者重新竞争。这是**正常路径上**唯一允许 `delivered` 之后回退的类型，因为竞争消费的语义就是"没 ack 等于没消费"。
 - **submission 对账重投**（替代 I22/beforeClearQueue）：崩溃恢复 (`reconcileDelivered`) 按 `submission_id` 读 `submissionStatus`，若返回 `unanswered`（无 entry）→ `delivered → queued` 重投并计 `queue_cleared_detected`。这是对账驱动的补偿边，取代 coding-agent 时代需要宿主配合的 `beforeClearQueue` 协议。A08 场景覆盖此路径。
+
+**⑥ 确认完成屏障与消费边界（1.0.4）：** pi 1.5 起条目镜像由 `observeCommits()` 提交观察驱动（§2.4），轮次边界不再有可依赖的差分信号，投递语义不变，但补两道闸：
+
+- **先 delivered 后 consumed 的确认屏障**：`onEntry` 处理器返回 `void | Promise<void>`。Mailbox 对带 `submission_id` 的 queued/routed 行调用 `handleEntryAppended` 时，delivered 的确认推进（`confirmEntryDelivery`）**等待该 promise**——镜像已落库之后，消费推进才发生。包根装配（`src/index.ts`）必须原样透传返回值，不得吞掉 promise。
+- **turnEnd 的消费边界**：`onTurnEnd` 事件携带 `eligibleEntryIds`（该轮边界内已纳入基线/entry 通知的条目 ID 快照，pi 1.5 完成屏障）。Mailbox 消费事务只选 `entry_id` 在此集合内的 delivered 行；`entry_id IS NULL` 的 P3 行不受过滤。自定义 / Fake 端口不传该字段时保留原行为（全量消费）。
+
+input/write 的投递语义本身不变：① 的判据仍是 `submissionStatus`，② 的 `parked`、③ 的 `folded`、④ 的 `consumed(partial)` 照旧。
 
 ### 7.10 原因码总表
 
@@ -3517,6 +3531,10 @@ interface RuntimeConfig {
   compaction?: { enabled?: boolean; reserveTokens?: number; keepRecentTokens?: number };
                                              // pi 的上下文压缩，**与 §7.5 的 mailbox 折叠无关**
   resources?: RuntimeResources;
+  progressPersistWithinMs?: number;          // 1.0.4：pi 1.5 progress 落盘窗口（非负安全整数）。
+                                             // 缺省 0 ≈ 旧版每-partial 即落盘的强度；宿主可显式
+                                             // 放宽（如 1000）以减写放大（对应 durable 的
+                                             // `progress.persistWithinMs`）
 }
 interface RuntimeResources {                 // 全部缺省关闭；要继承必须显式打开并自担风险
   extensions?: boolean; skills?: boolean; prompts?: boolean;
@@ -6607,8 +6625,8 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 #### ④ 完全自定义 `StreamPort`（非 pi 执行体）
 
 - **适用条件**：接收方不是 pi session——例如一个 HTTP 推理服务、一个别的 Agent 框架、一段规则引擎。此时用 `MeshConfig.streamPort` 换掉整个 `mesh-pi`，只保留零 pi 依赖的 `mesh-core`（约 85%）。
-- **装配差异**：实现 `StreamPort` 的 10 个方法（`warm` `evict` `deliver` `nudge` `note` `injectContext` `status` `hasEntries` `onEntry` `onTurnEnd`）。语义要点：`deliver` 之后**必须**在条目真正落到执行体的历史上时触发 `onEntry`（这是 `delivered` 的判据，F5），轮次结束时触发 `onTurnEnd`（这是 `consumed` 的判据）。`SessionFactory` 此时返回你自己的执行体句柄。
-- **代价**：**三项保证失效**——会话回放（`observer.replay`）、崩溃后的恢复核对（§8.4）、`.lock` 单写者强制。这三项都建立在"条目历史是 append-only 且可读"之上；自定义实现如果不提供等价的条目历史，M5 的幂等应用要由你自己保证。这是四种模式里唯一会削弱库级约束的一种，**不应当**为了"看起来更解耦"而选它。
+- **装配差异**：实现 `StreamPort` 的 10 个方法（`warm` `evict` `deliver` `nudge` `note` `injectContext` `status` `submissionStatus` `onEntry` `onTurnEnd`）。语义要点：`deliver` 之后**必须**在条目真正落到执行体的历史上时触发 `onEntry`，并以 `submissionStatus` 的权威投影推进 `delivered`（不是 `deliver()` 的返回，§7.9①）；轮次结束时触发 `onTurnEnd`（`consumed` 的判据），1.0.4 起事件带 `eligibleEntryIds` 快照、`onEntry` 处理器返回值构成确认完成屏障（§2.4、§7.9⑥）。`SessionFactory` 此时返回你自己的执行体句柄。
+- **代价**：**三项保证失效**——会话回放（`observer.replay`）、崩溃后的恢复核对（§8.4，依赖 `submissionStatus` 与条目历史）、`.lock` 单写者强制。这三项都建立在"条目历史是 append-only 且可读"之上；自定义实现如果不提供等价的条目历史与 submission 投影，M5 的幂等应用要由你自己保证。这是四种模式里唯一会削弱库级约束的一种，**不应当**为了"看起来更解耦"而选它。
 
 ### 26.5 六个反模式
 
@@ -6973,9 +6991,9 @@ message_delivered {"messageId":"msg_02…","accountId":"acct_alice","grade":"fol
 
 ### 28.5 pi SDK 版本兼容
 
-**依赖声明**：`@earendil-works/pi-coding-agent` **`^1.1.0`**，作为**直接 `dependency`**、在 `mesh-pi` 内惰性加载（v0.1.0 起；原设计是 optional `peerDependency`，改动理由与代价见 §29.2）。
+**依赖声明**：v0.1.0 为 `@earendil-works/pi-coding-agent` **`^1.1.0`**（原设计是 optional `peerDependency`，改动理由与代价见 §29.2）。**v0.2.0 起改为 `@earendil-works/pi-durable` + `pi-ai` + `chord`（1.0.4 再加 `pi-schema`），作为直接 `dependency`、惰性加载；1.0.4 起精确锁定 1.5.0（不再用范围）**——平台基线随 1.5 升级把观察实现从 watch 差分切到 `observeCommits()` 提交观察（§2.4），锁版本是让行为可复现。
 
-核实基线有两层：0.84.4 是本文档全部 SDK 事实的**首次**核实基线（§2.2 的八条实测结论、§2.3 的 F1–F5、`StreamPort` 十个方法的可实现性）；**1.1.0 是当前实现基线**，五条 F 已逐条重跑复核，唯一差异（`agent_settled` 增 `aborted`）登记在 §2.3 末。**低于 1.1.0 的行为在 v0.1.0 未经核实，不予支持。**
+核实基线有两层：0.84.4 是本文档全部 SDK 事实的**首次**核实基线（§2.2 的八条实测结论、§2.3 的 F1–F5、`StreamPort` 十个方法的可实现性）；**1.1.0 是 coding-agent 时代的实现基线**，五条 F 已逐条重跑复核，唯一差异（`agent_settled` 增 `aborted`）登记在 §2.3 末。**低于 1.1.0 的行为在 v0.1.0 未经核实，不予支持。** v0.2.0 的基线为 pi-durable 1.3.0（§2、附录 L.4 1.0.3），**1.0.4 的基线为 1.5.0**（§2、附录 L.4 1.0.4）。
 
 **F1–F5 契约测试是升级 pi 时的第一道闸。** 它们的职责不是"探索 pi 能做什么"（那件事已经做完了），而是**锁住这些已确认的事实不被 SDK 升级悄悄改掉**。要锁的清单：
 
@@ -8588,6 +8606,7 @@ pi session 的条目是**单会话视角**的，问不出"这条消息在 7 个�
 | **1.0.2** | 2026-10-19 | 定稿 | **收口 0.1.0 之后的规范差距（D1/D2/D3、T2/T3/T8/T9）。** D1：§12.5 事件 `endpointId` 由「每个事件都携带（硬要求）」收窄为「带端点语义的事件才携带」——6 个端点半身事件保留 `endpointId`，其余 9 个事件归因到 `accountId`/`by`/`from`（附录 C 同步）；D2：§12.6⑤ 删除 `MeshEvent`/`MeshEventMeta` 判别联合（破坏性，配套 `notes/changelog/2026-10-19-v0.1.0-open-items.md`）；D3：附录 E 恢复 `wake_per_message_busy` 自增点（`renderAndDeliver` 在「醒来但 busy」时 +1 的 canary）；T2：C15 断言与 §12.2 管理员护栏统一盯 `setCaps`（附录 D 的 `NO_ADMIN_LEFT` 同步）；T3：§7.10/§9.5 静音冷流语义由 `silent+cold → parked` 改为「只写 Inbox，delivery 留 queued，不 park 不丢正文」；T8：附录 F.1 `outboxDoneRetentionMs` 标注保留窗口起算点是 `claimed_at` 而非精确 `done_at`；T9：§14.4 `abandoned` 的「发起方账号注销」分支标注无触发路径 |
 
 | **1.0.3** | 2026-10-26 | 定稿 | **durable 迁移与补偿退役（v0.2.0）。四类破坏性变更，三种补偿机制删除。** 平台基线从 pi-coding-agent@1.1.0 迁移到 pi-durable@1.3.0 + pi-ai@1.3.0 + chord@1.3.0（MD1–MD10、OQ1–OQ8 落成决策编号 Q21–Q38，见下文）；运行基线抬至 Node ≥ 24（`engines.node >=24.0.0`）。**StreamPort 契约重构（§2.4）**：方法数 10→11，`deliver` 返回 `SubmissionHandle {submissionId, status, entryId?}`（取代 `{entryId?}`）；新增 `submissionStatus(endpointId, submissionId)` 权威投影读；新增 `dispose()` 强制卸载（A21）。**投递判据改读 submission（§7.9）**：`delivered` 判据从 `entry_appended` 事件改为 `submissionStatus` 返回 `placed`/`done`（§9 F-A）；`consumed` 按 input/write 两型分流；崩溃恢复（§8.4）从 `hasEntries` + handoff_at 双向核对改为 `submissionStatus` 按 id 精确读（A03/A04）。**补偿机制退役（F1–F5，§2.3）**：handoff 超时回退（F5）、entry 差分镜像（F2）、`beforeClearQueue`/I22 协议（F3）、`inFlightCount` 自持计数（F3）全部删除；I22 标记为退役，`delivered→queued` 补偿边改为由 submission 对账（`unanswered` 无 entry）驱动（A08/A09）。**端点标识重构（迁 5）**：`piSessionId`→`runtimeRef`（`{storagePath, conversationId}` 的 JSON 包装）；增量子迁移 `005_runtime_ref.sql` 随后并入基线 `000_init.sql`（`mesh_endpoints.pi_session_id`→`runtime_ref`，`mesh_deliveries` 加 `submission_id`/`attempt`，`mesh_stream_entries` 主键改 `(runtime_ref, entry_id)`）；`RuntimeRef` 类型公开导出 + `decodeRuntimeRef`/`encodeRuntimeRef` 辅助函数。**后续收口（2026-11-01）**：`handoffTimeoutMs`（RuntimeLimits）/`handoffAt`（DeliveryTrace）随后完全移除（类型、校验、默认值、observer 内部行类型、~25 测试文件）；`handoff_at` 列从 `mesh_deliveries` DDL 删除（基线 `000_init.sql`）；`delivery_handoff_timeout` 计数器移除；`handoffTimeoutMs` 运行时限制移除；增量迁移 001–005 并入基线，不再独立维护。**规范裁决落文（R1–R4）**：R1 cursor_seq 高水位（消费推进不越过非终态 seq）；R2 folded_to_seq 权威（由 fold 路径落盘，恢复只读不修）+ SCHEMA_VERSION 未知迁移戳拒绝；R3 根入口值导出 MeshRejectError + tsup splitting 统一类身份；R4 §5.2 投递集优先（定向消息非收件人不可见，附录 J O2 从「未决」改「已决」）。**安全加固（步骤 2–8）**：A01 多端点反查按 endpoint_id 定位；A02 fanout 逐收件人 try/catch + sweep routed 滞留重投；A11 outbox 状态回写带 CAS；A15 FTS 写回退；A22 能力校验前移抢锁前 + 装配回滚；A26 全写入口 assertOpen + close 等在途 sweep；A30 定向可见性过滤；A32 建群准入夹紧；A33 outbox 回源验签；A34 渲染转义 + shared ACL + 大小上限。**破坏性变更（四条合并）**：① `engines.node >=24`；② `RuntimeConfig.resources` 废弃（显式抛错）；③ `piSessionId`→`runtimeRef`（API 改名，历史数据通过迁移脚本升级）；④ coding-agent JSONL session 文件不平移（v0.1.0 的历史 session 不能在 v0.2.0 上直接恢复）。详见 `CHANGELOG.md`。 |
+| **1.0.4** | 2026-11-03 | 定稿 | **pi 1.5.0 兼容适配。** 平台基线精确锁定 `@earendil-works/pi-durable`/`pi-ai`/`chord`/`pi-schema` 1.5.0（§2、§28.5）。**观察实现由 watch 差分改为 `harness.observeCommits()` 提交观察（§2.4）**：observer 的 `advance` 只同步记录、串行 drain 在 Session 调用栈外消费 publication、按 root conversation 过滤、历史基线用 `root.entries` 分页（不依赖 50/100 窗口）；busy→idle 与旧 run→新 run 边界按 `pi.live` 的 run 身份（inputs 集合）判定（`status().busy` 由该状态派生）。**StreamPort 收为 10 个方法**：删 `hasEntries`（崩溃恢复只走 `submissionStatus` 对账）、`dispose` 退出接口（A21 强制卸载保留为 durable 端口实现细节，`close()` 鸭子类型调用）；`onEntry` 处理器放宽为 `void | Promise<void>`，返回值构成确认完成屏障；`onTurnEnd` 事件增加 `eligibleEntryIds?` 快照，Mailbox 消费事务只选该集合内的 delivered 行（`entry_id` 为 null 的 P3 行不过滤；不传该字段的端口保留全量消费，§7.9⑥）；continue 提交投影显式报不支持（`submissionStatus` 返回 null，不伪装 input/write）。**生命周期调整（§2.4）**：`harness.resume()` 移至端口 warm 末尾，warm 后半段失败回滚（摘除 stream、detach 观察器、释放单写者锁）；观察器非正常终止（`session closed` 异常路径）走 `unavailable` + 降级通道，不表现为正常热态。**配置**：`RuntimeConfig.progressPersistWithinMs` 新增、默认 `0`（保留近逐 partial 的持久化强度；宿主可显式设 1000 等非负安全整数，§12.6）。**DDL 不变**（schema 快照校验通过，§11.4 无新迁移）。详见 `notes/changelog/2026-11-02-pi-1-5-upgrade.md`。 |
 
 1.0.0 之后的版本记录追加在此表，格式不变。1.x 的功能路线见 §28.4，其中开放问题 O1–O8 的预计版本见附录 J。**破坏性变更**若不可避免，**必须**在此表标注并给出迁移脚本（§28.3）。
 

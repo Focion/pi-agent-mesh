@@ -69,14 +69,16 @@ export function endpointStoragePath(opts: {
 }
 
 /** runtime.retry/timeout/compaction → durable HarnessSettings（settings.{retry,stream,compaction}）。
- *  HarnessSettings 的字段是 readonly，故整对象用字面量 + 条件展开构造，不先建空对象再逐个赋值。 */
-function buildDurableSettings(runtime: RuntimeConfig | undefined): HarnessSettings | undefined {
-  if (!runtime) return undefined;
-  const retry = runtime.retry;
-  const compaction = runtime.compaction;
-  const timeout = runtime.timeout;
-  if (!retry && !compaction && timeout === undefined) return undefined;
+ *  HarnessSettings 的字段是 readonly，故整对象用字面量 + 条件展开构造，不先建空对象再逐个赋值。
+ *  pi 1.5 起 progress.persistWithinMs 缺省 1000（部分输出最长滞留 1s 才落盘）；mesh 恒显式
+ *  传 progress（缺省 0 ≈ 旧版每-partial 即落盘的强度），宿主可经 runtime.progressPersistWithinMs
+ *  放宽。故本函数恒返回 settings 对象（不再返回 undefined）。导出供单测锁定映射。 */
+export function buildDurableSettings(runtime: RuntimeConfig | undefined): HarnessSettings {
+  const retry = runtime?.retry;
+  const compaction = runtime?.compaction;
+  const timeout = runtime?.timeout;
   return {
+    progress: { persistWithinMs: runtime?.progressPersistWithinMs ?? 0 },
     ...(retry
       ? {
           retry: {
@@ -101,16 +103,18 @@ function buildDurableSettings(runtime: RuntimeConfig | undefined): HarnessSettin
 }
 
 /**
- * 每端点装配一个 DurableSession：开 storage → Harness.open → resume → root。
+ * 每端点装配一个 DurableSession：开 storage → Harness.open → root。
  * create 用 root(ctx,{agent}) 首建；open 用 root(ctx) + configure 重应用（F-G）。
  * chord Context 只在 src/pi/ 内构造（sdk.BackgroundContext），绝不外泄到 core。
+ * ⚠ 不在此处 resume：harness.resume() 由 PiStreamPort 在 warm 末尾调用（pi 1.5 升级，
+ * 启动顺序归 port 统一编排，失败回滚见 durable-port）。
  */
 async function assemble(
   sdk: Awaited<ReturnType<typeof loadDurableSdk>>,
   models: Models,
   modelRef: ModelRef,
   thinkingLevel: ModelThinkingLevel | undefined,
-  settings: HarnessSettings | undefined,
+  settings: HarnessSettings,
   tools: ToolDefinition[],
   endpoint: Endpoint,
   storagePath: string,
@@ -131,13 +135,12 @@ async function assemble(
     {
       models,
       registry,
-      ...(settings ? { settings } : {}),
+      settings,
       // MD8：durable 的失败通道（task_faulted / task_parked / extension_error 等非致命失败）。
       ...(onReport ? { onReport } : {}),
     },
     ctx,
   );
-  harness.resume();
 
   const agentChange = {
     model: modelRef,
@@ -241,7 +244,7 @@ export function createPiSessionFactory(opts: PiSessionFactoryOptions): SessionFa
     const storagePath =
       (mode === "open" ? decodeRuntimeRef(runtimeRef)?.storagePath : undefined) ??
       endpointStoragePath({ stateDir: opts.stateDir, endpoint, cwdFor: opts.cwdFor });
-    return assemble(sdk, models, modelRef, thinkingLevel, settings as HarnessSettings | undefined, tools, endpoint, storagePath, mode, opts.onReport);
+    return assemble(sdk, models, modelRef, thinkingLevel, settings as HarnessSettings, tools, endpoint, storagePath, mode, opts.onReport);
   }
 
   return {

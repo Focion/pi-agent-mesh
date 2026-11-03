@@ -74,6 +74,8 @@ export interface DurableSessionSurface {
 /**
  * 最小可过 durable-port `narrowDurableSession` 的假会话（无真 pi）。锁/租约/超时类
  * 用例只需 warm 成功与 deliver 落一个当场 done 的 submission，不需要真实转录。
+ * pi 1.5：narrow 检查 harness.observeCommits / harness.resume / harness.closed，
+ * 不再检查 root.watch（观察改走提交观察）。
  */
 export function fakeDurableSession(): unknown {
   return {
@@ -89,7 +91,11 @@ export function fakeDurableSession(): unknown {
       waitForIdle: async () => {},
     },
     registry: { install: () => {} },
-    harness: { closed: new Promise<never>(() => {}) },
+    harness: {
+      observeCommits: () => ({ detach: () => {} }),
+      resume: () => {},
+      closed: new Promise<never>(() => {}),
+    },
     configure: async () => {},
     close: async () => {},
   };

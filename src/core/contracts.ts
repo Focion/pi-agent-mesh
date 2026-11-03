@@ -154,7 +154,9 @@ export interface Router {
 export interface Mailbox {
   /** Router 事务提交后调用：逐 delivery 定档/唤醒/选端，执行投递 */
   fanout(envelope: Envelope): Promise<void>;
-  /** StreamPort.onEntry 回调：镜像入库 + delivery → delivered（F5 判据） */
+  /** StreamPort.onEntry 回调：镜像入库 + delivery → delivered（F5 判据）。
+   *  返回的 Promise 是 entry 确认的完成信号（pi 1.5 完成屏障）：port 在发同一提交边界
+   *  的 turnEnd 前等待它落定，保证先 delivered 后 consumed。 */
   handleEntryAppended(e: {
     endpointId: EndpointId;
     entryId: string;
@@ -163,9 +165,11 @@ export interface Mailbox {
     entryType: string;
     seqInStream: number;
     rawJson: string;
-  }): void;
-  /** StreamPort.onTurnEnd 回调：该轮已 delivered 的 → consumed，未读清零 */
-  handleTurnEnd(endpointId: EndpointId): void;
+  }): void | Promise<void>;
+  /** StreamPort.onTurnEnd 回调：该轮已 delivered 的 → consumed，未读清零。
+   *  eligibleEntryIds（可选）是该轮边界已通知的条目 ID 快照：消费事务只选中 entry_id
+   *  在此集合（或 entry 为空的 P2/P3）的行；缺省（自定义/Fake port）保留原全量行为。 */
+  handleTurnEnd(endpointId: EndpointId, eligibleEntryIds?: readonly string[]): void;
   /** 周期清扫：parked TTL、routed 滞留重投、溢出折叠、seq 缺口超时 */
   sweep(nowMs?: number): Promise<void>;
   /** warm 成功后：该端点 parked → queued 并重投 */

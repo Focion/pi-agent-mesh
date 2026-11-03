@@ -20,7 +20,7 @@ import { EndpointLock, LockHeldError } from "../../src/pi/lock.js";
 import { PiPortError, PiStreamPort } from "../../src/pi/durable-port.js";
 import { createPiSessionFactory } from "../../src/pi/session-factory.js";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { createFaux, waitFor, type Faux } from "../helpers/pi-session.js";
+import { createFaux, fakeDurableSession, waitFor, type Faux } from "../helpers/pi-session.js";
 
 // ── 测试工厂：createPiSessionFactory 高级路径 + faux provider（每端点真 durable storage）───
 
@@ -68,7 +68,7 @@ let port: PiStreamPort;
 let accounts: Map<string, Account>;
 let endpoints: Map<string, Endpoint>;
 let entries: PortEntryEvent[];
-let turnEnds: Array<{ endpointId: string }>;
+let turnEnds: Array<{ endpointId: string; eligibleEntryIds?: readonly string[] }>;
 let degraded: Array<{ reason: string; endpointId: string }>;
 
 beforeEach(async () => {
@@ -106,7 +106,9 @@ beforeEach(async () => {
     idleEvictMs: 0, // 测试不做空闲驱逐
     onDegraded: (info) => degraded.push(info),
   });
-  port.onEntry((e) => entries.push(e));
+  port.onEntry((e) => {
+    entries.push(e);
+  });
   port.onTurnEnd((e) => turnEnds.push(e));
 });
 
@@ -410,5 +412,225 @@ describe("PiStreamPort: lock_path 归属落库（§19.4 / C10）", () => {
     await tracking.evict(ep.id);
     expect(lockPaths.get(ep.id)).toBeNull();
     await tracking.dispose();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// pi 1.5 observeCommits 回归：提交 drain 的镜像/屏障/轮次边界/失败通道。
+// 关键回归面：>100 提交窗口无漏无重（旧 watch 50/100 滚动窗口会漏）、慢确认
+// 屏障（先 delivered 后 consumed）、快速连续 run 不合并 turnEnd、warm 后半段
+// 失败回滚、continue 投影显式不支持、session 失败通道、重开基线去重。
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("PiStreamPort: observeCommits 回归（pi 1.5）", () => {
+  /** 与 beforeEach 相同的 deps，仅换 sessionFactory：假会话/失败注入用例用。 */
+  function portWith(factory: SessionFactory): PiStreamPort {
+    return new PiStreamPort({
+      writerId: "test-writer",
+      sessionFactory: factory,
+      getEndpoint: (id) => endpoints.get(id),
+      getAccount: (id) => accounts.get(id),
+      buildTools: () => [],
+      setEndpointState: (id, state) => {
+        const e = endpoints.get(id);
+        if (e) e.state = state;
+      },
+      setEndpointSession: (id, sid) => {
+        const e = endpoints.get(id);
+        if (e) e.runtimeRef = sid;
+      },
+      setEndpointLease: (id, lease, until) => {
+        const e = endpoints.get(id);
+        if (e) {
+          e.lease = lease;
+          e.leaseUntil = until;
+        }
+      },
+      setEndpointLock: () => {},
+      stateDir: dir,
+      idleEvictMs: 0,
+      onDegraded: (info) => degraded.push(info),
+    });
+  }
+
+  it("120 条 note：全量镜像一次，seqInStream 连续 1..120（>100 提交窗口回归）", async () => {
+    const ep = addEndpoint();
+    await port.warm(ep.id, "shared");
+    for (let i = 0; i < 120; i++) {
+      await port.note(ep.id, "mesh.audit", { envelopeId: `m_audit_${i}`, seq: i });
+    }
+    await waitFor(() => entries.filter((e) => e.entryType === "mesh.audit").length === 120);
+    const audit = entries.filter((e) => e.entryType === "mesh.audit");
+    expect(audit).toHaveLength(120);
+    expect(new Set(audit.map((e) => e.entryId)).size).toBe(120); // 不重
+    expect(audit.map((e) => e.seqInStream)).toEqual(
+      Array.from({ length: 120 }, (_, i) => i + 1),
+    ); // 不漏、不乱序
+  });
+
+  it("慢 entry 确认是完成屏障：确认落定前不发 turnEnd，turnEnd 携带 eligibleEntryIds", async () => {
+    faux.setResponses([fauxAssistantMessage("reply")]);
+    const ep = addEndpoint();
+    await port.warm(ep.id, "shared");
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const held: PortEntryEvent[] = [];
+    port.onEntry(async (e) => {
+      held.push(e);
+      await gate;
+    });
+    const env = makeEnvelope("m_barrier");
+    await port.deliver(ep.id, "hi", env, "followUp", { triggerTurn: true });
+    await waitFor(() => held.some((e) => e.envelopeId === "m_barrier"));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(turnEnds).toHaveLength(0); // 屏障内不得提前发 turnEnd（先 delivered 后 consumed）
+    release();
+    await waitFor(() => turnEnds.some((t) => t.endpointId === ep.id));
+    const t = turnEnds.find((x) => x.endpointId === ep.id)!;
+    const deliveredEntry = held.find((e) => e.envelopeId === "m_barrier")!.entryId;
+    expect(t.eligibleEntryIds).toContain(deliveredEntry);
+  });
+
+  it("快速连续 run：旧 run→新 run 换手与 busy→idle 各发 turnEnd（不合并、不提前）", async () => {
+    let releaseR1!: () => void;
+    faux.setResponses([
+      () =>
+        new Promise((resolve) => {
+          releaseR1 = () => resolve(fauxAssistantMessage("r1"));
+        }),
+      fauxAssistantMessage("r2"),
+    ]);
+    const ep = addEndpoint();
+    await port.warm(ep.id, "shared");
+    await port.deliver(ep.id, "hi1", makeEnvelope("m_run_1"), "followUp", { triggerTurn: true });
+    await port.deliver(ep.id, "hi2", makeEnvelope("m_run_2"), "followUp", { triggerTurn: true });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(turnEnds).toHaveLength(0); // run 1 未结束不提前发
+    releaseR1();
+    await waitFor(() => turnEnds.filter((t) => t.endpointId === ep.id).length >= 2);
+    expect(faux.state.callCount).toBe(2);
+    for (const t of turnEnds) expect(t.eligibleEntryIds).toBeDefined();
+    expect(entries.some((e) => e.envelopeId === "m_run_1")).toBe(true);
+    expect(entries.some((e) => e.envelopeId === "m_run_2")).toBe(true);
+  });
+
+  it("resume 由 port warm 末尾执行且只一次（factory 不自 resume）", async () => {
+    let resumeCalls = 0;
+    const s = fakeDurableSession() as { harness: { resume: () => void } };
+    s.harness.resume = () => {
+      resumeCalls += 1;
+    };
+    const factory: SessionFactory = {
+      create: async () => ({ session: s as unknown, runtimeRef: "rs-ref" }),
+      open: async () => ({ session: s as unknown }),
+    };
+    const spyPort = portWith(factory);
+    const ep = addEndpoint();
+    await spyPort.warm(ep.id, "shared");
+    expect(ep.state).toBe("hot");
+    expect(resumeCalls).toBe(1);
+    await spyPort.dispose();
+  });
+
+  it("warm 后半段失败（基线抛错）回滚：NO_SESSION + unavailable + 锁释放，重试成功", async () => {
+    const good = await createTestFactory(faux, dir);
+    let attempts = 0;
+    const flaky: SessionFactory = {
+      create: async (ctx) => {
+        attempts += 1;
+        if (attempts === 1) {
+          const s = fakeDurableSession() as { root: { entries: () => Promise<never> } };
+          s.root.entries = () => Promise.reject(new Error("baseline boom"));
+          return { session: s as unknown, runtimeRef: "bad-ref" };
+        }
+        return good.create(ctx);
+      },
+      open: (ctx) => good.open(ctx),
+    };
+    const flakyPort = portWith(flaky);
+    const ep = addEndpoint();
+    await expect(flakyPort.warm(ep.id, "shared")).rejects.toMatchObject({ code: "NO_SESSION" });
+    expect(ep.state).toBe("unavailable");
+    expect(await EndpointLock.readInfo(join(dir, "locks", `${ep.id}.lock`))).toBeUndefined();
+    await flakyPort.warm(ep.id, "shared"); // 重试走 good 工厂
+    expect(ep.state).toBe("hot");
+    await flakyPort.dispose();
+  });
+
+  it("continue 提交投影显式不支持：submissionStatus 返回 null（不伪装成 input/write）", async () => {
+    const s = fakeDurableSession() as { harness: { submission: () => Promise<unknown> } };
+    s.harness.submission = () =>
+      Promise.resolve({
+        status: async () => ({ id: 7, type: "continue", status: "done" }),
+      });
+    const factory: SessionFactory = {
+      create: async () => ({ session: s as unknown, runtimeRef: "cont-ref" }),
+      open: async () => ({ session: s as unknown }),
+    };
+    const contPort = portWith(factory);
+    const ep = addEndpoint();
+    await contPort.warm(ep.id, "shared");
+    expect(ep.state).toBe("hot");
+    expect(await contPort.submissionStatus(ep.id, "7")).toBeNull();
+    await contPort.dispose();
+  });
+
+  it("session 失败通道：harness.closed(kind=failed) → unavailable + session_failed 降级 + 锁释放", async () => {
+    let endSession!: (end: { kind: string; error?: unknown }) => void;
+    const s = fakeDurableSession() as { harness: { closed: Promise<unknown> } };
+    s.harness.closed = new Promise((resolve) => {
+      endSession = (end) => resolve(end);
+    });
+    const factory: SessionFactory = {
+      create: async () => ({ session: s as unknown, runtimeRef: "fail-ref" }),
+      open: async () => ({ session: s as unknown }),
+    };
+    const failPort = portWith(factory);
+    const ep = addEndpoint();
+    await failPort.warm(ep.id, "shared");
+    expect(ep.state).toBe("hot");
+    endSession({ kind: "failed", error: new Error("storage boom") });
+    await waitFor(() => ep.state === "unavailable");
+    expect(degraded.some((d) => d.reason === "session_failed" && d.endpointId === ep.id)).toBe(true);
+    await waitFor(
+      async () => (await EndpointLock.readInfo(join(dir, "locks", `${ep.id}.lock`))) === undefined,
+    );
+    await failPort.dispose();
+  });
+
+  it("harness.closed(kind=closed) 不算失败：流保持 hot（正常关闭由 evict 接管）", async () => {
+    let endSession!: (end: { kind: string }) => void;
+    const s = fakeDurableSession() as { harness: { closed: Promise<unknown> } };
+    s.harness.closed = new Promise((resolve) => {
+      endSession = (end) => resolve(end);
+    });
+    const factory: SessionFactory = {
+      create: async () => ({ session: s as unknown, runtimeRef: "closed-ref" }),
+      open: async () => ({ session: s as unknown }),
+    };
+    const closedPort = portWith(factory);
+    const ep = addEndpoint();
+    await closedPort.warm(ep.id, "shared");
+    endSession({ kind: "closed" });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(ep.state).toBe("hot");
+    expect(degraded).toHaveLength(0);
+    await closedPort.dispose();
+  });
+
+  it("evict 后重开：基线条目不重发，只镜像新条目", async () => {
+    const ep = addEndpoint();
+    await port.warm(ep.id, "shared");
+    await port.deliver(ep.id, "first", makeEnvelope("m_reopen_1"), "followUp", { triggerTurn: false });
+    await waitFor(() => entries.some((e) => e.envelopeId === "m_reopen_1"));
+    await port.evict(ep.id);
+    expect(ep.state).toBe("cold");
+    await port.warm(ep.id, "shared");
+    await port.deliver(ep.id, "second", makeEnvelope("m_reopen_2"), "followUp", { triggerTurn: false });
+    await waitFor(() => entries.some((e) => e.envelopeId === "m_reopen_2"));
+    expect(entries.filter((e) => e.envelopeId === "m_reopen_1")).toHaveLength(1);
+    expect(entries.filter((e) => e.envelopeId === "m_reopen_2")).toHaveLength(1);
   });
 });

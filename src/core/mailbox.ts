@@ -1181,7 +1181,7 @@ export class MeshMailbox implements Mailbox {
     entryType: string;
     seqInStream: number;
     rawJson: string;
-  }): void {
+  }): void | Promise<void> {
     const d = this.d;
     const endpoint = d.registry.getEndpoint(e.endpointId);
     // 镜像入库（§8.5）：raw_json byte-fidelity；runtimeRef 缺失时跳过镜像
@@ -1239,7 +1239,9 @@ export class MeshMailbox implements Mailbox {
       (row.state === "queued" || row.state === "routed") &&
       row.submission_id
     ) {
-      void this.confirmEntryDelivery(e.endpointId, row.id, row.submission_id, e.entryId);
+      // 完成屏障（pi 1.5）：把确认 Promise 交回 port drain 等待，保证
+      // delivered 落定后才发同一提交边界的 turnEnd（先 delivered 后 consumed）。
+      return this.confirmEntryDelivery(e.endpointId, row.id, row.submission_id, e.entryId);
     }
   }
 
@@ -1263,10 +1265,14 @@ export class MeshMailbox implements Mailbox {
     }
   }
 
-  handleTurnEnd(endpointId: EndpointId): void {
+  handleTurnEnd(endpointId: EndpointId, eligibleEntryIds?: readonly string[]): void {
     const d = this.d;
     // A19：SELECT 移进事务 + UPDATE 带原状态条件（state='delivered'），避免把已被他进程
     // 终态化/重投的行按陈旧 snapshot 覆盖回 consumed，并让 cursorSeq 推进基于一致快照。
+    // pi 1.5：eligibleEntryIds 是该 turnEnd 边界已纳入基线/entry 通知的条目 ID 快照；
+    // 消费事务只选中 entry_id 在此集合（或 entry 为空的 P2/P3）的 delivered 行，防止
+    // SDK 领先 drain 时把「后续提交才落位」的行提前消费。不传该字段（自定义/Fake port）
+    // 保留原全量行为。
     const rows = d.store.tx(() => {
       const rs = d.store.db
         .prepare<[string], DeliveryRow & { seq: number }>(
@@ -1276,15 +1282,21 @@ export class MeshMailbox implements Mailbox {
         )
         .all(endpointId) as Array<DeliveryRow & { seq: number }>;
       if (rs.length === 0) return [] as Array<DeliveryRow & { seq: number }>;
+      let target = rs;
+      if (eligibleEntryIds !== undefined) {
+        const eligible = new Set(eligibleEntryIds);
+        target = rs.filter((r) => r.entry_id === null || eligible.has(r.entry_id));
+      }
+      if (target.length === 0) return [] as Array<DeliveryRow & { seq: number }>;
       const now = isoNow();
       const upd = d.store.db.prepare(
         "UPDATE mesh_deliveries SET state = 'consumed', consumed_at = ?, state_changed_at = ? " +
           "WHERE id = ? AND state = 'delivered'",
       );
-      for (const r of rs) upd.run(now, now, r.id);
+      for (const r of target) upd.run(now, now, r.id);
       // 按会话分组清未读 + 前移 cursorSeq
       const byConv = new Map<string, number>();
-      for (const r of rs) {
+      for (const r of target) {
         const conv = this.convOfMessage(r.message_id);
         byConv.set(
           conv,
@@ -1292,7 +1304,7 @@ export class MeshMailbox implements Mailbox {
         );
       }
       for (const [convId, seq] of byConv) {
-        const acct = rs.find((r) => this.convOfMessage(r.message_id) === convId);
+        const acct = target.find((r) => this.convOfMessage(r.message_id) === convId);
         const accountId = acct?.account_id;
         if (!accountId) continue;
         this.resetInboxPending(accountId, convId);
@@ -1302,7 +1314,7 @@ export class MeshMailbox implements Mailbox {
           )
           .run(seq, accountId, convId);
       }
-      return rs;
+      return target;
     });
     if (rows.length === 0) return;
     for (const r of rows) {
